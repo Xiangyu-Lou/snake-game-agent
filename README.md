@@ -33,6 +33,14 @@ envs = VectorSnakeEnv(num_envs=256)  # 256 games stepped together with NumPy
 obs, infos = envs.reset(seed=0)      # obs: (256, 8, 20, 20) exact board encoding
 ```
 
+## Model files
+
+Trained models are stored with [Git LFS](https://git-lfs.com). Install it once
+(`git lfs install`) before cloning or committing models; files matching the
+patterns in [`.gitattributes`](.gitattributes) (`*.pt`, `*.pth`, `*.ckpt`,
+`*.safetensors`, `*.onnx`, `*.h5`, `*.keras`, `*.zip`, `*.npz`) are then kept in LFS
+automatically.
+
 ## Repository layout
 
 | Path | Contents |

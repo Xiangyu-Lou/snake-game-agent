@@ -1,0 +1,1054 @@
+{
+  "repository_commit": "605ae41be2585af0aaa7641246d4d82a6b12571e",
+  "python": "3.13.17",
+  "numpy": "2.5.4",
+  "machine": {
+    "platform": "Linux-6.18.44-fc-v153-x86_64-with-glibc2.39",
+    "cpus": 4
+  },
+  "purpose": "Evidence for the Architecture B review; analysis instruments, no model training",
+  "certificate_validation": {
+    "target_vs_is_safe_checks": 23072,
+    "target_vs_is_safe_mismatches": 0,
+    "certificates_replayed_for_two_loop_periods": 8613,
+    "doomed_states_checked_with_engine_depth_40": 49,
+    "doomed_states_confirmed": 49
+  },
+  "expert_lookup": {
+    "board": [
+      20,
+      20
+    ],
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "decisions": 238824,
+    "distinct_head_cells": 400,
+    "conflicting_labels": 0,
+    "moves_per_game": [
+      39390,
+      41366,
+      39897,
+      37657,
+      40287,
+      40227
+    ]
+  },
+  "game_lengths": [
+    {
+      "board": [
+        4,
+        4
+      ],
+      "episodes": 20,
+      "mean_moves": 52.35,
+      "expected_moves": 52.0,
+      "bound_moves": 91
+    },
+    {
+      "board": [
+        6,
+        6
+      ],
+      "episodes": 20,
+      "mean_moves": 301.35,
+      "expected_moves": 297.0,
+      "bound_moves": 561
+    },
+    {
+      "board": [
+        8,
+        8
+      ],
+      "episodes": 20,
+      "mean_moves": 986.3,
+      "expected_moves": 976.0,
+      "bound_moves": 1891
+    },
+    {
+      "board": [
+        10,
+        10
+      ],
+      "episodes": 20,
+      "mean_moves": 2446.75,
+      "expected_moves": 2425.0,
+      "bound_moves": 4753
+    },
+    {
+      "board": [
+        12,
+        12
+      ],
+      "episodes": 20,
+      "mean_moves": 5087.5,
+      "expected_moves": 5076.0,
+      "bound_moves": 10011
+    }
+  ],
+  "branching_profile": {
+    "hamiltonian_20x20_seed0": {
+      "bands": [
+        {
+          "occupancy": [
+            0.0,
+            0.25
+          ],
+          "states": 16403,
+          "at_most_one_safe": 0.0631,
+          "at_most_one_certified": 0.0631
+        },
+        {
+          "occupancy": [
+            0.25,
+            0.5
+          ],
+          "states": 12047,
+          "at_most_one_safe": 0.1001,
+          "at_most_one_certified": 0.1001
+        },
+        {
+          "occupancy": [
+            0.5,
+            0.75
+          ],
+          "states": 8346,
+          "at_most_one_safe": 0.1199,
+          "at_most_one_certified": 0.1199
+        },
+        {
+          "occupancy": [
+            0.75,
+            0.9
+          ],
+          "states": 2199,
+          "at_most_one_safe": 0.1396,
+          "at_most_one_certified": 0.1396
+        },
+        {
+          "occupancy": [
+            0.9,
+            1.0
+          ],
+          "states": 395,
+          "at_most_one_safe": 0.3392,
+          "at_most_one_certified": 0.3392
+        }
+      ],
+      "states": 39390,
+      "at_most_one_safe": 0.0935,
+      "at_most_one_certified": 0.0935
+    },
+    "hamiltonian_10x10_seeds0-9": {
+      "bands": [
+        {
+          "occupancy": [
+            0.0,
+            0.25
+          ],
+          "states": 9824,
+          "at_most_one_safe": 0.0987,
+          "at_most_one_certified": 0.0987
+        },
+        {
+          "occupancy": [
+            0.25,
+            0.5
+          ],
+          "states": 7849,
+          "at_most_one_safe": 0.201,
+          "at_most_one_certified": 0.201
+        },
+        {
+          "occupancy": [
+            0.5,
+            0.75
+          ],
+          "states": 5317,
+          "at_most_one_safe": 0.2338,
+          "at_most_one_certified": 0.2338
+        },
+        {
+          "occupancy": [
+            0.75,
+            0.9
+          ],
+          "states": 1443,
+          "at_most_one_safe": 0.2904,
+          "at_most_one_certified": 0.2904
+        },
+        {
+          "occupancy": [
+            0.9,
+            1.0
+          ],
+          "states": 335,
+          "at_most_one_safe": 0.7463,
+          "at_most_one_certified": 0.7463
+        }
+      ],
+      "states": 24768,
+      "at_most_one_safe": 0.1801,
+      "at_most_one_certified": 0.1801
+    },
+    "guarded_greedy_10x10_seeds0-9": {
+      "bands": [
+        {
+          "occupancy": [
+            0.0,
+            0.25
+          ],
+          "states": 1831,
+          "at_most_one_safe": 0.0448,
+          "at_most_one_certified": 0.0524
+        },
+        {
+          "occupancy": [
+            0.25,
+            0.5
+          ],
+          "states": 3379,
+          "at_most_one_safe": 0.2246,
+          "at_most_one_certified": 0.2868
+        },
+        {
+          "occupancy": [
+            0.5,
+            0.75
+          ],
+          "states": 3477,
+          "at_most_one_safe": 0.4308,
+          "at_most_one_certified": 0.4996
+        },
+        {
+          "occupancy": [
+            0.75,
+            0.9
+          ],
+          "states": 2031,
+          "at_most_one_safe": 0.6455,
+          "at_most_one_certified": 0.7115
+        },
+        {
+          "occupancy": [
+            0.9,
+            1.0
+          ],
+          "states": 929,
+          "at_most_one_safe": 0.8353,
+          "at_most_one_certified": 0.887
+        }
+      ],
+      "states": 11647,
+      "at_most_one_safe": 0.38,
+      "at_most_one_certified": 0.4354
+    }
+  },
+  "death_horizons": {
+    "10x10": {
+      "node_budget": 1000000,
+      "episodes": [
+        {
+          "seed": 0,
+          "score": 37,
+          "horizon_moves": 19,
+          "lower_bound": false,
+          "proof_nodes": 1533,
+          "occupancy_when_doomed": 0.4
+        },
+        {
+          "seed": 1,
+          "score": 42,
+          "horizon_moves": 17,
+          "lower_bound": false,
+          "proof_nodes": 2112,
+          "occupancy_when_doomed": 0.45
+        },
+        {
+          "seed": 2,
+          "score": 39,
+          "horizon_moves": 21,
+          "lower_bound": false,
+          "proof_nodes": 3062,
+          "occupancy_when_doomed": 0.42
+        },
+        {
+          "seed": 3,
+          "score": 37,
+          "horizon_moves": 9,
+          "lower_bound": false,
+          "proof_nodes": 17,
+          "occupancy_when_doomed": 0.4
+        },
+        {
+          "seed": 4,
+          "score": 24,
+          "horizon_moves": 6,
+          "lower_bound": false,
+          "proof_nodes": 19,
+          "occupancy_when_doomed": 0.27
+        },
+        {
+          "seed": 5,
+          "score": 39,
+          "horizon_moves": 21,
+          "lower_bound": false,
+          "proof_nodes": 3061,
+          "occupancy_when_doomed": 0.42
+        },
+        {
+          "seed": 6,
+          "score": 37,
+          "horizon_moves": 24,
+          "lower_bound": false,
+          "proof_nodes": 7983,
+          "occupancy_when_doomed": 0.4
+        },
+        {
+          "seed": 7,
+          "score": 42,
+          "horizon_moves": 11,
+          "lower_bound": false,
+          "proof_nodes": 11,
+          "occupancy_when_doomed": 0.45
+        },
+        {
+          "seed": 8,
+          "score": 46,
+          "horizon_moves": 20,
+          "lower_bound": false,
+          "proof_nodes": 5874,
+          "occupancy_when_doomed": 0.48
+        },
+        {
+          "seed": 9,
+          "score": 32,
+          "horizon_moves": 21,
+          "lower_bound": false,
+          "proof_nodes": 3060,
+          "occupancy_when_doomed": 0.35
+        },
+        {
+          "seed": 10,
+          "score": 43,
+          "horizon_moves": 23,
+          "lower_bound": false,
+          "proof_nodes": 6812,
+          "occupancy_when_doomed": 0.46
+        },
+        {
+          "seed": 11,
+          "score": 41,
+          "horizon_moves": 24,
+          "lower_bound": false,
+          "proof_nodes": 177,
+          "occupancy_when_doomed": 0.43
+        },
+        {
+          "seed": 12,
+          "score": 37,
+          "horizon_moves": 21,
+          "lower_bound": false,
+          "proof_nodes": 14014,
+          "occupancy_when_doomed": 0.39
+        },
+        {
+          "seed": 13,
+          "score": 47,
+          "horizon_moves": 11,
+          "lower_bound": false,
+          "proof_nodes": 89,
+          "occupancy_when_doomed": 0.49
+        },
+        {
+          "seed": 14,
+          "score": 30,
+          "horizon_moves": 9,
+          "lower_bound": false,
+          "proof_nodes": 9,
+          "occupancy_when_doomed": 0.33
+        },
+        {
+          "seed": 15,
+          "score": 42,
+          "horizon_moves": 30,
+          "lower_bound": false,
+          "proof_nodes": 545518,
+          "occupancy_when_doomed": 0.45
+        },
+        {
+          "seed": 16,
+          "score": 39,
+          "horizon_moves": 21,
+          "lower_bound": false,
+          "proof_nodes": 3060,
+          "occupancy_when_doomed": 0.42
+        },
+        {
+          "seed": 17,
+          "score": 37,
+          "horizon_moves": 13,
+          "lower_bound": false,
+          "proof_nodes": 25,
+          "occupancy_when_doomed": 0.39
+        },
+        {
+          "seed": 18,
+          "score": 36,
+          "horizon_moves": 25,
+          "lower_bound": false,
+          "proof_nodes": 13170,
+          "occupancy_when_doomed": 0.39
+        },
+        {
+          "seed": 19,
+          "score": 43,
+          "horizon_moves": 7,
+          "lower_bound": false,
+          "proof_nodes": 21,
+          "occupancy_when_doomed": 0.46
+        },
+        {
+          "seed": 20,
+          "score": 37,
+          "horizon_moves": 21,
+          "lower_bound": false,
+          "proof_nodes": 3106,
+          "occupancy_when_doomed": 0.4
+        },
+        {
+          "seed": 21,
+          "score": 34,
+          "horizon_moves": 23,
+          "lower_bound": false,
+          "proof_nodes": 778,
+          "occupancy_when_doomed": 0.37
+        },
+        {
+          "seed": 22,
+          "score": 37,
+          "horizon_moves": 21,
+          "lower_bound": false,
+          "proof_nodes": 3060,
+          "occupancy_when_doomed": 0.4
+        },
+        {
+          "seed": 23,
+          "score": 21,
+          "horizon_moves": 13,
+          "lower_bound": false,
+          "proof_nodes": 39,
+          "occupancy_when_doomed": 0.24
+        },
+        {
+          "seed": 24,
+          "score": 35,
+          "horizon_moves": 20,
+          "lower_bound": false,
+          "proof_nodes": 3059,
+          "occupancy_when_doomed": 0.38
+        },
+        {
+          "seed": 25,
+          "score": 32,
+          "horizon_moves": 21,
+          "lower_bound": false,
+          "proof_nodes": 3060,
+          "occupancy_when_doomed": 0.35
+        },
+        {
+          "seed": 26,
+          "score": 22,
+          "horizon_moves": 13,
+          "lower_bound": false,
+          "proof_nodes": 61,
+          "occupancy_when_doomed": 0.25
+        },
+        {
+          "seed": 27,
+          "score": 29,
+          "horizon_moves": 18,
+          "lower_bound": false,
+          "proof_nodes": 1309,
+          "occupancy_when_doomed": 0.32
+        },
+        {
+          "seed": 28,
+          "score": 38,
+          "horizon_moves": 23,
+          "lower_bound": false,
+          "proof_nodes": 22607,
+          "occupancy_when_doomed": 0.4
+        },
+        {
+          "seed": 29,
+          "score": 21,
+          "horizon_moves": 8,
+          "lower_bound": false,
+          "proof_nodes": 23,
+          "occupancy_when_doomed": 0.24
+        }
+      ],
+      "median_horizon_moves": 20.5,
+      "min_horizon_moves": 6,
+      "max_horizon_moves": 30,
+      "budget_exceeded": 0,
+      "median_proof_nodes_when_proved": 2585.5
+    },
+    "20x20": {
+      "node_budget": 300000,
+      "episodes": [
+        {
+          "seed": 0,
+          "score": 81,
+          "horizon_moves": 36,
+          "lower_bound": true,
+          "proof_nodes": 196653,
+          "occupancy_when_doomed": 0.21
+        },
+        {
+          "seed": 1,
+          "score": 109,
+          "horizon_moves": 36,
+          "lower_bound": true,
+          "proof_nodes": 196653,
+          "occupancy_when_doomed": 0.28
+        },
+        {
+          "seed": 2,
+          "score": 113,
+          "horizon_moves": 39,
+          "lower_bound": true,
+          "proof_nodes": 50381,
+          "occupancy_when_doomed": 0.29
+        },
+        {
+          "seed": 3,
+          "score": 132,
+          "horizon_moves": 7,
+          "lower_bound": false,
+          "proof_nodes": 7,
+          "occupancy_when_doomed": 0.338
+        },
+        {
+          "seed": 4,
+          "score": 118,
+          "horizon_moves": 33,
+          "lower_bound": true,
+          "proof_nodes": 208267,
+          "occupancy_when_doomed": 0.302
+        },
+        {
+          "seed": 5,
+          "score": 116,
+          "horizon_moves": 32,
+          "lower_bound": true,
+          "proof_nodes": 281135,
+          "occupancy_when_doomed": 0.297
+        }
+      ],
+      "median_horizon_moves": 34.5,
+      "min_horizon_moves": 7,
+      "max_horizon_moves": 39,
+      "budget_exceeded": 5,
+      "median_proof_nodes_when_proved": 7
+    }
+  },
+  "uncertified_moves": {
+    "greedy_10x10_seeds0-9": {
+      "certified": 9092,
+      "uncertified_survivable": 563,
+      "uncertified_doomed": 343,
+      "unknown": 1
+    },
+    "guarded_greedy_10x10_seeds0-9": {
+      "certified": 20634,
+      "uncertified_survivable": 167,
+      "uncertified_doomed": 565,
+      "unknown": 11,
+      "won": 2
+    }
+  },
+  "guarded_greedy_outcomes": {
+    "10x10": {
+      "episodes": [
+        {
+          "seed": 0,
+          "outcome": "won",
+          "score": 97,
+          "moves": 1621
+        },
+        {
+          "seed": 1,
+          "outcome": "looped",
+          "score": 79,
+          "moves": 1644
+        },
+        {
+          "seed": 2,
+          "outcome": "looped",
+          "score": 95,
+          "moves": 1613
+        },
+        {
+          "seed": 3,
+          "outcome": "looped",
+          "score": 44,
+          "moves": 726
+        },
+        {
+          "seed": 4,
+          "outcome": "looped",
+          "score": 22,
+          "moves": 279
+        },
+        {
+          "seed": 5,
+          "outcome": "looped",
+          "score": 63,
+          "moves": 924
+        },
+        {
+          "seed": 6,
+          "outcome": "looped",
+          "score": 83,
+          "moves": 1894
+        },
+        {
+          "seed": 7,
+          "outcome": "won",
+          "score": 97,
+          "moves": 1823
+        },
+        {
+          "seed": 8,
+          "outcome": "looped",
+          "score": 34,
+          "moves": 482
+        },
+        {
+          "seed": 9,
+          "outcome": "looped",
+          "score": 37,
+          "moves": 633
+        },
+        {
+          "seed": 10,
+          "outcome": "looped",
+          "score": 79,
+          "moves": 1325
+        },
+        {
+          "seed": 11,
+          "outcome": "looped",
+          "score": 50,
+          "moves": 749
+        },
+        {
+          "seed": 12,
+          "outcome": "looped",
+          "score": 25,
+          "moves": 206
+        },
+        {
+          "seed": 13,
+          "outcome": "looped",
+          "score": 95,
+          "moves": 2133
+        },
+        {
+          "seed": 14,
+          "outcome": "looped",
+          "score": 39,
+          "moves": 984
+        },
+        {
+          "seed": 15,
+          "outcome": "won",
+          "score": 97,
+          "moves": 1482
+        },
+        {
+          "seed": 16,
+          "outcome": "looped",
+          "score": 43,
+          "moves": 701
+        },
+        {
+          "seed": 17,
+          "outcome": "looped",
+          "score": 32,
+          "moves": 556
+        },
+        {
+          "seed": 18,
+          "outcome": "won",
+          "score": 97,
+          "moves": 1636
+        },
+        {
+          "seed": 19,
+          "outcome": "looped",
+          "score": 59,
+          "moves": 1402
+        },
+        {
+          "seed": 20,
+          "outcome": "looped",
+          "score": 46,
+          "moves": 748
+        },
+        {
+          "seed": 21,
+          "outcome": "lost",
+          "score": 49,
+          "moves": 536
+        },
+        {
+          "seed": 22,
+          "outcome": "looped",
+          "score": 40,
+          "moves": 570
+        },
+        {
+          "seed": 23,
+          "outcome": "looped",
+          "score": 93,
+          "moves": 2064
+        },
+        {
+          "seed": 24,
+          "outcome": "looped",
+          "score": 26,
+          "moves": 421
+        },
+        {
+          "seed": 25,
+          "outcome": "won",
+          "score": 97,
+          "moves": 1978
+        },
+        {
+          "seed": 26,
+          "outcome": "looped",
+          "score": 39,
+          "moves": 1090
+        },
+        {
+          "seed": 27,
+          "outcome": "looped",
+          "score": 91,
+          "moves": 1808
+        },
+        {
+          "seed": 28,
+          "outcome": "looped",
+          "score": 93,
+          "moves": 1962
+        },
+        {
+          "seed": 29,
+          "outcome": "won",
+          "score": 97,
+          "moves": 1611
+        }
+      ],
+      "outcomes": {
+        "won": 6,
+        "looped": 23,
+        "lost": 1
+      },
+      "mean_score": 64.6,
+      "max_score": 97
+    },
+    "20x20": {
+      "episodes": [
+        {
+          "seed": 0,
+          "outcome": "won",
+          "score": 397,
+          "moves": 21547
+        },
+        {
+          "seed": 1,
+          "outcome": "looped",
+          "score": 199,
+          "moves": 7098
+        },
+        {
+          "seed": 2,
+          "outcome": "stalled",
+          "score": 235,
+          "moves": 16652
+        },
+        {
+          "seed": 3,
+          "outcome": "looped",
+          "score": 262,
+          "moves": 10252
+        },
+        {
+          "seed": 4,
+          "outcome": "looped",
+          "score": 61,
+          "moves": 1556
+        },
+        {
+          "seed": 5,
+          "outcome": "looped",
+          "score": 221,
+          "moves": 9100
+        }
+      ],
+      "outcomes": {
+        "won": 1,
+        "looped": 4,
+        "stalled": 1
+      },
+      "mean_score": 229.16666666666666,
+      "max_score": 397
+    }
+  },
+  "recovery": {
+    "start_states": {
+      "0.3": 59,
+      "0.5": 42,
+      "0.7": 25
+    },
+    "hamiltonian": {
+      "0.3": {
+        "won": 45,
+        "lost": 14
+      },
+      "0.5": {
+        "lost": 23,
+        "won": 19
+      },
+      "0.7": {
+        "lost": 22,
+        "won": 3
+      }
+    },
+    "guarded_greedy": {
+      "0.3": {
+        "looped": 46,
+        "won": 11,
+        "lost": 2
+      },
+      "0.5": {
+        "looped": 31,
+        "won": 9,
+        "lost": 2
+      },
+      "0.7": {
+        "won": 7,
+        "looped": 17,
+        "lost": 1
+      }
+    },
+    "greedy": {
+      "0.3": {
+        "lost": 59
+      },
+      "0.5": {
+        "lost": 39,
+        "looped": 3
+      },
+      "0.7": {
+        "lost": 21,
+        "looped": 4
+      }
+    }
+  },
+  "costs": {
+    "states": [
+      {
+        "board": [
+          20,
+          20
+        ],
+        "occupancy": 0.1,
+        "length": 40,
+        "us_clone_reseed_step": 2.07,
+        "us_state": 1.41,
+        "us_safe_directions": 1.3,
+        "us_observe_grid": 36.19,
+        "us_encode_cells_spec": 42.75,
+        "us_from_state_with_seed": 15.57,
+        "us_survival_certificate": 53.07,
+        "us_per_simulation_puct_without_network": {
+          "64": 9.51,
+          "256": 12.8
+        }
+      },
+      {
+        "board": [
+          20,
+          20
+        ],
+        "occupancy": 0.5,
+        "length": 200,
+        "us_clone_reseed_step": 3.65,
+        "us_state": 2.05,
+        "us_safe_directions": 1.01,
+        "us_observe_grid": 46.95,
+        "us_encode_cells_spec": 59.94,
+        "us_from_state_with_seed": 37.6,
+        "us_survival_certificate": 132.11,
+        "us_per_simulation_puct_without_network": {
+          "64": 10.71,
+          "256": 12.84
+        }
+      },
+      {
+        "board": [
+          20,
+          20
+        ],
+        "occupancy": 0.9,
+        "length": 360,
+        "us_clone_reseed_step": 4.5,
+        "us_state": 2.88,
+        "us_safe_directions": 1.16,
+        "us_observe_grid": 86.2,
+        "us_encode_cells_spec": 103.86,
+        "us_from_state_with_seed": 64.59,
+        "us_survival_certificate": 19.9,
+        "us_per_simulation_puct_without_network": {
+          "64": 14.1,
+          "256": 19.0
+        }
+      },
+      {
+        "board": [
+          10,
+          10
+        ],
+        "occupancy": 0.5,
+        "length": 50,
+        "us_clone_reseed_step": 2.14,
+        "us_state": 1.14,
+        "us_safe_directions": 0.93,
+        "us_observe_grid": 30.64,
+        "us_encode_cells_spec": 41.21,
+        "us_from_state_with_seed": 20.84,
+        "us_survival_certificate": 52.95,
+        "us_per_simulation_puct_without_network": {
+          "64": 7.62,
+          "256": 10.43
+        }
+      }
+    ]
+  },
+  "network_cost_model": {
+    "encoders": [
+      {
+        "board": [
+          4,
+          4
+        ],
+        "tokens": 17,
+        "hamiltonian_expected_moves": 52.0,
+        "transformer_6x128": {
+          "gflop": 0.0413,
+          "attention_matrix_mb_per_layer_fp32": 0.01
+        },
+        "cnn_64x21": {
+          "gflop": 0.0238
+        }
+      },
+      {
+        "board": [
+          6,
+          6
+        ],
+        "tokens": 37,
+        "hamiltonian_expected_moves": 297.0,
+        "transformer_6x128": {
+          "gflop": 0.0928,
+          "attention_matrix_mb_per_layer_fp32": 0.04
+        },
+        "cnn_64x21": {
+          "gflop": 0.0535
+        }
+      },
+      {
+        "board": [
+          8,
+          8
+        ],
+        "tokens": 65,
+        "hamiltonian_expected_moves": 976.0,
+        "transformer_6x128": {
+          "gflop": 0.17,
+          "attention_matrix_mb_per_layer_fp32": 0.13
+        },
+        "cnn_64x21": {
+          "gflop": 0.0952
+        }
+      },
+      {
+        "board": [
+          10,
+          10
+        ],
+        "tokens": 101,
+        "hamiltonian_expected_moves": 2425.0,
+        "transformer_6x128": {
+          "gflop": 0.2784,
+          "attention_matrix_mb_per_layer_fp32": 0.31
+        },
+        "cnn_64x21": {
+          "gflop": 0.1487
+        }
+      },
+      {
+        "board": [
+          12,
+          12
+        ],
+        "tokens": 145,
+        "hamiltonian_expected_moves": 5076.0,
+        "transformer_6x128": {
+          "gflop": 0.4246,
+          "attention_matrix_mb_per_layer_fp32": 0.64
+        },
+        "cnn_64x21": {
+          "gflop": 0.2142
+        }
+      },
+      {
+        "board": [
+          20,
+          20
+        ],
+        "tokens": 401,
+        "hamiltonian_expected_moves": 39700.0,
+        "transformer_6x128": {
+          "gflop": 1.5751,
+          "attention_matrix_mb_per_layer_fp32": 4.91
+        },
+        "cnn_64x21": {
+          "gflop": 0.5949
+        }
+      }
+    ]
+  },
+  "exact_state_space": {
+    "4x4": {
+      "body_paths": 27960,
+      "states_with_fruit": 143368,
+      "board_filling_paths": 552
+    },
+    "5x5": {
+      "body_paths": 3051769,
+      "states_with_fruit": 22064488,
+      "board_filling_paths": 8648
+    }
+  }
+}

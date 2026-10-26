@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snake-game-agent"
+version = "0.1.0"
+description = "An AI that learns to beat Snake. Step 1: an exact, fast Snake game with Gymnasium environments and an animated UI."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "gymnasium>=1.1",
+]
+
+[project.optional-dependencies]
+ui = ["pygame-ce>=2.5"]
+dev = ["pytest>=7", "pygame-ce>=2.5"]
+
+[project.scripts]
+snake-game = "snake_game.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["snake_game*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["*.md"]  # keep hand-aligned comments in documentation
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I"]

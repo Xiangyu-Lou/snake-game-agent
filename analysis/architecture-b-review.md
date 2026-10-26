@@ -148,6 +148,33 @@ features (global features 7–9). In addition:
 - Log how close winning games come to the limit. Raise it to 2N if they
   regularly approach it.
 
+**Why not a penalty on every move?** A per-move penalty does make loops costly,
+even one that shrinks as the snake grows. But a 20×20 game takes about 40,000
+moves, so the whole game's penalty has to stay far below the 2-point gap between
+winning (+1) and dying (−1); otherwise crashing at once scores better than
+winning. The examples below use a penalty that shrinks linearly with the free
+cells, `c0 × (1 − L / N)`, and a game played at the Hamiltonian pace:
+
+- **Too large:** with a starting penalty above 7.6 × 10⁻⁵ per move, crashing on
+  the first move beats a full win. A constant penalty crosses that line at
+  5.0 × 10⁻⁵.
+- **Small enough:** a policy that maximizes win probability minus penalty loses
+  at most the penalty a win-maximizing policy pays. Keeping that penalty below
+  0.01 (one percentage point of win probability) means a starting penalty of
+  3.8 × 10⁻⁷.
+- **Too weak at that size:** 400 looping moves then cost 1.1 × 10⁻⁴ at 25% fill
+  and 1.5 × 10⁻⁵ at 90% fill. That is far below the differences a value network
+  resolves.
+
+The shrinking schedule is also weakest late in the game, and loops happen there
+too: 8 of the 23 looped 10×10 games stopped above 75% fill. Its shape would suit an efficiency
+objective, pushing for speed early when shortcuts are safe and fading when they
+are not. Loop prevention needs something else. If a reward is preferred to a
+rule, penalize only moves beyond an allowance since the last fruit, for example
+−1/N per move after N moves without fruit. Normal play then pays nothing, and a
+stall pays quickly. That is a soft version of the timeout and needs the same
+remaining-budget input.
+
 ### 2.3 Use exact survival analysis instead of rediscovering it
 
 **When is a game actually lost?** For each greedy death the probe searched
@@ -287,11 +314,31 @@ timeout rule there are no censored games, but the signal is still sparse.
 
 ### 2.6 Encoder and training path
 
-**Training path.** For a B-first project, skip PPO and the reward warm-up. B's
-training loop is self-play with search-improved policy targets and outcome-based
-value targets. The plan already excludes warm-up rewards from B's backups. The
-search/no-search comparison the plan asks for comes free: evaluate B's raw policy
-head. Start on 4×4 and 6×6, where games last about 50 and 300 moves and
+**Training path.** For a B-first project, skip PPO and the reward warm-up:
+
+- **B does not use them.** B trains with supervised losses on its own games: the
+  policy head imitates the search's improved move distribution, and the value
+  head predicts the outcome. Advantages, GAE λ, a return critic and a staged
+  reward warm-up would be built, tuned and then discarded. The plan already keeps
+  warm-up rewards out of B's backups.
+- **PPO is weakest where this task is hard.** It assigns credit to individual
+  moves through a policy gradient. The plan's λ = 0.99 gives a credit horizon of
+  about 100 moves, while the payoff is a win tens of thousands of moves later.
+  Search instead plays candidate moves forward in the exact simulator, so its
+  targets already carry their consequences. B's value head still learns from
+  outcomes; §2.3 and §2.5 give it denser and exact signals.
+- **The no-search baseline comes free.** Evaluating B's raw policy head at every
+  checkpoint compares the same network with and without search, a cleaner test
+  than a separately trained PPO model.
+- **No warm start is needed.** On small boards, early search reaches real
+  outcomes (below).
+
+The environment already exposes `action_masks()`, so an off-the-shelf maskable
+PPO (for example `MaskablePPO` from sb3-contrib) can run on `SnakeEnv` as a cheap
+check of the environment and logging, and as a model-free reference point. It
+should not be a stage of B or a gate.
+
+Start on 4×4 and 6×6, where games last about 50 and 300 moves and
 late-game searches reach the actual win or loss, so no demonstrations are needed
 to get started. Then grow through 8×8, 10×10 and 14×14 to 20×20. Keep earlier sizes in the mixture.
 Mix standard starts with mid-game states replayed from the agent's own games,

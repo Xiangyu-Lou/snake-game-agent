@@ -8,22 +8,31 @@ simulator is exact and cheap to copy, and no move has a deadline. The existing
 reports are careful. Every number rechecked here is correct, and the committed
 probe reproduces exactly (§1).
 
-As written, however, the B plan has six gaps. Some would stall training; others
-would make a successful result impossible to interpret. They are listed below in
-order of impact. Each is backed by a new reproducible probe,
-[`architecture_b_probe.py`](architecture_b_probe.py), whose output is in
+**Objective, as clarified by the project owner.** "Does not care about speed" in
+the project README refers to computation: the agent may think as long as it
+likes before each move. The number of moves does matter. The goal is to fill the
+board first and, among equally safe ways to do so, to use as few moves as
+possible: eat quickly early in the game, and as quickly as safety allows later.
+The earlier reports, and the first version of this review, treated move count as
+a diagnostic only. This version ranks it second. That changes the reference
+strategy (§2.1), how B combines its two goals (§2.2), and the gates (§3).
+
+Measured against that objective, the B plan as written has six gaps. Some would
+stall training; others would make a successful result impossible to interpret.
+They are listed below in order of impact. Each is backed by a new reproducible
+probe, [`architecture_b_probe.py`](architecture_b_probe.py), whose output is in
 [`architecture_b_probe_results.json`](architecture_b_probe_results.json).
 
 | # | Plan as written | Problem found | Change |
 | --- | --- | --- | --- |
-| 1 | Main gate: ≥ 99% completion on standard 20×20 starts, after pretraining on Hamiltonian games | On standard starts the expert's move depends only on the head cell (400 cells, no conflicting labels in 238,824 decisions). Imitation alone can pass the gate, so passing it says nothing about search or learning | Add a **recovery** track and a **demonstration-free** track, and judge B on them (§2.1) |
-| 2 | No fruit timeout; unresolved loops are only a diagnostic; win-only values with γ = 1 | Once deaths are prevented, loops take over: a survival-guarded greedy policy died in 1 of 36 games but looped or stalled in 28 | Train with **N moves without fruit = loss** and the remaining budget as input (§2.2) |
+| 1 | Main gate: ≥ 99% completion on standard 20×20 starts, after pretraining on Hamiltonian games; moves only a diagnostic | Imitating the expert means memorizing a 400-entry table keyed by the head cell, and the plain cycle is the slowest way to finish. A certified shortcut cycle, with no learning, finished all 320 test games and used 52% of the plain cycle's moves on 20×20 | Gate **completion first and moves second**, against the shortcut cycle; add **recovery** and **demonstration-free** tracks (§2.1) |
+| 2 | No fruit timeout; win-only values with γ = 1; no step penalty | Once deaths are prevented, loops take over: a survival-guarded greedy policy died in 1 of 36 games but looped or stalled in 28. A per-move penalty folded into the win reward is either large enough that crashing beats winning or too small to learn from | **Separate win-probability and moves heads**; choose the fastest move within δ of the best win probability; **N moves without fruit = loss** as a backstop (§2.2) |
 | 3 | Traps found by depth-limited search plus a learned value | Greedy games were already lost 6–30 moves before the collision on 10×10, and at least 32 moves before it in five of six 20×20 games. Proving it took up to 545,518 nodes on 10×10, and more than 300,000 in those five 20×20 games | Use an **exact, cheap survival certificate** as search mask, input feature and label (§2.3) |
 | 4 | 64–1,024 (up to 4,096) expansions per move; skip forced moves | At 256 expansions, one 20×20 game needs about 10 million network evaluations (16 PFLOP for the proposed Transformer). Only 9% of expert moves are forced | **Gumbel root search with 8–32 simulations**, adaptive per-move budgets, afterstate leaves, batching across games (§2.4) |
 | 5 | Win-probability value trained on final 0/1 outcomes | One label per ~40,000 states. Values near 0 or 1 hide the differences between moves | **Bootstrapped and exact labels**; compare actions on a failure-probability scale (§2.5) |
 | 6 | Imitation, then PPO with a reward warm-up, then search; coordinates normalized by board size | PPO is a detour for B. Normalized coordinates change what "adjacent" looks like on every board size, which undermines the small-board curriculum | **Self-play with search targets from 4×4 upward**; size-independent geometry (§2.6) |
 
-§3 turns these changes into milestones with gates. §4 lists four decisions
+§3 turns these changes into milestones with gates. §4 lists five decisions
 that are yours to make.
 
 ## 1. What holds up
@@ -56,23 +65,56 @@ before any of its deaths is all-fatal. Hand-built curriculum states should
 therefore set the heading to the neck-to-head direction. Keep the heading in
 cache keys, as the plan says.
 
+**Superseded by the clarified objective.** These statements in the earlier
+reports assume that move count does not matter:
+
+- "Move count is a diagnostic, not an optimization target" (architecture report, §1).
+- "Avoid an action penalty because speed is not a user objective" (§4).
+- "With no move-efficiency objective, a deterministic tie-break is enough" (§8,
+  Architecture D).
+- The advice against any move-efficiency objective (rewards report, §6).
+
+Fewer moves is now the second goal. Their warnings still apply to how it is
+added: a per-move penalty mixed into the win reward does distort the first goal
+(§2.2).
+
 ## 2. Issues, evidence and changes
 
-### 2.1 The completion gate cannot show what B adds
+### 2.1 Gates must rank completion first and moves second
 
 The architecture report already separates three evaluation tracks: standard
 starts, non-aligned snapshots and other board sizes (its §11). Only the first
-has a gate, a 95% lower confidence bound above 99% completion. Both A and B
-begin with Hamiltonian demonstrations, and the report does not separate runs
-with and without them.
+has a gate, a 95% lower confidence bound above 99% completion, and moves are not
+part of it. Both A and B begin with Hamiltonian demonstrations, and the report
+does not separate runs with and without them.
 
-**Evidence.** In six standard games the Hamiltonian expert made 238,824
-decisions from exactly 400 head cells, with no cell ever labelled with two
-different actions. From the standard start the expert is a 400-entry table keyed
-by the head cell. A network trained by imitation only has to memorize that
-table, and following it wins every game. Such a network could pass the gate with
-no search, no useful value function, and no ability to recover from a state the
-table does not cover.
+**Evidence: the expert is a lookup table, and a slow one.** In six standard
+games the Hamiltonian expert made 238,824 decisions from exactly 400 head cells,
+with no cell ever labelled with two different actions. Imitating it means
+memorizing a 400-entry table keyed by the head cell. That wins every game, but
+in about 39,700 moves on 20×20: the slowest way to finish. Such a network could
+pass the completion gate with no search, no useful value function, and no ability
+to recover from a state the table does not cover.
+
+**A certified, faster reference needs no learning.** Keep the body in cycle
+order, and let the head jump to a neighbouring cell further along the cycle,
+never past the tail or the fruit. Every cell between the head and the tail along
+the cycle is then free, so the next cell on the cycle is always safe. Each move
+brings the head at least one step closer to the fruit along the cycle, so every
+fruit is eaten within N moves. Jumps pay off only while the snake is short: late
+jumps leave holes, and a fruit that appears in a hole costs most of a lap.
+
+| Board | Plain cycle, expected moves | Jumps while under 50% fill, mean moves | Share | Completed |
+| --- | ---: | ---: | ---: | ---: |
+| 6×6 | 297 | 214 | 72% | 200 of 200 |
+| 10×10 | 2,425 | 1,445 | 60% | 100 of 100 |
+| 20×20 | 39,700 | 20,737 | 52% | 20 of 20 |
+
+Cutoffs between 40% and 60% fill were all within 5% of the best. Allowing jumps
+at any fill saved only 4% on 20×20. The probe checked the cycle-order invariant
+at every move of the 6×6 and 10×10 games, about 1.1 million moves in total. This
+is the shortcut variant that the architecture report anticipated for
+Architecture D, with its invariant and progress argument stated.
 
 Recovery is where the reference policies struggle. The probe took mid-game
 10×10 states from held-out guarded-greedy games, kept those that are
@@ -90,32 +132,36 @@ report warns. Guarded-greedy failures are mostly loops. Whether every one of
 these states can be won is unknown, so the table gives lower bounds on what is
 achievable, and a planning agent has a lot of room to improve on them.
 
-**Change.** Gate B on three tracks:
+**Change.** Gate B on three tracks, completion first and moves second:
 
-- **T1, standard starts** (as planned). Report models trained with and without
-  demonstrations separately.
+- **T1, standard starts.** The completion gate as planned, then mean moves
+  against the shortcut cycle. Report models trained with and without
+  demonstrations separately. Imitating the plain cycle passes the completion gate
+  and takes about twice the shortcut cycle's moves.
 - **T2, recovery**: certified, non-aligned mid-game states at fixed occupancy
   bands, generated from held-out seeds as in the probe. Gate: beat the best
   reference policy in every band, with 95% intervals.
 - **T3, no demonstrations**: B trained only from its own search. T1 and T2 are
   measured on the result.
 
-Odd-by-odd boards remain a separate generalization track. If the goal is only
-"a trained network fills the default board", T1 with demonstrations reaches it
-cheaply, and A is enough. B is justified by T2 and T3.
+Odd-by-odd boards remain a separate generalization track. Filling the default
+board needs no learning, and the shortcut cycle does it in about half the moves.
+B is justified if it beats the shortcut cycle on moves at equal completion,
+recovers from states the cycle strategies cannot handle, or both.
 
-### 2.2 Non-progress loops are the main failure once survival is handled
+### 2.2 Speed and loops: keep the two goals separate
 
 The plan disables the fruit timeout for the principal task, treats unfinished
-episodes as censored, trains `V_win` only on resolved outcomes, and backs it up
-with γ = 1 and no step penalty. It rightly rejects survival rewards and step
-penalties. Nothing is then left that tells a safe loop apart from progress: both
-keep the snake alive, and a loop is worth whatever the network predicts for the
-states it cycles through.
+episodes as censored, trains `V_win` only on resolved outcomes, backs it up with
+γ = 1, and rejects step penalties because move count was not a goal. Under the
+clarified objective the agent needs pressure toward fewer moves, and it needs
+protection against loops. Nothing in the plan supplies either: a safe loop and
+real progress both keep the snake alive, and a loop is worth whatever the
+network predicts for the states it cycles through.
 
-**Evidence.** The probe's guarded greedy policy takes the greedy move only when
-its successor carries a survival certificate (§2.3). That nearly eliminates
-deaths, and loops take their place:
+**Evidence: loops.** The probe's guarded greedy policy takes the greedy move
+only when its successor carries a survival certificate (§2.3). That nearly
+eliminates deaths, and loops take their place:
 
 | Board | Games | Won | Lost | Looped | Stalled | Mean score |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -128,52 +174,64 @@ without fruit. Plain greedy loses all six 20×20 games with a mean score of
 111.5. The single 20×20 win took 21,547 moves, about half the Hamiltonian
 expectation.
 
-A search whose value has learned to avoid death, but gains nothing from
-progress, is in the same position: very good at staying alive, with nothing to
-push it out of a loop.
+Guarded greedy is "eat as fast as possible while staying alive", applied one
+fruit at a time. It got stuck in 28 of 36 games: the fastest safe move now can
+lead to positions where no safe move makes progress. Speed has to be judged over
+the rest of the game, not per fruit.
 
-**Change.** In training, count **N consecutive moves without fruit as a loss**.
-This is `max_steps_without_fruit="auto"`, the environment's default; the
-environment reports it as `truncated`, so the training target must record it as
-a loss. It never binds for the cycle strategy, which reaches every fruit within
-`F < N` moves.
-It turns every episode into a resolved win or loss, so censored labels
-disappear. The input specification already reserves the remaining-budget
-features (global features 7–9). In addition:
-
-- In search, a node whose board (body, heading, fruit) repeats an ancestor's
-  with no fruit eaten in between is the same position with less budget. Prune it.
-- Evaluate final models twice: with the rule, and with `None` as a check,
-  reporting loops as censored.
-- Log how close winning games come to the limit. Raise it to 2N if they
-  regularly approach it.
-
-**Why not a penalty on every move?** A per-move penalty does make loops costly,
-even one that shrinks as the snake grows. But a 20×20 game takes about 40,000
-moves, so the whole game's penalty has to stay far below the 2-point gap between
-winning (+1) and dying (−1); otherwise crashing at once scores better than
-winning. The examples below use a penalty that shrinks linearly with the free
-cells, `c0 × (1 − L / N)`, and a game played at the Hamiltonian pace:
+**Why one combined reward does not work.** A per-move penalty adds speed
+pressure and makes loops costly. One that shrinks as the snake grows matches the
+intent: hurry early, be careful late. But a 20×20 game takes 20,000–40,000
+moves, so a penalty folded into the win reward has no size that works. The
+examples below use a penalty that shrinks linearly with the free cells,
+`c0 × (1 − L / N)`, and a game played at the plain-cycle pace:
 
 - **Too large:** with a starting penalty above 7.6 × 10⁻⁵ per move, crashing on
-  the first move beats a full win. A constant penalty crosses that line at
-  5.0 × 10⁻⁵.
-- **Small enough:** a policy that maximizes win probability minus penalty loses
-  at most the penalty a win-maximizing policy pays. Keeping that penalty below
-  0.01 (one percentage point of win probability) means a starting penalty of
-  3.8 × 10⁻⁷.
-- **Too weak at that size:** 400 looping moves then cost 1.1 × 10⁻⁴ at 25% fill
-  and 1.5 × 10⁻⁵ at 90% fill. That is far below the differences a value network
-  resolves.
+  the first move beats a full win, because the remaining penalty exceeds the
+  2-point gap between winning (+1) and dying (−1). A constant penalty crosses
+  that line at 5.0 × 10⁻⁵.
+- **Small enough to be safe:** a policy that maximizes win probability minus
+  penalty loses at most the penalty a win-maximizing policy pays. Keeping that
+  penalty below 0.01 (one percentage point of win probability) means a starting
+  penalty of 3.8 × 10⁻⁷.
+- **Too weak at that size:** 400 moves then cost 1.1 × 10⁻⁴ at 25% fill and
+  1.5 × 10⁻⁵ at 90% fill, far below the win-probability differences the value
+  network must resolve. It learns neither speed nor loop avoidance from them.
 
-The shrinking schedule is also weakest late in the game, and loops happen there
-too: 8 of the 23 looped 10×10 games stopped above 75% fill. Its shape would suit an efficiency
-objective, pushing for speed early when shortcuts are safe and fading when they
-are not. Loop prevention needs something else. If a reward is preferred to a
-rule, penalize only moves beyond an allowance since the last fruit, for example
-−1/N per move after N moves without fruit. Normal play then pays nothing, and a
-stall pays quickly. That is a soft version of the timeout and needs the same
-remaining-budget input.
+**Change.** Learn the two goals separately, and combine them only when choosing
+a move:
+
+1. **Two heads.** `V_win`, the probability of filling the board, as planned.
+   `M`, the expected moves until the board is full, divided by the plain-cycle
+   expectation `F(F + 3) / 4` so its scale stays stable through the game. Train
+   `M` on won games. Count deaths and timeouts as the maximum, so that dying
+   never looks fast.
+2. **Bounded tie-break.** Choose the fastest move among those whose win
+   probability is within δ of the best. Inside the tree, score children by
+   `Q_win − δ · m`, where `m` is their moves estimate rescaled to [0, 1] across
+   the siblings. A win-probability lead larger than δ always wins; a smaller
+   lead can be outweighed by speed.
+3. **The owner's schedule falls out of this rule.** Early in the game every safe
+   move has nearly the same win probability, so speed decides. Late in the game
+   risky moves fall more than δ behind, so safety decides. δ is the single number
+   that sets how much win probability may be traded for speed in one decision.
+4. **Timeout as a backstop.** In training, count N consecutive moves without
+   fruit as a loss: `max_steps_without_fruit="auto"`, the environment's default.
+   The environment reports it as `truncated`, so the training target must record
+   it as a loss. It never binds for the plain or shortcut cycle, which eat within
+   N moves. Loops then end as resolved losses, so neither head has to learn from
+   games that never end. The input specification already reserves the
+   remaining-budget features (global features 7–9). If a reward is preferred to
+   a rule, charge only moves beyond the allowance, for example 1/N per move after
+   N moves without fruit. Normal play pays nothing, and a stall pays quickly.
+5. **Search and evaluation details.**
+   - In search, a node whose board (body, heading, fruit) repeats an ancestor's,
+     with no fruit eaten in between, is the same position with less budget.
+     Prune it.
+   - Evaluate final models twice: with the rule, and with `None` as a check,
+     reporting loops as censored.
+   - Log how close winning games come to the limit. Raise it to 2N if they
+     regularly approach it.
 
 ### 2.3 Use exact survival analysis instead of rediscovering it
 
@@ -227,7 +285,7 @@ progress.
   (arrival minus release) on body cells bordering the reachable region. Like the
   coordinate planes, these are exact preprocessing. Ablate them.
 - **Labels.** A proven-lost state has value 0, whatever the episode's outcome.
-- **Speed.** In pure Python the certificate costs 20–132 µs per call on 20×20,
+- **Speed.** In pure Python the certificate costs 34–159 µs per call on 20×20,
   and a search node needs up to three. Implement it in compiled or vectorized
   form on `VectorSnakeEnv`'s timestamp representation, which the probe's
   `Board` mirrors.
@@ -247,18 +305,21 @@ CNN: 64 channels, 21 convolutions), and, for illustration, a sustained
 | 20×20 | 39,700 | 256 | 10.2 M | 16 PFLOP (13 min) | 6 PFLOP (5 min) |
 | 20×20 | 39,700 | 1,024 | 40.7 M | 64 PFLOP (53 min) | 24 PFLOP (20 min) |
 
-The CPU side, measured on this 4-CPU container:
+The CPU side, measured on this 4-CPU container (timings varied by up to about
+50% between runs):
 
-- A masked PUCT tree over `SnakeGame` clones, without a network, costs 8–19 µs
-  per simulation (`clone` + `reseed` + `step` costs 2–5 µs). At 256 simulations
-  that is 2–3 minutes per 20×20 game, which is affordable.
+- A masked PUCT tree over `SnakeGame` clones, without a network, costs 11–19 µs
+  per simulation (`clone` + `reseed` + `step` costs 3–6 µs). At 256 simulations
+  that is 2.5–3.5 minutes per 20×20 game, which is affordable.
 - Encoding leaves one at a time with the specification's `encode_cells` costs
-  43–104 µs each on 20×20, which is 7–18 minutes per game at 256 simulations.
+  54–105 µs each on 20×20, which is 9–18 minutes per game at 256 simulations.
   Leaves must be encoded in batches; the vectorized `encode_grid` already exists.
 - On boards up to 10×10, this per-leaf Python work costs more than the network.
 
 So 1,000 self-play games on 20×20 cost about 220 GPU-hours at 256 simulations
-and 14 GPU-hours at 16 simulations (Transformer, 20 TFLOP/s).
+and 14 GPU-hours at 16 simulations (Transformer, 20 TFLOP/s). The table assumes
+the plain-cycle pace. At the shortcut cycle's pace (about 20,700 moves on
+20×20) the 20×20 costs roughly halve, and a faster agent costs less still.
 
 Skipping forced moves saves little on cycle-like play. Only 9.4% of expert
 decisions on 20×20 (18% on 10×10) had at most one safe move. On compact
@@ -308,6 +369,9 @@ timeout rule there are no censored games, but the signal is still sparse.
   cycle, has about 2.2 × 10⁷, which is feasible in compiled code. These give
   ground-truth values for calibration, policy regret, and a known optimum for
   the odd-board track.
+- Train the moves head (§2.2) on every state of every won game: its target, the
+  moves that game still took, is observed everywhere, so it is far denser than
+  the win label. Bootstrap it the same way as the win value.
 - Sample replay so that long games do not dominate, and oversample states shortly
   before failures. The plan already asks for hard near-full states; §2.3 adds
   the earlier, decisive ones.
@@ -317,8 +381,9 @@ timeout rule there are no censored games, but the signal is still sparse.
 **Training path.** For a B-first project, skip PPO and the reward warm-up:
 
 - **B does not use them.** B trains with supervised losses on its own games: the
-  policy head imitates the search's improved move distribution, and the value
-  head predicts the outcome. Advantages, GAE λ, a return critic and a staged
+  policy head imitates the search's improved move distribution, the value head
+  predicts the outcome, and the moves head predicts the moves still needed.
+  Advantages, GAE λ, a return critic and a staged
   reward warm-up would be built, tuned and then discarded. The plan already keeps
   warm-up rewards out of B's backups.
 - **PPO is weakest where this task is hard.** It assigns credit to individual
@@ -384,10 +449,10 @@ Either choice is a new dependency and belongs in a separate implementation chang
 
 | Milestone | Work | Gate to continue |
 | --- | --- | --- |
-| **M0. Contracts and instruments** (no learning) | Fix the information contract: relative actions, public state only, N-move fruit timeout as a training loss. Turn the probe's certificate, lost-proof search and recovery-state generator into tested code. Build an evaluation harness for T1–T3 with held-out seeds and outcome classes (won, lost, timed out, censored). Solve 4×4 exactly | Tests pass; the harness reproduces this probe's reference numbers |
-| **M1. Self-play on 4×4 and 6×6**, no demonstrations | CNN with certificate planes and size-independent geometry; Gumbel root search, 16 simulations, at non-forced moves; afterstate leaves; blended value targets | 6×6 T1: no failures in 299 held-out games (lower bound above 99%); 4×4 values calibrated against the exact solution; raw-policy and search results both reported |
-| **M2. 8×8 and 10×10, recovery** | Mixed sizes; replayed mid-game starts; search budget sweep (8, 16, 32, 64) at equal compute | 10×10 T1 ≥ 95% in development; T2 beats the best reference in every band (currently 76%, 45%, 28%) with 95% intervals |
-| **M3. 20×20** | Fine-tune from M2; adaptive budgets; batched leaves; Transformer only if CNN errors point to capacity or long-range limits | 100-game development run, then the plan's 299-game reliability gate on T1, plus T2 at 20×20 against the reference policies |
+| **M0. Contracts and instruments** (no learning) | Fix the information contract: relative actions, public state only, N-move fruit timeout as a training loss. Turn the probe's certificate, lost-proof search, shortcut cycle and recovery-state generator into tested code. Build an evaluation harness for T1–T3 with held-out seeds, outcome classes (won, lost, timed out, censored) and move counts. Solve 4×4 exactly | Tests pass; the harness reproduces this probe's reference numbers |
+| **M1. Self-play on 4×4 and 6×6**, no demonstrations | CNN with certificate planes and size-independent geometry; win-probability and moves heads with the δ tie-break; Gumbel root search, 16 simulations, at non-forced moves; afterstate leaves; blended value targets | 6×6 T1: no failures in 299 held-out games (lower bound above 99%) and mean moves at or below the shortcut cycle's 214; 4×4 values calibrated against the exact solution; raw-policy and search results both reported |
+| **M2. 8×8 and 10×10, recovery** | Mixed sizes; replayed mid-game starts; search budget sweep (8, 16, 32, 64) at equal compute; δ sweep charting completion against moves | 10×10 T1 ≥ 95% in development with mean moves at or below 1,445; T2 beats the best reference in every band (currently 76%, 45%, 28%) with 95% intervals |
+| **M3. 20×20** | Fine-tune from M2; adaptive budgets; batched leaves; Transformer only if CNN errors point to capacity or long-range limits | 100-game development run, then the plan's 299-game reliability gate on T1 with mean moves below 20,737, plus T2 at 20×20 against the reference policies |
 
 A demonstration-assisted run can be added at any stage, reported separately.
 Architecture A's baseline is B's raw policy head. C and D keep the triggers the
@@ -395,15 +460,22 @@ architecture report gives them.
 
 ## 4. Decisions for you
 
-1. **What counts as success?** "A trained network fills the default board" is
-   cheap with demonstrations (T1). "It learned to plan" needs T2 and T3.
-   **Recommendation: T2 and T3**, with T1 reported both ways.
-2. **Timeout during training.** Count N moves without fruit as a loss
+1. **δ, the speed-for-safety trade.** How much win probability per decision you
+   would give up for fewer moves (§2.2). **Recommendation:** start small, for
+   example 0.002, and chart completion against moves on 10×10 for a few values
+   before choosing.
+2. **A safety envelope on standard starts.** B can choose freely, or only among
+   moves that keep the body in cycle order (§2.1). The envelope guarantees
+   completion from standard starts, so learning only decides when to jump. Free
+   choice may go faster than any cycle-based strategy but carries no guarantee.
+   Recovery (T2) always needs free choice. The envelope is only a move mask, so
+   **recommendation:** evaluate the same network both ways on T1.
+3. **Timeout during training.** Count N moves without fruit as a loss
    (recommended), or keep the strict no-timeout task throughout and handle
    loops some other way.
-3. **Stack.** PyTorch with Python search batched across games (recommended to
+4. **Stack.** PyTorch with Python search batched across games (recommended to
    start), or a JAX port with `mctx` from the outset.
-4. **Compute.** Which accelerator and how many GPU-hours. This sets the 20×20
+5. **Compute.** Which accelerator and how many GPU-hours. This sets the 20×20
    search budget (§2.4).
 
 ## 5. Reproducing the measurements
@@ -415,8 +487,9 @@ From the repository root, with development dependencies installed:
 ```
 
 The script rewrites [`architecture_b_probe_results.json`](architecture_b_probe_results.json)
-in about three minutes on this container. Game outcomes, counts and proofs are
-deterministic for the fixed seeds; timings vary by machine and are recorded with
-the machine description. The survival certificate, the exact lost-proof search
-and the guarded greedy policy are analysis instruments, not application code
-and not a proposed agent. No model was trained.
+in about four minutes on this container. Game outcomes, counts and proofs are
+deterministic for the fixed seeds; timings vary between runs and machines and
+are recorded with the machine description. The survival certificate, the exact
+lost-proof search, the guarded greedy policy and the shortcut cycle are analysis
+instruments, not application code and not a proposed agent. No model was
+trained.

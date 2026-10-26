@@ -212,6 +212,53 @@ class GuardedGreedyPolicy:
         )
 
 
+class ShortcutCyclePolicy:
+    """Hamiltonian cycle with order-preserving shortcuts (analysis baseline).
+
+    The body always lies in cycle order from tail to head, so every cell ahead of
+    the head up to the tail is free and following the cycle can never collide. A
+    jump to a neighbour further along the cycle keeps that order if it passes
+    neither the tail (safety) nor the fruit (each move then gets at least one step
+    closer to the fruit, so it is eaten within N moves). Jumps are only taken while
+    the snake fills less than ``max_fill`` of the board.
+    """
+
+    def __init__(self, max_fill: float) -> None:
+        self.max_fill = max_fill
+        self.position: dict[tuple[int, int], int] = {}
+
+    def __call__(self, state: GameState) -> Direction:
+        cells = state.width * state.height
+        if not self.position:
+            cycle = HamiltonianPolicy()
+            cycle(state)  # picks the cycle orientation that the body already follows
+            cell = state.head
+            for i in range(cells):
+                self.position[cell] = i
+                cell = cycle._chosen[cell]
+        position = self.position
+
+        def ahead(cell: tuple[int, int]) -> int:
+            return (position[cell] - position[state.head]) % cells
+
+        limit = min(ahead(state.tail), ahead(state.fruit) if state.fruit else cells)
+        longest = limit if state.length < self.max_fill * cells else 1
+        best, best_jump = None, 0
+        for d in safe_directions(state):
+            jump = ahead((state.head[0] + DX[d], state.head[1] + DY[d]))
+            if 0 < jump <= longest and jump > best_jump:
+                best, best_jump = d, jump
+        assert best is not None, "the body left cycle order"
+        return best
+
+
+def in_cycle_order(state: GameState, position: dict[tuple[int, int], int]) -> bool:
+    """Whether the body, read from tail to head, advances around the cycle less than one lap."""
+    cells = state.width * state.height
+    order = [position[cell] for cell in reversed(state.snake)]
+    return sum((b - a) % cells for a, b in zip(order, order[1:], strict=False)) < cells
+
+
 # -------------------------------------------------------------------- game helpers
 def play(
     game: SnakeGame,
@@ -524,6 +571,46 @@ def guarded_greedy_outcomes() -> dict:
     return result
 
 
+def shortcut_baseline() -> dict:
+    """Moves needed by the certified shortcut cycle, for several fill cutoffs."""
+    runs = (
+        (6, range(200), (0.5, 1.0)),
+        (10, range(100), (0.25, 0.4, 0.5, 0.6, 0.7, 1.0)),
+        (20, range(20), (0.25, 0.4, 0.5, 0.6, 0.7, 1.0)),
+    )
+    result = {}
+    for side, seeds, cutoffs in runs:
+        free = side * side - 3
+        rows = []
+        for cutoff in cutoffs:
+            moves, wins, order_checks = [], 0, 0
+            for seed in seeds:
+                game, policy = SnakeGame(GameConfig(side, side), seed=seed), ShortcutCyclePolicy(cutoff)
+                while not game.done:
+                    state = game.state()
+                    action = policy(state)
+                    if side <= 10:
+                        assert in_cycle_order(state, policy.position)
+                        order_checks += 1
+                    game.step(action)
+                wins += game.won
+                moves.append(game.steps)
+            rows.append(
+                {
+                    "max_fill": cutoff,
+                    "games": len(moves),
+                    "won": wins,
+                    "mean_moves": round(statistics.mean(moves), 1),
+                    "median_moves": statistics.median(moves),
+                    "max_moves": max(moves),
+                    "share_of_cycle_expectation": round(statistics.mean(moves) / (free * (free + 3) / 4), 3),
+                    "cycle_order_checks": order_checks,
+                }
+            )
+        result[f"{side}x{side}"] = {"plain_cycle_expected_moves": free * (free + 3) / 4, "cutoffs": rows}
+    return result
+
+
 def recovery() -> dict:
     """Reference policies started from certified, non-aligned 10x10 mid-game states."""
     size, cells = (10, 10), 100
@@ -761,6 +848,7 @@ def main() -> None:
         "death_horizons": death_horizons,
         "uncertified_moves": uncertified_moves,
         "guarded_greedy_outcomes": guarded_greedy_outcomes,
+        "shortcut_baseline": shortcut_baseline,
         "recovery": recovery,
         "costs": costs,
         "network_cost_model": network_cost_model,

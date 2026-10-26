@@ -1,5 +1,5 @@
 {
-  "repository_commit": "605ae41be2585af0aaa7641246d4d82a6b12571e",
+  "repository_commit": "bfbff414063523be4a6baf765cafca77691654c9",
   "python": "3.13.17",
   "numpy": "2.5.4",
   "machine": {
@@ -814,6 +814,163 @@
       "max_score": 397
     }
   },
+  "shortcut_baseline": {
+    "6x6": {
+      "plain_cycle_expected_moves": 297.0,
+      "cutoffs": [
+        {
+          "max_fill": 0.5,
+          "games": 200,
+          "won": 200,
+          "mean_moves": 214.1,
+          "median_moves": 213.0,
+          "max_moves": 260,
+          "share_of_cycle_expectation": 0.721,
+          "cycle_order_checks": 42823
+        },
+        {
+          "max_fill": 1.0,
+          "games": 200,
+          "won": 200,
+          "mean_moves": 290.0,
+          "median_moves": 289.0,
+          "max_moves": 373,
+          "share_of_cycle_expectation": 0.976,
+          "cycle_order_checks": 57999
+        }
+      ]
+    },
+    "10x10": {
+      "plain_cycle_expected_moves": 2425.0,
+      "cutoffs": [
+        {
+          "max_fill": 0.25,
+          "games": 100,
+          "won": 100,
+          "mean_moves": 1748.5,
+          "median_moves": 1736.0,
+          "max_moves": 2146,
+          "share_of_cycle_expectation": 0.721,
+          "cycle_order_checks": 174852
+        },
+        {
+          "max_fill": 0.4,
+          "games": 100,
+          "won": 100,
+          "mean_moves": 1504.4,
+          "median_moves": 1502.5,
+          "max_moves": 1779,
+          "share_of_cycle_expectation": 0.62,
+          "cycle_order_checks": 150442
+        },
+        {
+          "max_fill": 0.5,
+          "games": 100,
+          "won": 100,
+          "mean_moves": 1445.3,
+          "median_moves": 1451.0,
+          "max_moves": 1697,
+          "share_of_cycle_expectation": 0.596,
+          "cycle_order_checks": 144526
+        },
+        {
+          "max_fill": 0.6,
+          "games": 100,
+          "won": 100,
+          "mean_moves": 1479.3,
+          "median_moves": 1488.5,
+          "max_moves": 1756,
+          "share_of_cycle_expectation": 0.61,
+          "cycle_order_checks": 147935
+        },
+        {
+          "max_fill": 0.7,
+          "games": 100,
+          "won": 100,
+          "mean_moves": 1616.4,
+          "median_moves": 1619.0,
+          "max_moves": 1976,
+          "share_of_cycle_expectation": 0.667,
+          "cycle_order_checks": 161644
+        },
+        {
+          "max_fill": 1.0,
+          "games": 100,
+          "won": 100,
+          "mean_moves": 2306.3,
+          "median_moves": 2323.0,
+          "max_moves": 2760,
+          "share_of_cycle_expectation": 0.951,
+          "cycle_order_checks": 230631
+        }
+      ]
+    },
+    "20x20": {
+      "plain_cycle_expected_moves": 39700.0,
+      "cutoffs": [
+        {
+          "max_fill": 0.25,
+          "games": 20,
+          "won": 20,
+          "mean_moves": 25884.5,
+          "median_moves": 26123.5,
+          "max_moves": 27474,
+          "share_of_cycle_expectation": 0.652,
+          "cycle_order_checks": 0
+        },
+        {
+          "max_fill": 0.4,
+          "games": 20,
+          "won": 20,
+          "mean_moves": 21711.2,
+          "median_moves": 21769.0,
+          "max_moves": 23932,
+          "share_of_cycle_expectation": 0.547,
+          "cycle_order_checks": 0
+        },
+        {
+          "max_fill": 0.5,
+          "games": 20,
+          "won": 20,
+          "mean_moves": 20737.5,
+          "median_moves": 20778.5,
+          "max_moves": 21802,
+          "share_of_cycle_expectation": 0.522,
+          "cycle_order_checks": 0
+        },
+        {
+          "max_fill": 0.6,
+          "games": 20,
+          "won": 20,
+          "mean_moves": 21307.2,
+          "median_moves": 21372.0,
+          "max_moves": 22206,
+          "share_of_cycle_expectation": 0.537,
+          "cycle_order_checks": 0
+        },
+        {
+          "max_fill": 0.7,
+          "games": 20,
+          "won": 20,
+          "mean_moves": 23567,
+          "median_moves": 23652.0,
+          "max_moves": 24360,
+          "share_of_cycle_expectation": 0.594,
+          "cycle_order_checks": 0
+        },
+        {
+          "max_fill": 1.0,
+          "games": 20,
+          "won": 20,
+          "mean_moves": 38171.7,
+          "median_moves": 38277.5,
+          "max_moves": 40263,
+          "share_of_cycle_expectation": 0.962,
+          "cycle_order_checks": 0
+        }
+      ]
+    }
+  },
   "recovery": {
     "start_states": {
       "0.3": 59,
@@ -874,16 +1031,16 @@
         ],
         "occupancy": 0.1,
         "length": 40,
-        "us_clone_reseed_step": 2.07,
-        "us_state": 1.41,
-        "us_safe_directions": 1.3,
-        "us_observe_grid": 36.19,
-        "us_encode_cells_spec": 42.75,
-        "us_from_state_with_seed": 15.57,
-        "us_survival_certificate": 53.07,
+        "us_clone_reseed_step": 4.09,
+        "us_state": 2.58,
+        "us_safe_directions": 2.2,
+        "us_observe_grid": 38.19,
+        "us_encode_cells_spec": 53.59,
+        "us_from_state_with_seed": 21.04,
+        "us_survival_certificate": 81.47,
         "us_per_simulation_puct_without_network": {
-          "64": 9.51,
-          "256": 12.8
+          "64": 11.44,
+          "256": 17.64
         }
       },
       {
@@ -893,16 +1050,16 @@
         ],
         "occupancy": 0.5,
         "length": 200,
-        "us_clone_reseed_step": 3.65,
-        "us_state": 2.05,
-        "us_safe_directions": 1.01,
-        "us_observe_grid": 46.95,
-        "us_encode_cells_spec": 59.94,
-        "us_from_state_with_seed": 37.6,
-        "us_survival_certificate": 132.11,
+        "us_clone_reseed_step": 6.13,
+        "us_state": 3.8,
+        "us_safe_directions": 2.13,
+        "us_observe_grid": 96.86,
+        "us_encode_cells_spec": 80.27,
+        "us_from_state_with_seed": 49.11,
+        "us_survival_certificate": 159.23,
         "us_per_simulation_puct_without_network": {
-          "64": 10.71,
-          "256": 12.84
+          "64": 10.93,
+          "256": 19.32
         }
       },
       {
@@ -912,16 +1069,16 @@
         ],
         "occupancy": 0.9,
         "length": 360,
-        "us_clone_reseed_step": 4.5,
-        "us_state": 2.88,
-        "us_safe_directions": 1.16,
-        "us_observe_grid": 86.2,
-        "us_encode_cells_spec": 103.86,
-        "us_from_state_with_seed": 64.59,
-        "us_survival_certificate": 19.9,
+        "us_clone_reseed_step": 3.62,
+        "us_state": 2.25,
+        "us_safe_directions": 0.92,
+        "us_observe_grid": 67.45,
+        "us_encode_cells_spec": 105.33,
+        "us_from_state_with_seed": 82.65,
+        "us_survival_certificate": 33.99,
         "us_per_simulation_puct_without_network": {
-          "64": 14.1,
-          "256": 19.0
+          "64": 15.48,
+          "256": 14.35
         }
       },
       {
@@ -931,16 +1088,16 @@
         ],
         "occupancy": 0.5,
         "length": 50,
-        "us_clone_reseed_step": 2.14,
-        "us_state": 1.14,
-        "us_safe_directions": 0.93,
-        "us_observe_grid": 30.64,
-        "us_encode_cells_spec": 41.21,
-        "us_from_state_with_seed": 20.84,
-        "us_survival_certificate": 52.95,
+        "us_clone_reseed_step": 2.69,
+        "us_state": 1.46,
+        "us_safe_directions": 1.17,
+        "us_observe_grid": 38.19,
+        "us_encode_cells_spec": 38.4,
+        "us_from_state_with_seed": 21.35,
+        "us_survival_certificate": 51.37,
         "us_per_simulation_puct_without_network": {
-          "64": 7.62,
-          "256": 10.43
+          "64": 13.46,
+          "256": 17.2
         }
       }
     ]

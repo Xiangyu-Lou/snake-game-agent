@@ -29,14 +29,21 @@ graph-based hierarchical planning and certified cycle execution.
 - Existing-policy rollouts and interface checks have been executed. Neural
   architectures, training settings, and evaluation gates are proposals; no
   learned model has been trained as part of this analysis.
+- The project owner has clarified the objective: computation time per move does
+  not matter, but the number of moves does. Fill the board first, then use as
+  few moves as possible. A certified shortcut cycle completes every tested game
+  in about half the plain cycle's moves on 20×20 and is the reference to beat.
 - The Architecture B review keeps B as the main design and recommends six
-  changes: gate B on recovery and demonstration-free tracks, because imitation
-  alone can pass the standard-start gate; count N moves without fruit as a
-  training loss, because loops become the main failure once deaths are
-  prevented; use an exact survival certificate in search, inputs, and labels;
-  use Gumbel root search with 8–32 simulations and adaptive budgets; add
-  bootstrapped and exact value labels; and replace PPO with self-play from 4×4
-  upward, using size-independent geometry.
+  changes:
+  - Gate completion first and moves second, with recovery and
+    demonstration-free tracks, because imitation alone can pass the
+    standard-start gate.
+  - Learn win probability and remaining moves as separate heads, combined by a
+    bounded tie-break. Keep N moves without fruit as a training loss.
+  - Use an exact survival certificate in search, inputs and labels.
+  - Use Gumbel root search with 8–32 simulations and adaptive budgets.
+  - Add bootstrapped and exact value labels.
+  - Replace PPO with self-play from 4×4 upward, using size-independent geometry.
 
 ## Reports
 
@@ -57,8 +64,8 @@ graph-based hierarchical planning and certified cycle execution.
   the decisions left to the project owner.
 - [Architecture B probe](architecture_b_probe.py) and
   [measured results](architecture_b_probe_results.json): survival certificate,
-  death horizons, loop outcomes, recovery baselines, branching, and search and
-  network costs supporting the review.
+  death horizons, loop outcomes, the shortcut-cycle speed reference, recovery
+  baselines, branching, and search and network costs supporting the review.
 
 ## Reproduce the Baseline Evidence
 
@@ -79,5 +86,5 @@ The review's measurements are reproduced the same way:
 .venv/bin/python analysis/architecture_b_probe.py
 ```
 
-It takes about three minutes and rewrites `architecture_b_probe_results.json`.
+It takes about four minutes and rewrites `architecture_b_probe_results.json`.
 Outcomes and counts are deterministic; timings depend on the machine.

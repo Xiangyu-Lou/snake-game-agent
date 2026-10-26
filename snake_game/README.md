@@ -63,7 +63,7 @@ python -m snake_game --help                   # board size, seed, cell size, ...
 
 The window is resizable. Moves are animated (the snake slides between cells),
 eating bursts into particles, crashing shakes the board, and a filled board ends
-in confetti.
+in confetti and a "Level cleared!" card.
 
 ## Rules
 
@@ -82,8 +82,11 @@ in confetti.
   `StepResult.collision` tells where it tried to go.
 - Eating a fruit scores **one point** and grows the snake by one segment. The next
   fruit appears on a uniformly random free cell.
-- The game is **won** when the snake covers the whole board (a score of
-  `width * height - 3`, i.e. 397 on 20 x 20).
+- The level is **cleared** when the snake covers the whole board, i.e. when it
+  eats the last fruit (a score of `width * height - 3`, 397 on 20 x 20). This is a
+  win, not a death: the game ends with `Status.WON` and no `death_cause`, and the
+  environments report `terminated=True`, `won=True`, `hit_wall=False`,
+  `hit_self=False` and no death penalty.
 
 Fruit placement is the only randomness. It is deterministic given a seed: the
 `k`-th fruit of an episode is the `k`-th output of a SplitMix64 stream keyed by the

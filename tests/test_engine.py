@@ -163,7 +163,8 @@ def test_filling_the_board_wins():
     game = make_game([(0, 0), (1, 0), (1, 1)], Direction.LEFT, (0, 1), width=2, height=2)
     result = game.step(Direction.DOWN)
     assert result.ate_fruit and result.won and result.done
-    assert game.status is Status.WON and game.won
+    assert not result.lost and result.death_cause is None and result.collision is None
+    assert game.status is Status.WON and game.won and game.death_cause is None
     assert game.fruit is None and game.length == 4
     with pytest.raises(GameOverError):
         game.step(Direction.UP)

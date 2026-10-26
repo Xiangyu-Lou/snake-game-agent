@@ -17,7 +17,7 @@ from ..engine import DeathCause, Direction, GameConfig, SnakeGame, Status, StepR
 from ..policies import GreedyPolicy
 from . import hud
 from .renderer import BoardRenderer
-from .theme import DEFAULT_THEME, Fonts, Theme, aacircle, gradient, radial_glow, vertical_gradient
+from .theme import DEFAULT_THEME, Color, Fonts, Theme, aacircle, gradient, radial_glow, vertical_gradient
 
 SPEEDS: tuple[float, ...] = (
     1,
@@ -543,39 +543,19 @@ class SnakeApp:
         elif game.done and self._over_since is not None:
             appear = (now - self._over_since - (0.55 if game.status is Status.LOST else 0.9)) / 0.35
             footer = [("Enter", "play again"), ("M", "mode"), ("P", "agent" if not self.autopilot else "you")]
-            if game.won:
-                hud.overlay_card(
-                    screen,
-                    fonts,
-                    th,
-                    board,
-                    "Perfect game!",
-                    [
-                        ("The snake fills the whole board.", th.text_dim),
-                        (f"Score {game.score}  ·  {game.steps} moves", th.gold),
-                    ],
-                    appear=appear,
-                    title_color=th.gold,
-                    footer=footer,
-                    scale=s,
-                )
-            else:
-                cause = "Hit the wall" if game.death_cause is DeathCause.WALL else "Ran into itself"
-                lines = [(cause, th.text_dim), (f"Score {game.score}  ·  Length {game.length}", th.text)]
-                if self._new_best and game.score == self.best:
-                    lines.append(("New best score!", th.gold))
-                hud.overlay_card(
-                    screen,
-                    fonts,
-                    th,
-                    board,
-                    "Game over",
-                    lines,
-                    appear=appear,
-                    title_color=th.danger,
-                    footer=footer,
-                    scale=s,
-                )
+            title, lines, color = self.end_card()
+            hud.overlay_card(
+                screen,
+                fonts,
+                th,
+                board,
+                title,
+                lines,
+                appear=appear,
+                title_color=color,
+                footer=footer,
+                scale=s,
+            )
         elif self.controller.mode is GameMode.AUTO and self.controller.paused and not self._waiting_start:
             hud.overlay_card(
                 screen,
@@ -616,6 +596,24 @@ class SnakeApp:
             hud.toast(
                 screen, fonts, th, (board.centerx, board.y + round(16 * s)), message, alpha, round(14 * s)
             )
+
+    def end_card(self) -> tuple[str, list[tuple[str, Color]], Color]:
+        """Title, lines and title colour of the card shown when the game is over.
+
+        Filling the board clears the level: it is a win, never a death.
+        """
+        game, th = self.game, self.theme
+        if game.won:
+            lines = [
+                ("The snake fills the whole board.", th.text_dim),
+                (f"Score {game.score}  ·  {game.steps} moves", th.gold),
+            ]
+            return "Level cleared!", lines, th.gold
+        cause = "Hit the wall" if game.death_cause is DeathCause.WALL else "Ran into itself"
+        lines = [(cause, th.text_dim), (f"Score {game.score}  ·  Length {game.length}", th.text)]
+        if self._new_best and game.score == self.best:
+            lines.append(("New best score!", th.gold))
+        return "Game over", lines, th.danger
 
     def _draw_help(self, board: pygame.Rect) -> None:
         screen, fonts, th = self._screen, self.fonts, self.theme

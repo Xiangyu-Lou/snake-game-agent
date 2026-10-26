@@ -149,10 +149,30 @@ def test_game_over_and_restart(app):
         press(app, pygame.K_RIGHT)
     assert app.game.done and app.game.death_cause is DeathCause.WALL
     assert app.games == 1
+    assert app.end_card()[0] == "Game over"
     for _ in range(5):
         app.frame(1 / 60)
     press(app, pygame.K_RETURN)
     assert not app.game.done and app.game.steps == 0
+
+
+def test_filling_the_board_clears_the_level():
+    app = SnakeApp(
+        GameConfig(4, 4), seed=3, agent=HamiltonianPolicy(), mode="auto", speed=math.inf, cell_size=20
+    )
+    app.open()
+    try:
+        while not app.game.done:
+            app.frame(1 / 60)
+        assert app.game.status is Status.WON and app.game.death_cause is None
+        assert app.games == 1 and app.best == GameConfig(4, 4).max_score
+        title, lines, _ = app.end_card()
+        assert title == "Level cleared!"
+        assert "fills the whole board" in lines[0][0]
+        app._over_since -= 2.0  # past the end-of-game animation: the card is drawn
+        app.frame(1 / 60)
+    finally:
+        app.close()
 
 
 def test_agent_wins_and_auto_restarts():

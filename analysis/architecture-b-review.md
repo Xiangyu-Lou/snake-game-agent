@@ -210,15 +210,20 @@ a move:
    scores `0.8 + 0.2 · S`, where `S` is the share of the plain cycle's moves
    saved, and anything else scores 0. The search maximizes the expected score,
    `P_win · (0.8 + 0.2 · S)`, with `S` computed from the moves so far plus `M`.
-   Because the speed bonus only counts for a filled board, dying always scores
-   below any win, so the crash problem of per-move penalties cannot arise. The
-   weights enter only at decision time, so the 0.2 weight does not shrink what
-   the moves head learns.
-3. **The owner's schedule falls out of this rule.** Early in the game every safe
-   move has nearly the same win probability, so the speed term decides. Late in
-   the game a risky move loses more through `P_win` than it gains in speed. On
-   20×20 one saved move is worth at most 5.6 × 10⁻⁶ of win probability, so no
-   single decision trades much safety for speed.
+   The score is never negative and is earned only by filling the board, so
+   ending a game early always earns the minimum: unlike a per-move penalty, this
+   score never makes crashing attractive. It does not make the agent risk-free.
+   A game ends in a win or a death, never both, so the agent never chooses
+   between the two. It chooses between moves that differ in their chance of
+   winning and in moves saved, and the weights set how many saved moves justify
+   a risk (§4, decision 1). The weights enter only at decision time, so the 0.2
+   weight does not shrink what the moves head learns.
+3. **The owner's schedule falls out of this rule.** A move is worth extra risk
+   only if it saves enough moves. On 20×20 each saved move justifies at most
+   5.6 × 10⁻⁶ of win probability, so a 1% risk of death needs about 1,800 saved
+   moves. Early in the game most moves carry almost no risk, so the speed term
+   decides. Late in the game risky moves usually cost more win probability than
+   their saved moves justify, so safety decides.
 4. **Timeout as a backstop.** In training, a game is lost after N + L
    consecutive moves without fruit, where L is the snake's current length (the
    owner's choice: the allowance grows with the snake, from N to about 2N). It
@@ -476,6 +481,12 @@ specification it implies:
    - **Exchange rate:** the agent gives up one percentage point of completion
      only to save about 4.5% of `T_cycle`. That is 1,805 moves on 20×20, 110 on
      10×10 and 14 on 6×6.
+   - **The weights do trade risk for speed.** On 20×20, a route with a 1% chance
+     of death that saves 2,000 moves scores 0.901, against 0.900 for the safe
+     route, so the agent takes it. At 1,500 moves saved it does not. If no
+     death risk should ever be traded for speed, replace the weights with a
+     lexicographic rule: speed only breaks ties between moves of equal win
+     probability.
    - **Gate conflict:** if training settles below the 99% completion gate, the
      gate wins and the win weight goes up.
 2. **Safety envelope: evaluate both ways.** On T1 the same network is evaluated

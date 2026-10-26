@@ -38,12 +38,22 @@ graph-based hierarchical planning and certified cycle execution.
   - Gate completion first and moves second, with recovery and
     demonstration-free tracks, because imitation alone can pass the
     standard-start gate.
-  - Learn win probability and remaining moves as separate heads, combined by a
-    bounded tie-break. Keep N moves without fruit as a training loss.
+  - Learn win probability and remaining moves as separate heads, and never
+    trade death risk for speed. Count N + L moves without fruit as a training
+    loss.
   - Use an exact survival certificate in search, inputs and labels.
   - Use Gumbel root search with 8–32 simulations and adaptive budgets.
   - Add bootstrapped and exact value labels.
   - Replace PPO with self-play from 4×4 upward, using size-independent geometry.
+- The owner's decisions (review §4):
+  - Never accept extra death risk for speed: fewer moves only decides between
+    equally safe moves.
+  - On standard starts every game stays inside the cycle-order envelope. There
+    every allowed move keeps the certainty of filling the board, so completion is
+    guaranteed and learning goes into speed.
+  - A game is lost after N + L moves without fruit.
+  - The stack is PyTorch, on one rented 24 GB GPU with 16–32 CPU cores from
+    milestone M2, about 100 GPU-hours in total.
 
 ## Reports
 

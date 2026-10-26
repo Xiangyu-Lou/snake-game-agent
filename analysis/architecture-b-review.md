@@ -486,8 +486,9 @@ specification it implies:
    safe route.
 2. **Safety envelope: always on where it applies.** Under decision 1, leaving
    the envelope on a standard start can never reduce risk and may add some, so
-   every T1 game is played inside it, and completion on T1 is guaranteed. A T1 failure is a bug, and the
-   T1 gate measures moves. Free choice is used only where no envelope exists:
+   every T1 game is played inside it, and completion on T1 is guaranteed. A T1
+   failure is a bug, and the T1 gate measures moves. Free choice is used only
+   where no envelope exists:
    recovery starts (T2) and odd-by-odd boards. This supersedes the earlier plan
    to evaluate free choice on T1 as well.
 3. **Timeout: yes, growing with the snake.** A game is lost after N + L

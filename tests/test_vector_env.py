@@ -4,7 +4,8 @@ import pytest
 from gymnasium.vector import AutoresetMode, SyncVectorEnv
 from gymnasium.wrappers.vector import DictInfoToList, RecordEpisodeStatistics
 
-from snake_game import GameConfig, SnakeEnv, SnakeGame, VectorSnakeEnv
+from snake_game import GameConfig, SnakeEnv, SnakeGame, Status, VectorSnakeEnv
+from snake_game.policies import HamiltonianPolicy
 
 BOARD_8 = GameConfig(8, 8)
 
@@ -101,6 +102,23 @@ def test_matches_gymnasium_sync_vector_env(mode):
                 np.testing.assert_array_equal(info_a["final_obs"][i], info_b["final_obs"][i])
                 assert info_a["final_info"]["score"][i] == info_b["final_info"]["score"][i]
     reference.close()
+
+
+def test_filling_the_board_is_a_win_not_a_death():
+    n = 3
+    venv = VectorSnakeEnv(n, 4, 4, max_steps_without_fruit=None)  # NextStep: the final state stays visible
+    venv.reset(seed=0)
+    policies = [HamiltonianPolicy() for _ in range(n)]
+    endings = {}
+    while len(endings) < n:
+        actions = np.array([int(policy(venv.state(i))) for i, policy in enumerate(policies)])
+        _, rewards, terms, truncs, infos = venv.step(actions)
+        for i in np.flatnonzero(terms | truncs):
+            flags = (rewards[i], truncs[i], infos["won"][i], infos["hit_wall"][i], infos["hit_self"][i])
+            endings.setdefault(int(i), (venv.state(i), flags))
+    for state, flags in endings.values():
+        assert state.status is Status.WON and state.death_cause is None and state.length == 16
+        assert flags == (1.0, False, True, False, False)  # reward = fruit, no death penalty
 
 
 def test_next_step_autoreset_semantics():

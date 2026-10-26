@@ -99,9 +99,10 @@ def test_custom_rewards_and_win_bonus():
     env = SnakeEnv(2, 2, 2, rewards=rewards)
     state = GameState(2, 2, ((0, 0), (1, 0), (1, 1)), Direction.LEFT, (0, 1))
     env.reset(options={"state": state})
-    _, reward, term, _, info = env.step(Direction.DOWN)
-    assert term and info["won"]
-    assert reward == pytest.approx(2.0 + 10.0 - 0.01)
+    _, reward, term, trunc, info = env.step(Direction.DOWN)
+    assert term and not trunc and info["won"]
+    assert not info["hit_wall"] and not info["hit_self"]  # a full board is a win, not a death
+    assert reward == pytest.approx(2.0 + 10.0 - 0.01)  # no death penalty
 
 
 def test_truncation_after_steps_without_fruit():

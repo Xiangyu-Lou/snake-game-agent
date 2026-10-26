@@ -1,0 +1,367 @@
+{
+  "repository_commit": "a5ab92e3ebc696e5539c136409186f53531b8de4",
+  "python": "3.12.14",
+  "numpy": "2.5.4",
+  "protocol": {
+    "board": [
+      20,
+      20
+    ],
+    "initial_length": 3,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "max_episode_steps": 160000,
+    "runner": "SnakeGame (no Gymnasium truncation)",
+    "purpose": "Illustrative baseline and interface checks, not a model comparison"
+  },
+  "baselines": [
+    {
+      "policy": "random",
+      "episodes": [
+        {
+          "seed": 0,
+          "score": 4,
+          "steps": 1718,
+          "outcome": "lost"
+        },
+        {
+          "seed": 1,
+          "score": 6,
+          "steps": 1852,
+          "outcome": "lost"
+        },
+        {
+          "seed": 2,
+          "score": 6,
+          "steps": 1907,
+          "outcome": "lost"
+        },
+        {
+          "seed": 3,
+          "score": 5,
+          "steps": 2151,
+          "outcome": "lost"
+        },
+        {
+          "seed": 4,
+          "score": 5,
+          "steps": 2588,
+          "outcome": "lost"
+        },
+        {
+          "seed": 5,
+          "score": 3,
+          "steps": 1764,
+          "outcome": "lost"
+        }
+      ],
+      "wins": 0,
+      "censored": 0,
+      "mean_score": 4.833333333333333,
+      "mean_steps": 1996.6666666666667
+    },
+    {
+      "policy": "greedy",
+      "episodes": [
+        {
+          "seed": 0,
+          "score": 81,
+          "steps": 1518,
+          "outcome": "lost"
+        },
+        {
+          "seed": 1,
+          "score": 109,
+          "steps": 2519,
+          "outcome": "lost"
+        },
+        {
+          "seed": 2,
+          "score": 113,
+          "steps": 2221,
+          "outcome": "lost"
+        },
+        {
+          "seed": 3,
+          "score": 132,
+          "steps": 2940,
+          "outcome": "lost"
+        },
+        {
+          "seed": 4,
+          "score": 118,
+          "steps": 2821,
+          "outcome": "lost"
+        },
+        {
+          "seed": 5,
+          "score": 116,
+          "steps": 2572,
+          "outcome": "lost"
+        }
+      ],
+      "wins": 0,
+      "censored": 0,
+      "mean_score": 111.5,
+      "mean_steps": 2431.8333333333335
+    },
+    {
+      "policy": "hamiltonian",
+      "episodes": [
+        {
+          "seed": 0,
+          "score": 397,
+          "steps": 39390,
+          "outcome": "won"
+        },
+        {
+          "seed": 1,
+          "score": 397,
+          "steps": 41366,
+          "outcome": "won"
+        },
+        {
+          "seed": 2,
+          "score": 397,
+          "steps": 39897,
+          "outcome": "won"
+        },
+        {
+          "seed": 3,
+          "score": 397,
+          "steps": 37657,
+          "outcome": "won"
+        },
+        {
+          "seed": 4,
+          "score": 397,
+          "steps": 40287,
+          "outcome": "won"
+        },
+        {
+          "seed": 5,
+          "score": 397,
+          "steps": 40227,
+          "outcome": "won"
+        }
+      ],
+      "wins": 6,
+      "censored": 0,
+      "mean_score": 397,
+      "mean_steps": 39804
+    }
+  ],
+  "feature_alias": {
+    "first": {
+      "width": 6,
+      "height": 6,
+      "snake": [
+        [
+          3,
+          3
+        ],
+        [
+          3,
+          2
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          5,
+          1
+        ],
+        [
+          5,
+          2
+        ]
+      ],
+      "direction": "RIGHT",
+      "fruit": [
+        0,
+        0
+      ],
+      "score": 5,
+      "steps": 0,
+      "steps_since_fruit": 0,
+      "status": "running",
+      "death_cause": null,
+      "segment_directions": [
+        "RIGHT",
+        "DOWN",
+        "DOWN",
+        "DOWN",
+        "LEFT",
+        "LEFT",
+        "UP",
+        "UP"
+      ]
+    },
+    "second": {
+      "width": 6,
+      "height": 6,
+      "snake": [
+        [
+          3,
+          3
+        ],
+        [
+          3,
+          2
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          4,
+          0
+        ],
+        [
+          4,
+          1
+        ],
+        [
+          5,
+          1
+        ],
+        [
+          5,
+          2
+        ]
+      ],
+      "direction": "RIGHT",
+      "fruit": [
+        0,
+        0
+      ],
+      "score": 5,
+      "steps": 0,
+      "steps_since_fruit": 0,
+      "status": "running",
+      "death_cause": null,
+      "segment_directions": [
+        "RIGHT",
+        "DOWN",
+        "DOWN",
+        "DOWN",
+        "LEFT",
+        "UP",
+        "LEFT",
+        "UP"
+      ]
+    },
+    "features": [
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.6000000238418579,
+      0.6000000238418579,
+      -0.6000000238418579,
+      -0.6000000238418579,
+      0.4000000059604645,
+      -0.20000000298023224,
+      0.2222222238779068,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.4000000059604645,
+      0.4000000059604645,
+      0.6000000238418579
+    ]
+  },
+  "interface_checks": {
+    "trapped_state": {
+      "width": 3,
+      "height": 3,
+      "snake": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          2
+        ]
+      ],
+      "direction": "UP",
+      "fruit": [
+        2,
+        2
+      ],
+      "score": 0,
+      "steps": 0,
+      "steps_since_fruit": 0,
+      "status": "running",
+      "death_cause": null,
+      "segment_directions": [
+        "UP",
+        "LEFT",
+        "DOWN",
+        "RIGHT",
+        "RIGHT",
+        "UP",
+        "UP",
+        "LEFT"
+      ]
+    },
+    "safe_actions": [],
+    "gym_mask": [
+      true,
+      true,
+      false,
+      true
+    ],
+    "default_20x20_fruit_timeout": 400
+  }
+}

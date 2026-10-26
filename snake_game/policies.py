@@ -14,7 +14,14 @@ from collections import deque
 
 from .engine import DELTAS, Direction, GameState, Position
 
-__all__ = ["RandomPolicy", "GreedyPolicy", "HamiltonianPolicy", "POLICIES", "safe_directions"]
+__all__ = [
+    "RandomPolicy",
+    "GreedyPolicy",
+    "HamiltonianPolicy",
+    "POLICIES",
+    "hamiltonian_cycles",
+    "safe_directions",
+]
 
 
 def _neighbour(position: Position, direction: Direction) -> Position:
@@ -125,6 +132,11 @@ class HamiltonianPolicy:
         self._cycles: dict[tuple[int, int], list[dict[Position, Position]]] = {}
         self._chosen: dict[Position, Position] | None = None
 
+    @property
+    def cycle(self) -> dict[Position, Position] | None:
+        """The cycle being followed (cell -> next cell); ``None`` before the first move."""
+        return self._chosen
+
     def __call__(self, state: GameState) -> Direction:
         cycle = self._cycle(state)
         target = cycle[state.head]
@@ -160,24 +172,33 @@ class HamiltonianPolicy:
     def _candidates(self, width: int, height: int) -> list[dict[Position, Position]]:
         key = (width, height)
         if key not in self._cycles:
-            if width % 2 and height % 2:
-                raise ValueError(f"a {width}x{height} board has no Hamiltonian cycle (both sides odd)")
-            paths = []
-            if height % 2 == 0 and width >= 2:
-                paths.append(_serpentine(width, height))
-            if width % 2 == 0 and height >= 2:
-                paths.append([(x, y) for y, x in _serpentine(height, width)])
-            variants = []
-            for path in paths:
-                for mirrored in (path, [(width - 1 - x, y) for x, y in path]):
-                    for oriented in (mirrored, mirrored[::-1]):
-                        variants.append(
-                            {cell: oriented[(i + 1) % len(oriented)] for i, cell in enumerate(oriented)}
-                        )
-            if not variants:
-                raise ValueError(f"no Hamiltonian cycle construction for a {width}x{height} board")
-            self._cycles[key] = variants
+            self._cycles[key] = hamiltonian_cycles(width, height)
         return self._cycles[key]
+
+
+def hamiltonian_cycles(width: int, height: int) -> list[dict[Position, Position]]:
+    """The cycles :class:`HamiltonianPolicy` chooses from, in its order of preference.
+
+    Each cycle maps every cell to the next one. They are serpentines along rows
+    (even ``height``) or columns (even ``width``), mirrored and in both directions.
+    Raises ``ValueError`` if both sides are odd (no Hamiltonian cycle exists) or
+    the board is a single row or column.
+    """
+    if width % 2 and height % 2:
+        raise ValueError(f"a {width}x{height} board has no Hamiltonian cycle (both sides odd)")
+    paths = []
+    if height % 2 == 0 and width >= 2:
+        paths.append(_serpentine(width, height))
+    if width % 2 == 0 and height >= 2:
+        paths.append([(x, y) for y, x in _serpentine(height, width)])
+    variants = []
+    for path in paths:
+        for mirrored in (path, [(width - 1 - x, y) for x, y in path]):
+            for oriented in (mirrored, mirrored[::-1]):
+                variants.append({cell: oriented[(i + 1) % len(oriented)] for i, cell in enumerate(oriented)})
+    if not variants:
+        raise ValueError(f"no Hamiltonian cycle construction for a {width}x{height} board")
+    return variants
 
 
 def _serpentine(width: int, height: int) -> list[Position]:

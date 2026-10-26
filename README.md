@@ -14,8 +14,13 @@ screen either; it reads the exact positions of the snake and the fruit.
    environments for one game or thousands at once, and an animated UI that can be
    switched off during training.
    **Documentation: [`snake_game/README.md`](snake_game/README.md)**
-2. **The agent** (next): a model trained on the game's exact state to play a
-   perfect game.
+2. **The agent** (in progress): a model trained on the game's exact state to play
+   a perfect game, following the [Architecture B plan](analysis/architecture-b-review.md).
+   Milestone M0 is done: the information contract, the exact instruments
+   (survival certificate, lost-proof search, cycle-order envelope, shortcut
+   cycle), the evaluation harness for standard and recovery starts, and an exact
+   solution of 4×4. It reproduces the reference numbers of the plan's probe.
+   **Documentation: [`snake_agent/README.md`](snake_agent/README.md)**
 
 ## Quick start
 
@@ -24,6 +29,7 @@ pip install -e ".[ui]"
 python -m snake_game                                             # play: one move per key press
 python -m snake_game --mode auto                                 # classic real-time Snake
 python -m snake_game --agent hamiltonian --mode auto --speed max # watch a perfect game
+python -m snake_agent evaluate t1 --agent shortcut --board 10x10 # evaluate on held-out games
 ```
 
 ```python
@@ -46,6 +52,8 @@ automatically.
 | Path | Contents |
 | --- | --- |
 | [`snake_game/`](snake_game/) | the game: engine, Gymnasium environments, pygame UI ([README](snake_game/README.md)) |
+| [`snake_agent/`](snake_agent/) | the agent: contract, exact instruments, evaluation harness, exact 4×4 solution ([README](snake_agent/README.md)) |
+| [`analysis/`](analysis/) | design reports and the probes behind them ([README](analysis/README.md)) |
 | [`tests/`](tests/) | test suite: `pip install -e ".[dev]"`, then `pytest` |
 | [`.github/workflows/`](.github/workflows/) | continuous integration |
 

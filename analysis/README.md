@@ -29,6 +29,21 @@ graph-based hierarchical planning and certified cycle execution.
 - Existing-policy rollouts and interface checks have been executed. Neural
   architectures, training settings, and evaluation gates are proposals; no
   learned model has been trained as part of this analysis.
+- The project owner has clarified the objective: computation time per move does
+  not matter, but the number of moves does. Fill the board first, then use as
+  few moves as possible. A certified shortcut cycle completes every tested game
+  in about half the plain cycle's moves on 20×20 and is the reference to beat.
+- The Architecture B review keeps B as the main design and recommends six
+  changes:
+  - Gate completion first and moves second, with recovery and
+    demonstration-free tracks, because imitation alone can pass the
+    standard-start gate.
+  - Learn win probability and remaining moves as separate heads, combined by a
+    bounded tie-break. Keep N moves without fruit as a training loss.
+  - Use an exact survival certificate in search, inputs and labels.
+  - Use Gumbel root search with 8–32 simulations and adaptive budgets.
+  - Add bootstrapped and exact value labels.
+  - Replace PPO with self-play from 4×4 upward, using size-independent geometry.
 
 ## Reports
 
@@ -44,6 +59,13 @@ graph-based hierarchical planning and certified cycle execution.
 - [Context management and initial rewards](context-and-initial-rewards.md):
   single-state context, trajectory/search memory, a concrete reward warm-up,
   reward/penalty scales, and transition to the terminal-completion objective.
+- [Architecture B review](architecture-b-review.md): verification of the reports,
+  six gaps in the B plan with measured evidence, a milestone plan with gates, and
+  the decisions left to the project owner.
+- [Architecture B probe](architecture_b_probe.py) and
+  [measured results](architecture_b_probe_results.json): survival certificate,
+  death horizons, loop outcomes, the shortcut-cycle speed reference, recovery
+  baselines, branching, and search and network costs supporting the review.
 
 ## Reproduce the Baseline Evidence
 
@@ -57,3 +79,12 @@ The script runs 18 standard-board episodes and checks feature aliasing and actio
 mask behavior. It rewrites `architecture_probe_results.json` with the current
 source commit and measurements; the committed result records the revision used
 for the report. Review generated differences before committing another run.
+
+The review's measurements are reproduced the same way:
+
+```bash
+.venv/bin/python analysis/architecture_b_probe.py
+```
+
+It takes about four minutes and rewrites `architecture_b_probe_results.json`.
+Outcomes and counts are deterministic; timings depend on the machine.

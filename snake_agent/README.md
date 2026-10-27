@@ -417,11 +417,16 @@ the prefix runs start 37.5% of the games after a prefix (fill up to 75%) and
 | M1 | 10 | 213.3 | 0.26 | 0.34 | 3.0 | 0.61 | 0.73 |
 | M1 | 20 | 210.3 | 0.17 | 0.29 | 4.7 | 0.58 | 0.80 |
 | M1 | 30 | 211.5 | 0.20 | 0.45 | 4.9 | 0.56 | 0.83 |
+| M1 | 40 | 213.7 | 0.26 | 0.39 | 4.5 | 0.54 | 0.83 |
 | Prefixes | 10 | 211.1 | 0.19 | 0.22 | 3.2 | 0.65 | 0.74 |
 | Prefixes | 20 | **208.3** | **0.11** | 0.29 | 3.8 | 0.55 | 0.81 |
 | Prefixes | 30 | 210.5 | 0.17 | 0.34 | 4.6 | 0.57 | 0.85 |
-| Prefixes and siblings | 10 | 213.6 | 0.29 | 0.26 | 3.6 | 0.56 | 0.78 |
-| Prefixes and siblings | 20 | 213.2 | 0.22 | 0.27 | 4.1 | **0.63** | **0.93** |
+| Prefixes and siblings, first run | 10 | 213.6 | 0.29 | 0.26 | 3.6 | 0.56 | 0.78 |
+| Prefixes and siblings, first run | 20 | 213.2 | 0.22 | 0.27 | 4.1 | 0.63 | 0.93 |
+| Prefixes and siblings | 10 | 213.7 | 0.25 | 0.23 | 3.0 | 0.61 | 0.75 |
+| Prefixes and siblings | 20 | 213.7 | 0.21 | 0.29 | 3.5 | 0.53 | 0.88 |
+| Prefixes and siblings | 30 | 218.6 | 0.28 | 0.32 | 4.0 | 0.51 | **0.94** |
+| Prefixes and siblings | 40 | 217.7 | 0.29 | 0.37 | 3.7 | 0.52 | **0.94** |
 
 The raw policy's numbers are over 300 validation games, the search's (16
 simulations, one-move unit) over 200; "error" is in moves, "agreement" the
@@ -432,21 +437,23 @@ share of pairs ordered as the exact solution orders them.
   the 16-simulation search with a 16-move unit costs 0.13 extra moves per
   decision against 0.17 (300 games each). They do not stop the ranking in the
   first half from degrading, nor the decline after generation 20.
-- **Sibling examples make a better moves head**, as intended: at generation 20
-  it orders 93% of second-half pairs as the exact solution does (81% with
-  prefixes alone), with an error of 3.1 moves against 5.9, and 63% in the first
-  half. The policy learns more slowly (0.22 extra moves per decision at
-  generation 20), and the search with the one-move unit still trails it.
-  Whether the better values pay off later is open: continuing this run from
-  generation 20 with an empty replay buffer and a fresh optimizer (`--init`)
-  collapsed (220.9 moves at generation 30, first-half agreement 0.53), which
-  says more about the restart than about the method.
+- **Sibling examples make a better moves head late in the game, not a better
+  agent.** Two runs (the first stopped at generation 20, the second run to 40
+  with other seeds) order 88% to 94% of second-half pairs as the exact solution
+  does, against 80% to 85% without them. The first half does not improve: 63%
+  and 53% at generation 20 in the two runs, which also shows how much this
+  measure varies between runs. The policy is worse throughout (the runs' best
+  checkpoints average 213.2 and 213.7 moves, against 208.3 with prefixes
+  alone) and declines after generation 20 as well (217.7 at generation 40).
+  Continuing the first run from generation 20 with `--init`, so with an empty
+  replay buffer and a fresh optimizer, collapsed within ten generations (220.9
+  moves): a restart needs the replay buffer too.
 - **Open.** In every run the policy peaks around generation 20 and then
-  declines while the losses keep falling, and early in the game no variant
-  orders close moves much better than chance: they differ by 0.6 to 1.5 moves
-  out of about 170 still to come. Next steps: a full sibling run without a
-  restart, a decaying learning rate or fewer updates per generation against
-  the late decline, and value targets precise enough for the first half.
+  declines while the losses keep falling, whatever the values late in the game.
+  Early in the game no variant orders close moves much better than chance:
+  they differ by 0.6 to 1.5 moves out of about 170 still to come. Next steps: a
+  decaying learning rate or fewer updates per generation against the late
+  decline, and value targets precise enough for the first half.
 
 ## Reproducing the probe
 

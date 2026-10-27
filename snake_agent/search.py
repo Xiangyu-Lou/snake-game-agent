@@ -32,9 +32,13 @@ Leaves and pruning:
   without moves is a loss.
 
 Values are pairs: the probability of filling the board, and the expected moves
-until then, with a lost game counted as :data:`~snake_agent.encoding.MAX_MOVES`
-units of :func:`~snake_agent.encoding.moves_scale` so that dying never looks
-fast. Both are averaged in their own space.
+until the board is full *if it is filled*. Lost games never enter a moves value:
+backups weight moves by the win value, so dying cannot look fast, and slow wins
+need no ceiling. (A late fruit in a hole behind the tail can cost many times the
+plain cycle's pace, so a fixed value for losses would make some wins look slower
+than dying.) Moves only ever compare moves whose win values tie exactly, and a
+learned win value is never exactly 1: only the exact instruments (the envelope,
+a filled board) make a win certain.
 
 The search is a generator, so that a driver can batch the leaves of many games
 into one network call: :func:`search` yields one :class:`Query` at a time,
@@ -56,7 +60,7 @@ import numpy as np
 from snake_game import GameState, RelativeAction, SnakeGame, Status
 
 from .contract import TRAINING_RULES, Rules, planning_game, to_relative
-from .encoding import MAX_MOVES, canonical_envelope, moves_scale
+from .encoding import canonical_envelope, moves_ceiling, moves_scale
 from .survival import MoveClass, classify_moves
 
 ACTIONS = tuple(RelativeAction)
@@ -94,7 +98,7 @@ class LeafValue:
     win: float
     """Probability of filling the board."""
     moves: float
-    """Expected moves until the board is full, in units of ``moves_scale(free cells)``."""
+    """Expected moves until the board is full if it is filled, in units of ``moves_scale(free cells)``."""
 
 
 @dataclass(frozen=True)
@@ -128,6 +132,11 @@ class SearchConfig:
     """``sigma(q) = (c_visit + max visits) * c_scale * q`` for ``q`` rescaled to [0, 1], as in the paper."""
     tie_weight: float = 0.25
     """Free mode: share of the rescaled Q given to moves among the moves tied on the best win value."""
+    moves_unit: float | None = 1.0
+    """Envelope mode: ``q = -moves / moves_unit``, so that moves differing by much less than a unit count
+    for little against the prior. None rescales the moves to [0, 1] at each node, as the paper does with
+    values, which turns the moves head's errors into full-size differences. The best unit grows with
+    those errors: 1 on 4x4, 16 for the 6x6 network at 16 simulations (``snake_agent/README.md``)."""
     lost_budget: int = 10_000
     """States :func:`~snake_agent.survival.prove_lost` may visit per root move of a free search."""
     search_forced: bool = False
@@ -145,8 +154,8 @@ class SearchResult:
     """What the search found at the root.
 
     Arrays are over ``LEFT``, ``STRAIGHT``, ``RIGHT``; moves are absolute
-    expected moves until the board is full. The Q-values are *completed*:
-    a valid move that was never visited gets the root's mixed value.
+    expected moves until the board is full, if it is filled. The Q-values are
+    *completed*: a valid move that was never visited gets the root's mixed value.
     """
 
     action: RelativeAction
@@ -204,7 +213,7 @@ class _Status(Enum):
 
 
 class _Node:
-    """Common statistics: visits and sums of the values backed up through the node."""
+    """Common statistics: visits, and sums of the win values and of the win-weighted moves backed up."""
 
     __slots__ = ("state", "visits", "win_sum", "moves_sum", "raw_win", "raw_moves", "evaluated", "leaf")
 
@@ -263,8 +272,21 @@ class _Decision(_Node):
         self.status: dict[RelativeAction, _Status] = {}
 
 
-def _loss(state: GameState) -> tuple[float, float]:
-    return 0.0, MAX_MOVES * moves_scale(state.free_cells)
+LOSS = (0.0, 0.0)
+"""The value of a lost state: no win, and so no moves (they are weighted by the win value)."""
+
+CERTAIN = 1.0 - 1e-6
+"""The highest win value a learned evaluation can give: only exact wins tie at 1."""
+
+
+def _ceiling(state: GameState) -> float:
+    """The most moves a won game can still take from ``state`` (see :func:`moves_ceiling`)."""
+    return moves_ceiling(state.num_cells, state.free_cells) * moves_scale(state.free_cells)
+
+
+def _moves(moves_sum: float, win_sum: float, state: GameState) -> float:
+    """Expected moves if the board is filled: win-weighted moves over win values (the ceiling if no win)."""
+    return moves_sum / win_sum if win_sum > 0.0 else _ceiling(state)
 
 
 def _successor(game: SnakeGame, action: RelativeAction) -> tuple[GameState, bool]:
@@ -321,7 +343,7 @@ def _child(node: _Decision, action: RelativeAction, rules: Rules, mode: Mode) ->
         return _Chance(state, certain=mode is Mode.ENVELOPE or envelope_certain(state, rules))
     child = _decision(state, rules, mode, node.history)
     if not child.leaf and not child.actions:
-        return _Terminal(state, *_loss(state))
+        return _Terminal(state, *LOSS)
     return child
 
 
@@ -375,23 +397,30 @@ class _Stats:
             if child is not None and child.visits:
                 visits[i] = child.visits
                 q_win[i] = child.win_sum / child.visits
-                q_moves[i] = 1.0 + child.moves_sum / child.visits
+                q_moves[i] = 1.0 + _moves(child.moves_sum, child.win_sum, child.state)
         logits = node.logits[actions]
         visited = visits > 0
         total = visits.sum()
+        mixed_win, mixed_moves = node.raw_win, node.raw_moves
         if total:
-            # The mixed value of the paper: the raw value and the prior-weighted Q of the visited moves.
+            # The mixed value of the paper: the raw value and the prior-weighted Q of the visited moves,
+            # with the moves weighted by the win values like every backup.
             prior = _softmax(logits)
             weights = np.where(visited, np.maximum(prior, 1e-30), 0.0)
             weights /= weights.sum()
-            mixed_win = (node.raw_win + total * float(weights @ q_win)) / (total + 1)
-            mixed_moves = (node.raw_moves + total * float(weights @ q_moves)) / (total + 1)
-        else:
-            mixed_win, mixed_moves = node.raw_win, node.raw_moves
+            win_mass = node.raw_win + total * float(weights @ q_win)
+            mixed_win = win_mass / (total + 1)
+            if win_mass > 0.0:
+                moves_mass = node.raw_win * node.raw_moves + total * float((weights * q_win) @ q_moves)
+                mixed_moves = moves_mass / win_mass
         self.win = np.where(visited, q_win, mixed_win)
         self.moves = np.where(visited, q_moves, mixed_moves)
         if mode is Mode.ENVELOPE:
-            q = _rescale(-self.moves)
+            q = (
+                _rescale(-self.moves)
+                if config.moves_unit is None
+                else (self.moves.min() - self.moves) / config.moves_unit
+            )
         else:
             q = _lexicographic(self.win, self.moves, config.tie_weight)
         self.sigma = (config.c_visit + visits.max()) * config.c_scale * q
@@ -422,8 +451,10 @@ def _evaluate(node: _Node, rules: Rules) -> Generator[Query, LeafValue, None]:
     afterstate = isinstance(node, _Chance)
     classes = node.classes if isinstance(node, _Decision) else None
     value = yield Query(node.state, rules, afterstate, classes)
-    win = 1.0 if node.certain else min(max(value.win, 0.0), 1.0)
-    moves = min(max(value.moves, 0.0), MAX_MOVES) * moves_scale(node.state.free_cells)
+    win = 1.0 if node.certain else min(max(value.win, 0.0), CERTAIN)
+    state = node.state
+    moves = min(max(value.moves, 0.0), moves_ceiling(state.num_cells, state.free_cells))
+    moves *= moves_scale(state.free_cells)
     if isinstance(node, _Decision):
         node.logits = np.asarray(value.logits, dtype=np.float64)
     node.set_value(win, moves)
@@ -434,7 +465,7 @@ def _backup(path: list[_Node], win: float, moves: float) -> None:
         node = path[i]
         node.visits += 1
         node.win_sum += win
-        node.moves_sum += moves
+        node.moves_sum += win * moves
         if i and isinstance(path[i - 1], _Decision):
             moves += 1.0  # the move from the parent into this node
 
@@ -485,7 +516,7 @@ def search(
 
     yield from _evaluate(root, rules)
     prior_win, prior_moves = root.raw_win, root.raw_moves
-    root.visits, root.win_sum, root.moves_sum = 1, root.raw_win, root.raw_moves
+    root.visits, root.win_sum, root.moves_sum = 1, root.raw_win, root.raw_win * root.raw_moves
     gumbel = config.gumbel_scale * rng.gumbel(size=len(actions))
     schedule = considered_visits(len(actions), config.simulations)
     for simulation in range(config.simulations):
@@ -510,7 +541,7 @@ def search(
                     after = dataclasses.replace(node.state, fruit=fruit)
                     child = _decision(after, rules, mode, frozenset())
                     if not child.leaf and not child.actions:
-                        child = _Terminal(after, *_loss(after))
+                        child = _Terminal(after, *LOSS)
                     node.children[fruit] = child
             path.append(child)
             if not child.evaluated:
@@ -531,6 +562,9 @@ def search(
     index = [int(a) for a in actions]
     policy[index], visits[index] = improved, stats.visits
     q_win[index], q_moves[index] = stats.win, stats.moves
+    win_mass = improved * stats.win
+    value_win = float(win_mass.sum())
+    value_moves = float(win_mass @ stats.moves) / value_win if value_win > 0.0 else _ceiling(state)
     return SearchResult(
         action,
         mode,
@@ -542,8 +576,8 @@ def search(
         policy,
         q_win,
         q_moves,
-        float(improved @ stats.win),
-        float(improved @ stats.moves),
+        value_win,
+        value_moves,
         prior_win,
         prior_moves,
     )

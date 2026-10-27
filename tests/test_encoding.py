@@ -13,10 +13,11 @@ from snake_agent.encoding import (
     canonical_cycle,
     encode,
     mirror,
+    moves_ceiling,
     moves_scale,
     stack,
 )
-from snake_agent.exact import standard_starts
+from snake_agent.exact import solve, standard_starts
 from snake_agent.survival import Board, classify_moves
 from snake_game import Direction, GameConfig, GameState, RelativeAction, SnakeGame
 
@@ -235,3 +236,19 @@ def test_moves_scale_is_the_plain_cycle_expectation():
     assert moves_scale(33) == 297.0  # 6x6 from the standard start
     assert moves_scale(13) == 52.0  # 4x4
     assert moves_scale(1) == 1.0
+
+
+def test_moves_ceiling_bounds_every_win():
+    assert moves_ceiling(16, 1) * moves_scale(1) == 31  # the last fruit, within N + L = 16 + 15 moves
+    assert moves_ceiling(36, 33) == pytest.approx((2 * 36 * 33 - 33 * 34 / 2) / 297)
+    assert moves_ceiling(16, 0) == 0.0
+    # Late in a game the best certain win takes many times the plain cycle's pace, never beyond the ceiling.
+    solution = solve(4, 4)
+    ratios = {}
+    for length, moves in solution._moves.items():
+        free = 16 - length
+        finite = moves[np.isfinite(moves)]
+        if finite.size:
+            assert finite.max() <= moves_ceiling(16, free) * moves_scale(free)
+            ratios[free] = finite.max() / moves_scale(free)
+    assert ratios[2] > 12

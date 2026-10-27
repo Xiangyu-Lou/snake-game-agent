@@ -4,8 +4,9 @@ Each generation:
 
 1. **Self-play.** ``games`` games with the current network, split across worker
    processes that each play their games at once (:func:`~snake_agent.selfplay.play`).
-   A ``free_share`` of them start from free starts, the rest from the standard
-   start. Seeds are training seeds, a block per generation (:meth:`TrainConfig.seeds`).
+   A ``free_share`` of them start from free starts, a ``prefix_share`` from the
+   standard start after a random prefix, the rest from the standard start. Seeds
+   are training seeds, a block per generation (:meth:`TrainConfig.seeds`).
 2. **Replay.** The examples join a buffer that keeps the most recent ``replay``.
 3. **Updates.** ``steps`` optimizer steps on minibatches drawn uniformly from the
    buffer, each example mirrored left to right with probability 1/2. The policy
@@ -40,9 +41,9 @@ import torch.nn.functional as F
 from .assess import assess
 from .contract import TRAINING_RULES, Outcome
 from .encoding import mirror
-from .network import NetworkConfig, NetworkEvaluator, SnakeNet, from_bytes, save, tensors, to_bytes
+from .network import NetworkConfig, NetworkEvaluator, SnakeNet, from_bytes, load, save, tensors, to_bytes
 from .search import SELF_PLAY
-from .selfplay import Examples, GameSummary, Start, free_starts, play, standard_starts
+from .selfplay import Examples, GameSummary, Start, free_starts, play, prefix_starts, standard_starts
 
 GAMES_PER_GENERATION_LIMIT = 1000
 GENERATION_LIMIT = 1000
@@ -58,12 +59,18 @@ class TrainConfig:
     games: int = 256
     """Self-play games per generation."""
     free_share: float = 0.5
-    """Share of the games from free starts (the rest from the standard start)."""
+    """Share of the games from free starts."""
+    prefix_share: float = 0.0
+    """Share of the games from the standard start after a random envelope prefix (the rest: standard)."""
+    prefix_fill: float = 0.75
+    """The longest prefix, as a share of the board the snake fills (see :func:`prefix_starts`)."""
     simulations: int = 16
     beta: float = 0.5
     """Weight of the search's values in the win targets."""
     moves_lambda: float = 0.5
     """Lambda of the moves targets' TD returns over fruits (1: the moves the game still took)."""
+    sibling_visits: int = 0
+    """Envelope moves the search visited this often but did not play give examples (0: none)."""
     replay: int = 300_000
     steps: int = 200
     """Optimizer steps per generation."""
@@ -199,24 +206,36 @@ def _init_worker() -> None:
 
 
 def _self_play_task(args: tuple) -> tuple[list[GameSummary], Examples]:
-    weights, starts, simulations, beta, moves_lambda, seed, device = args
+    weights, starts, simulations, beta, moves_lambda, sibling_visits, seed, device = args
     config = dataclasses.replace(SELF_PLAY, simulations=simulations)
     evaluator = NetworkEvaluator(from_bytes(weights), device)
-    return play(evaluator, starts, TRAINING_RULES, config, seed=seed, beta=beta, moves_lambda=moves_lambda)
+    return play(
+        evaluator,
+        starts,
+        TRAINING_RULES,
+        config,
+        seed=seed,
+        beta=beta,
+        moves_lambda=moves_lambda,
+        sibling_visits=sibling_visits,
+    )
 
 
 def _starts(config: TrainConfig, generation: int) -> list[Start]:
     seeds = config.seeds(generation)
     free = round(config.free_share * len(seeds))
+    prefix = free + round(config.prefix_share * len(seeds))
     starts = free_starts(config.width, config.height, seeds[:free])
-    starts += standard_starts(config.width, config.height, seeds[free:])
+    starts += prefix_starts(config.width, config.height, seeds[free:prefix], config.prefix_fill)
+    starts += standard_starts(config.width, config.height, seeds[prefix:])
     return starts
 
 
 def _game_stats(summaries: list[GameSummary]) -> dict[str, Any]:
     stats: dict[str, Any] = {}
-    for kind, standard in (("standard", True), ("free", False)):
-        games = [s for s in summaries if s.standard is standard]
+    kinds = {"standard": (True, False), "prefix": (True, True), "free": (False, False)}
+    for kind, (standard, prefixed) in kinds.items():
+        games = [s for s in summaries if s.standard is standard and (s.prefix > 0) is prefixed]
         if not games:
             continue
         outcomes = Counter(s.outcome.value for s in games)
@@ -235,19 +254,27 @@ def train(
     out: str | Path,
     device: str = "cpu",
     log: Callable[[str], None] = print,
+    init: str | Path | None = None,
 ) -> SnakeNet:
     """Run ``config`` and write its log and checkpoints to ``out``; returns the trained network.
 
     With a CUDA ``device`` the self-play workers evaluate their leaves on it too: batched across their
     games, the network then costs little next to the search's own work. Assessment games evaluate one
-    leaf at a time, on the CPU.
+    leaf at a time, on the CPU. ``init`` starts from a checkpoint's weights (its network size must match
+    ``config``); the replay buffer and the optimizer start empty, and a new run ``seed`` gives new games.
     """
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n")
+    settings = asdict(config) | ({"init": str(init)} if init is not None else {})
+    (out / "config.json").write_text(json.dumps(settings, indent=2) + "\n")
     rng = np.random.default_rng(config.seed)
     torch.manual_seed(config.seed)
     model = SnakeNet(config.network).to(device)
+    if init is not None:
+        start, _ = load(init, device)
+        if start.config != config.network:
+            raise ValueError(f"the checkpoint's network {start.config} is not {config.network}")
+        model.load_state_dict(start.state_dict())
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     replay = Replay(config.replay)
     inference = "cuda" if str(device).startswith("cuda") else "cpu"
@@ -268,6 +295,7 @@ def train(
                     config.simulations,
                     config.beta,
                     config.moves_lambda,
+                    config.sibling_visits,
                     (config.seed, generation, k),
                     inference,
                 )
@@ -325,6 +353,9 @@ def _line(record: dict[str, Any]) -> str:
     if "standard" in games:
         s = games["standard"]
         parts.append(f"std won {s['won']}/{s['games']} moves {s['mean_moves_won']}")
+    if "prefix" in games:
+        p = games["prefix"]
+        parts.append(f"prefix won {p['won']}/{p['games']}")
     if "free" in games:
         f = games["free"]
         parts.append(f"free won {f['won']}/{f['games']}")

@@ -153,9 +153,12 @@ def train_network(args: argparse.Namespace) -> int:
         generations=args.generations,
         games=args.games,
         free_share=args.free_share,
+        prefix_share=args.prefix_share,
+        prefix_fill=args.prefix_fill,
         simulations=args.simulations,
         beta=args.beta,
         moves_lambda=args.moves_lambda,
+        sibling_visits=args.sibling_visits,
         replay=args.replay,
         steps=args.steps,
         batch=args.batch,
@@ -167,7 +170,7 @@ def train_network(args: argparse.Namespace) -> int:
         eval_games=args.eval_games,
         eval_sources=args.eval_sources,
     )
-    train(config, args.out, device=args.device or _default_device())
+    train(config, args.out, device=args.device or _default_device(), init=args.init)
     return 0
 
 
@@ -250,12 +253,24 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--generations", type=int, default=50)
     tr.add_argument("--games", type=int, default=256, help="self-play games per generation (default: 256)")
     tr.add_argument("--free-share", type=float, default=0.5, help="share of games from free starts")
+    tr.add_argument(
+        "--prefix-share", type=float, default=0.0, help="share of games after a random envelope prefix"
+    )
+    tr.add_argument(
+        "--prefix-fill", type=float, default=0.75, help="the longest prefix, as a share of the board"
+    )
     tr.add_argument("--simulations", type=int, default=16)
     tr.add_argument(
         "--beta", type=float, default=0.5, help="weight of the search's values in the win targets"
     )
     tr.add_argument(
         "--moves-lambda", type=float, default=0.5, help="lambda of the moves targets (1: moves still taken)"
+    )
+    tr.add_argument(
+        "--sibling-visits",
+        type=int,
+        default=0,
+        help="envelope moves the search visited this often but did not play give examples (0: none)",
     )
     tr.add_argument("--replay", type=int, default=300_000, help="examples kept for training")
     tr.add_argument("--steps", type=int, default=200, help="optimizer steps per generation")
@@ -270,6 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--eval-games", type=int, default=100, help="T1 games per assessment")
     tr.add_argument("--eval-sources", type=int, default=60, help="T2 source games per assessment")
     tr.add_argument("--device", help="torch device for training (default: cuda if available, else cpu)")
+    tr.add_argument("--init", help="start from this checkpoint's weights (a model.pt written by train)")
     tr.set_defaults(run=train_network)
 
     asm = commands.add_parser("assess", help="assess a trained network against the M1 gates (needs PyTorch)")

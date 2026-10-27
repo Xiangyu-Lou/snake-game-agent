@@ -2,10 +2,11 @@ import numpy as np
 import pytest
 
 from snake_agent.contract import NO_LIMIT, TRAINING_RULES, Outcome
-from snake_agent.encoding import moves_scale
+from snake_agent.encoding import canonical_envelope, moves_scale
 from snake_agent.search import Prediction, envelope_certain
 from snake_agent.seeds import VALIDATION
-from snake_agent.selfplay import Label, free_starts, moves_returns, play, standard_starts
+from snake_agent.selfplay import Label, free_starts, moves_returns, play, prefix_starts, standard_starts
+from snake_game import GameConfig, SnakeGame
 
 
 def uniform(queries):
@@ -99,3 +100,33 @@ def test_a_larger_canvas_holds_smaller_boards():
     _, examples = play(uniform, standard_starts(4, 4, [0]), seed=0, size=6)
     assert examples.planes.shape[2:] == (6, 6)
     assert not examples.planes[:, :, 4:, :].any() and not examples.planes[:, :, :, 4:].any()
+
+
+def test_prefix_starts_hand_won_games_to_the_agent_after_random_envelope_moves():
+    starts = prefix_starts(6, 6, range(8), fill=0.5)
+    standard = SnakeGame(GameConfig(6, 6), seed=0).state()
+    envelope = canonical_envelope(6, 6)
+    for start in starts:
+        assert start.standard and start.state.snake == standard.snake and 4 <= start.prefix <= 18
+        game = start.game()
+        assert game.length == start.prefix and envelope.contains(game.state())
+        assert start.game().state() == game.state()  # the prefix is reproducible
+    assert len({start.prefix for start in starts}) > 1
+    summaries, examples = play(uniform, starts, seed=0)
+    for summary, start in zip(summaries, starts, strict=True):
+        assert summary.outcome is Outcome.WON and summary.prefix > 0
+        assert summary.start_length == start.prefix and summary.fruits == 36 - start.prefix
+    # Only the agent's moves give examples.
+    assert len(examples) == sum(s.moves + s.fruits - 1 for s in summaries)
+
+
+def test_sibling_examples_take_the_search_value_of_moves_not_played():
+    starts = standard_starts(6, 6, range(3))
+    plain_summaries, plain = play(uniform, starts, seed=4)
+    summaries, examples = play(uniform, starts, seed=4, sibling_visits=1)
+    assert summaries == plain_summaries  # the same games: siblings only add examples
+    siblings = examples.label == Label.SIBLING
+    assert siblings.sum() == len(examples) - len(plain) > 0
+    assert (examples.win[siblings] == 1.0).all() and examples.has_moves[siblings].all()
+    assert not examples.has_policy[siblings].any() and (examples.moves[siblings] > 0).all()
+    assert np.array_equal(examples.planes[~siblings], plain.planes)

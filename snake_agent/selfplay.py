@@ -5,12 +5,16 @@ advances every game's search to its next leaf, evaluates all the leaves in one
 batch, and repeats (review §2.4). The live games are :class:`~snake_game.SnakeGame`
 objects that the search never sees: it plans on the public state only.
 
-**Starts.** A game starts either from the standard start (:func:`standard_starts`),
-where the search stays inside the cycle-order envelope and every game is won,
-or from a *free start* (:func:`free_starts`): a running state of a reference
-policy's game that is not a certain win inside the envelope, where the search
-must judge win probabilities. Seeds must be training seeds
-(:func:`~snake_agent.seeds.check_training_seed`).
+**Starts.** A game starts from the standard start (:func:`standard_starts`),
+where the search stays inside the cycle-order envelope and every game is won;
+from the standard start after a random prefix (:func:`prefix_starts`): random
+envelope moves up to a random length, then the agent; or from a *free start*
+(:func:`free_starts`): a running state of a reference policy's game that is not
+a certain win inside the envelope, where the search must judge win
+probabilities. Random jumps leave holes that the agent's own games rarely show,
+so prefixes train the network on the kind of position that lies behind the
+moves its policy does not play, which the search must still judge. Seeds must
+be training seeds (:func:`~snake_agent.seeds.check_training_seed`).
 
 **Targets.** Every move gives an example of the state before it, and every
 eating move that does not fill the board one of its *afterstate*, the board
@@ -24,6 +28,10 @@ records its provenance (:class:`Label`):
 * ``OUTCOME``: the outcome alone, at moves that were not searched.
 * ``AFTERSTATE``: the outcome blended with the search's value of the state
   after the next fruit appeared, an unbiased sample of the afterstate's value.
+* ``SIBLING``: optionally, in envelope mode, the position after a move the
+  search visited but did not play (1, exact). Its moves target is the search's
+  value of that move: the search compares exactly those positions, and the
+  policy's own games rarely show them.
 
 The moves target, for won games only, is a TD(lambda) return over the game's
 fruits, in units of :func:`~snake_agent.encoding.moves_scale`: the moves until
@@ -47,11 +55,11 @@ from enum import IntEnum
 
 import numpy as np
 
-from snake_game import Direction, GameConfig, GameState, SnakeGame
+from snake_game import Direction, GameConfig, GameState, RelativeAction, SnakeGame
 from snake_game.policies import GreedyPolicy, RandomPolicy
 
-from .contract import TRAINING_RULES, Outcome, Rules
-from .encoding import encode, moves_ceiling, moves_scale
+from .contract import TRAINING_RULES, Outcome, Rules, planning_game
+from .encoding import canonical_envelope, encode, moves_ceiling, moves_scale
 from .references import GuardedGreedyPolicy
 from .search import (
     SELF_PLAY,
@@ -76,6 +84,7 @@ class Label(IntEnum):
     ENVELOPE = 2
     PROVEN_LOST = 3
     AFTERSTATE = 4
+    SIBLING = 5
 
 
 # --------------------------------------------------------------------- starts
@@ -87,17 +96,45 @@ class Start:
     seed: int
     standard: bool
     """The standard start (its first fruit from ``seed`` too), or a free start."""
+    prefix: int = 0
+    """Standard starts: random envelope moves are played until the snake is this long, then the agent
+    takes over (0: no prefix). The prefix gives no examples."""
 
     def game(self) -> SnakeGame:
-        if self.standard:
-            return SnakeGame(GameConfig(self.state.width, self.state.height), seed=self.seed)
-        return SnakeGame.from_state(self.state, seed=self.seed)
+        """The live game, positioned where the agent takes over."""
+        if not self.standard:
+            return SnakeGame.from_state(self.state, seed=self.seed)
+        game = SnakeGame(GameConfig(self.state.width, self.state.height), seed=self.seed)
+        if self.prefix:
+            envelope = canonical_envelope(game.width, game.height)
+            rng = random.Random(f"{self.seed}/prefix")
+            while game.length < self.prefix and not game.done:
+                game.step(rng.choice(sorted(envelope.moves(game.state()))))
+        return game
 
 
 def standard_starts(width: int, height: int, seeds: Sequence[int]) -> list[Start]:
     """One standard start per training seed."""
     config = GameConfig(width, height)
     return [Start(SnakeGame(config, seed=check_training_seed(s)).state(), s, True) for s in seeds]
+
+
+def prefix_starts(width: int, height: int, seeds: Sequence[int], fill: float = 0.75) -> list[Start]:
+    """One standard start per training seed whose first moves are uniformly random envelope moves.
+
+    The prefix lasts until the snake is as long as a target drawn uniformly
+    between one segment more than at the start and ``fill`` of the board.
+    Envelope moves keep the win certain, so the agent takes over a won game.
+    """
+    config = GameConfig(width, height)
+    cells = width * height
+    starts = []
+    for seed in seeds:
+        state = SnakeGame(config, seed=check_training_seed(seed)).state()
+        shortest = state.length + 1
+        target = random.Random(seed).randint(shortest, max(shortest, min(int(fill * cells), cells - 2)))
+        starts.append(Start(state, seed, True, target))
+    return starts
 
 
 def free_starts(
@@ -177,11 +214,15 @@ class GameSummary:
     seed: int
     outcome: Outcome
     moves: int
+    """Moves the agent played (after the prefix, if any)."""
     fruits: int
     length: int
     start_length: int
+    """Length when the agent took over."""
     searched: int
     """Moves chosen by a search (the others had at most one move left)."""
+    prefix: int = 0
+    """Random envelope moves played before the agent took over."""
 
 
 class _Game:
@@ -190,6 +231,7 @@ class _Game:
     def __init__(self, start: Start, rules: Rules, config: SearchConfig) -> None:
         self.start, self.rules, self.config = start, rules, config
         self.game = start.game()
+        self.prefix, self.start_length = self.game.steps if start.prefix else 0, self.game.length
         self.epoch = _Epoch()
         self.search = None
         self.state: GameState | None = None
@@ -230,15 +272,19 @@ class _Game:
             self.start.seed,
             self.outcome,
             len(self.steps),
-            self.game.length - self.start.state.length,
+            self.game.length - self.start_length,
             self.game.length,
-            self.start.state.length,
+            self.start_length,
             sum(not result.forced for _, result in self.steps),
+            self.prefix,
         )
 
-    def examples(self, beta: float, moves_lambda: float, values: Sequence[float], size: int) -> list[tuple]:
+    def examples(
+        self, beta: float, moves_lambda: float, values: Sequence[float], size: int, sibling_visits: int = 0
+    ) -> list[tuple]:
         """The game's examples as rows: (encoding, width, valid, policy, has_policy, win, moves, has_moves,
-        label, free). ``values`` are the network's moves values of the afterstates (won games only)."""
+        label, free). ``values`` are the network's moves values of the afterstates (won games only);
+        with ``sibling_visits``, envelope moves visited that often but not played give examples too."""
         won = self.outcome is Outcome.WON
         z = float(won)
         eats = [t for t, _ in self.afterstates]
@@ -274,6 +320,8 @@ class _Game:
                     state.free_cells,
                 )
             )
+            if sibling_visits and searched and result.mode is Mode.ENVELOPE:
+                rows += self._siblings(state, result, sibling_visits, size)
         for k, (t, after) in enumerate(self.afterstates):
             _, following = self.steps[t + 1]
             moves = afters[k] / moves_scale(after.free_cells) if won else 0.0
@@ -294,6 +342,35 @@ class _Game:
                     moves,
                     won,
                     label,
+                    after.free_cells,
+                )
+            )
+        return rows
+
+    def _siblings(self, state: GameState, result: SearchResult, visits: int, size: int) -> list[tuple]:
+        """Examples of the positions after the moves the search visited at least ``visits`` times but did
+        not play, with the search's moves value of each move as the target (envelope mode)."""
+        rows = []
+        game = planning_game(state, seed=0)
+        for action in RelativeAction:
+            if action == result.action or not result.valid[action] or result.visits[action] < visits:
+                continue
+            child = game.clone()
+            step = child.step_relative(action)
+            if step.won:
+                continue
+            after = dataclasses.replace(child.state(), fruit=None) if step.ate_fruit else child.state()
+            rows.append(
+                (
+                    encode(after, self.rules, size, afterstate=step.ate_fruit),
+                    _frame_width(after),
+                    (False, False, False),
+                    np.zeros(3),
+                    False,
+                    1.0,
+                    (result.q_moves[action] - 1.0) / moves_scale(after.free_cells),
+                    True,
+                    Label.SIBLING,
                     after.free_cells,
                 )
             )
@@ -364,6 +441,7 @@ def play(
     beta: float = 0.5,
     moves_lambda: float = 0.5,
     size: int | None = None,
+    sibling_visits: int = 0,
 ) -> tuple[list[GameSummary], Examples]:
     """Play a game from each start, all at once, and return their summaries and training examples.
 
@@ -372,7 +450,9 @@ def play(
     values in the win targets, ``moves_lambda`` the lambda of the moves
     targets (1: the moves the game still took), and ``size`` the canvas of the
     encodings (by default the largest board side). The afterstates of won games
-    are evaluated once more at the end, for the moves targets.
+    are evaluated once more at the end, for the moves targets. With
+    ``sibling_visits``, envelope moves the search visited that often but did not
+    play give examples too (``Label.SIBLING``).
     """
     if not rules.fruit_timeout:
         raise ValueError("self-play needs the fruit timeout, which turns loops into losses")
@@ -401,7 +481,7 @@ def play(
     rows = []
     for game in games:
         mine = [next(values) for _ in game.afterstates] if game.outcome is Outcome.WON else []
-        rows += game.examples(beta, moves_lambda, mine, size)
+        rows += game.examples(beta, moves_lambda, mine, size, sibling_visits)
     return [game.summary() for game in games], _to_examples(rows)
 
 

@@ -389,6 +389,65 @@ the policy narrows the states it visits, so siblings it does not play are
 rarely trained on (the error grows from 3.0 moves at generation 10 to 4.8 at
 30).
 
+### Training on the moves the policy does not play
+
+Two options give the moves head positions that the policy's own games rarely
+show, which the search must still judge:
+
+- **Random prefixes** (`--prefix-share`, `prefix_starts`): a game starts from the
+  standard start, plays uniformly random envelope moves until the snake reaches
+  a length drawn up to `--prefix-fill` of the board, then hands over to the
+  agent; only the agent's moves give examples. Random jumps leave holes in
+  places the policy would not.
+- **Sibling examples** (`--sibling-visits`): every envelope move the search
+  visited at least that often but did not play gives an example of the position
+  it leads to, with the search's value of the move as its moves target
+  (`Label.SIBLING`).
+
+`assess` measures the problem directly (`sibling_ranking`): at each T1 decision
+with a choice, the error of each move's one-step value relative to the played
+move's, against `solve_envelope`, and the share of pairs of moves ordered as
+the exact solution orders them, for each half of the game (the first: at least
+half the board free, where moves differ by little). Runs as in M1 (λ = 0.5);
+the prefix runs start 37.5% of the games after a prefix (fill up to 75%) and
+25% from free starts:
+
+| Run | Generation | Raw policy: T1 moves | Raw policy: extra moves | Search: extra moves | First half: error | First half: agreement | Second half: agreement |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| M1 | 10 | 213.3 | 0.26 | 0.34 | 3.0 | 0.61 | 0.73 |
+| M1 | 20 | 210.3 | 0.17 | 0.29 | 4.7 | 0.58 | 0.80 |
+| M1 | 30 | 211.5 | 0.20 | 0.45 | 4.9 | 0.56 | 0.83 |
+| Prefixes | 10 | 211.1 | 0.19 | 0.22 | 3.2 | 0.65 | 0.74 |
+| Prefixes | 20 | **208.3** | **0.11** | 0.29 | 3.8 | 0.55 | 0.81 |
+| Prefixes | 30 | 210.5 | 0.17 | 0.34 | 4.6 | 0.57 | 0.85 |
+| Prefixes and siblings | 10 | 213.6 | 0.29 | 0.26 | 3.6 | 0.56 | 0.78 |
+| Prefixes and siblings | 20 | 213.2 | 0.22 | 0.27 | 4.1 | **0.63** | **0.93** |
+
+The raw policy's numbers are over 300 validation games, the search's (16
+simulations, one-move unit) over 200; "error" is in moves, "agreement" the
+share of pairs ordered as the exact solution orders them.
+
+- **Random prefixes make a better policy.** Its best checkpoint (generation 20)
+  averages 209.0 moves on 1,000 validation games against 210.5 for M1's, and
+  the 16-simulation search with a 16-move unit costs 0.13 extra moves per
+  decision against 0.17 (300 games each). They do not stop the ranking in the
+  first half from degrading, nor the decline after generation 20.
+- **Sibling examples make a better moves head**, as intended: at generation 20
+  it orders 93% of second-half pairs as the exact solution does (81% with
+  prefixes alone), with an error of 3.1 moves against 5.9, and 63% in the first
+  half. The policy learns more slowly (0.22 extra moves per decision at
+  generation 20), and the search with the one-move unit still trails it.
+  Whether the better values pay off later is open: continuing this run from
+  generation 20 with an empty replay buffer and a fresh optimizer (`--init`)
+  collapsed (220.9 moves at generation 30, first-half agreement 0.53), which
+  says more about the restart than about the method.
+- **Open.** In every run the policy peaks around generation 20 and then
+  declines while the losses keep falling, and early in the game no variant
+  orders close moves much better than chance: they differ by 0.6 to 1.5 moves
+  out of about 170 still to come. Next steps: a full sibling run without a
+  restart, a decaying learning rate or fewer updates per generation against
+  the late decline, and value targets precise enough for the first half.
+
 ## Reproducing the probe
 
 `python -m snake_agent reproduce` (about 20 seconds) replays the probe's

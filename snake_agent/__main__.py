@@ -1,4 +1,4 @@
-"""Command line: ``python -m snake_agent {evaluate,solve,reproduce} --help``."""
+"""Command line: ``python -m snake_agent {evaluate,solve,reproduce,train,assess} --help``."""
 
 from __future__ import annotations
 
@@ -142,9 +142,77 @@ def _plain(envelope: CycleEnvelope):
     return policy
 
 
+def train_network(args: argparse.Namespace) -> int:
+    from .network import NetworkConfig  # needs PyTorch
+    from .train import TrainConfig, train
+
+    width, height = args.board
+    config = TrainConfig(
+        width=width,
+        height=height,
+        generations=args.generations,
+        games=args.games,
+        free_share=args.free_share,
+        simulations=args.simulations,
+        beta=args.beta,
+        moves_lambda=args.moves_lambda,
+        replay=args.replay,
+        steps=args.steps,
+        batch=args.batch,
+        lr=args.lr,
+        network=NetworkConfig(args.channels, args.blocks, args.hidden),
+        workers=args.workers,
+        seed=args.seed,
+        eval_every=args.eval_every,
+        eval_games=args.eval_games,
+        eval_sources=args.eval_sources,
+    )
+    train(config, args.out, device=args.device or _default_device())
+    return 0
+
+
+def assess_network(args: argparse.Namespace) -> int:
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    from .assess import assess  # needs PyTorch
+    from .network import load, to_bytes
+    from .search import SearchConfig
+    from .train import _init_worker
+
+    model, meta = load(args.checkpoint)
+    config = meta.get("config", {})
+    width, height = args.board or (config.get("width", 6), config.get("height", 6))
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(args.workers, mp_context=context, initializer=_init_worker) as pool:
+        report = assess(
+            pool,
+            to_bytes(model),
+            width,
+            height,
+            games=args.games,
+            sources=args.sources,
+            split=SPLITS[args.split],
+            workers=args.workers,
+            search=SearchConfig(simulations=args.simulations, gumbel_scale=0.0, moves_unit=args.moves_unit),
+        )
+    text = json.dumps(report, indent=2)
+    print(text)
+    if args.json:
+        Path(args.json).write_text(text + "\n")
+    gates = [report[f"t1_{kind}"].get("gate") for kind in ("search",)]
+    return 0 if all(gate is None or gate["passed"] for gate in gates) else 1
+
+
+def _default_device() -> str:
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m snake_agent", description="Snake agent tools (milestone M0)."
+        prog="python -m snake_agent", description="Snake agent tools (milestones M0 and M1)."
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -175,6 +243,52 @@ def build_parser() -> argparse.ArgumentParser:
     rp = commands.add_parser("reproduce", help="reproduce the Architecture B probe's reference numbers")
     rp.add_argument("--full", action="store_true", help="also run the slow sections (several minutes)")
     rp.set_defaults(run=lambda args: reproduce.main(["--full"] if args.full else []))
+
+    tr = commands.add_parser("train", help="train the M1 network by self-play (needs PyTorch)")
+    tr.add_argument("--board", type=board_size, default=(6, 6), help="board size (default: 6x6)")
+    tr.add_argument("--out", required=True, help="output directory for the log and checkpoints")
+    tr.add_argument("--generations", type=int, default=50)
+    tr.add_argument("--games", type=int, default=256, help="self-play games per generation (default: 256)")
+    tr.add_argument("--free-share", type=float, default=0.5, help="share of games from free starts")
+    tr.add_argument("--simulations", type=int, default=16)
+    tr.add_argument(
+        "--beta", type=float, default=0.5, help="weight of the search's values in the win targets"
+    )
+    tr.add_argument(
+        "--moves-lambda", type=float, default=0.5, help="lambda of the moves targets (1: moves still taken)"
+    )
+    tr.add_argument("--replay", type=int, default=300_000, help="examples kept for training")
+    tr.add_argument("--steps", type=int, default=200, help="optimizer steps per generation")
+    tr.add_argument("--batch", type=int, default=512)
+    tr.add_argument("--lr", type=float, default=1e-3)
+    tr.add_argument("--channels", type=int, default=64)
+    tr.add_argument("--blocks", type=int, default=6)
+    tr.add_argument("--hidden", type=int, default=128)
+    tr.add_argument("--workers", type=int, default=8, help="self-play and evaluation processes")
+    tr.add_argument("--seed", type=int, default=0, help="run seed (selects the training seeds)")
+    tr.add_argument("--eval-every", type=int, default=10, help="assess every this many generations")
+    tr.add_argument("--eval-games", type=int, default=100, help="T1 games per assessment")
+    tr.add_argument("--eval-sources", type=int, default=60, help="T2 source games per assessment")
+    tr.add_argument("--device", help="torch device for training (default: cuda if available, else cpu)")
+    tr.set_defaults(run=train_network)
+
+    asm = commands.add_parser("assess", help="assess a trained network against the M1 gates (needs PyTorch)")
+    asm.add_argument("checkpoint", help="a model.pt written by train")
+    asm.add_argument("--board", type=board_size, help="board size (default: the training board)")
+    asm.add_argument("--games", type=int, default=300, help="T1 games (default: 300)")
+    asm.add_argument("--sources", type=int, default=60, help="T2 source games (default: 60)")
+    asm.add_argument(
+        "--split", choices=sorted(SPLITS), default="validation", help="held-out seeds (default: validation)"
+    )
+    asm.add_argument(
+        "--simulations", type=int, default=16, help="the search's simulations per move (default: 16)"
+    )
+    asm.add_argument(
+        "--moves-unit", type=float, default=1.0, help="the search's unit for comparing moves (default: 1)"
+    )
+    asm.add_argument("--workers", type=int, default=8)
+    asm.add_argument("--json", help="write the report to this JSON file")
+    asm.set_defaults(run=assess_network)
     return parser
 
 

@@ -20,6 +20,8 @@ screen either; it reads the exact positions of the snake and the fruit.
    (survival certificate, lost-proof search, cycle-order envelope, shortcut
    cycle), the evaluation harness for standard and recovery starts, and an exact
    solution of 4×4. It reproduces the reference numbers of the plan's probe.
+   Milestone M1 adds the network, the Gumbel search, self-play and training,
+   learned from scratch on 4×4 and 6×6 (`pip install -e ".[train]"` for PyTorch).
    **Documentation: [`snake_agent/README.md`](snake_agent/README.md)**
 
 ## Quick start
@@ -52,7 +54,7 @@ automatically.
 | Path | Contents |
 | --- | --- |
 | [`snake_game/`](snake_game/) | the game: engine, Gymnasium environments, pygame UI ([README](snake_game/README.md)) |
-| [`snake_agent/`](snake_agent/) | the agent: contract, exact instruments, evaluation harness, exact 4×4 solution ([README](snake_agent/README.md)) |
+| [`snake_agent/`](snake_agent/) | the agent: contract, exact instruments, evaluation harness, exact solutions, network, search, self-play and training ([README](snake_agent/README.md)) |
 | [`analysis/`](analysis/) | design reports and the probes behind them ([README](analysis/README.md)) |
 | [`tests/`](tests/) | test suite: `pip install -e ".[dev]"`, then `pytest` |
 | [`.github/workflows/`](.github/workflows/) | continuous integration |

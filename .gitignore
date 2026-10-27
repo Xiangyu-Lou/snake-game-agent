@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Training runs (logs and checkpoints of python -m snake_agent train)
+runs/

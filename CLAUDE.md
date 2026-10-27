@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 An AI that learns to beat Snake. The goal is to fill the whole board, and then to do it in as few moves as possible. Thinking time per move does not matter. The agent reads the exact game state, never pixels.
 
 - `snake_game/`: the environment. An exact, deterministic engine (`engine.py`), Gymnasium environments for one game (`env.py`) or thousands stepped together in NumPy (`vector_env.py`), and an optional pygame UI (`ui/`). Its documentation is `snake_game/README.md`.
-- `snake_agent/`: the agent, built milestone by milestone after the Architecture B plan in `analysis/architecture-b-review.md`. §3 lists the milestones and their gates; §4 the owner's decisions, which the code implements. Milestone M0 is done: the contract, the exact instruments, the evaluation harness and an exact 4×4 solution. M1, self-play on 4×4 and 6×6, is in progress: `encoding.py` holds the network inputs and `search.py` the Gumbel search (a draft without unit tests). Its documentation is `snake_agent/README.md`.
+- `snake_agent/`: the agent, built milestone by milestone after the Architecture B plan in `analysis/architecture-b-review.md`. §3 lists the milestones and their gates; §4 the owner's decisions, which the code implements. Milestone M0 is done: the contract, the exact instruments, the evaluation harness and an exact 4×4 solution. M1, self-play on 4×4 and 6×6, adds `encoding.py` (the network inputs), `search.py` (the Gumbel search), `network.py` (the PyTorch network), `selfplay.py` and `train.py` (self-play and training) and `assess.py` (the M1 gates). Its gate is met on the test seeds (6×6 T1 below 214 moves, every game won; 4×4 values calibrated), but on 6×6 the moves head cannot yet rank close moves, so the search adds little to the raw policy: the open problem for M2. Its documentation is `snake_agent/README.md`.
 - `analysis/`: the design reports and the probe scripts behind them.
 
 The two package READMEs document the API and the measured numbers. Update them when behaviour changes.
@@ -17,17 +17,20 @@ The two package READMEs document the API and the measured numbers. Update them w
 ```bash
 pip install -e ".[dev]"                                       # Python >= 3.10; includes pytest and pygame-ce
 python -m pytest -W error                                     # the suite as CI runs it: warnings are errors
-python -m pytest -W error --slow                              # adds the slow tests (full probe reproduction, exact 6x6)
+python -m pytest -W error --slow                              # adds the slow tests (full probe reproduction, exact 6x6; several minutes)
 python -m pytest -W error tests/test_exact.py::test_4x4_size  # one test (or -k <pattern>)
 ruff check . && ruff format --check snake_game snake_agent tests  # ruff is not in the dev extras: install it separately
 
 python -m snake_game --agent hamiltonian --mode auto --speed max  # play or watch a game (needs pygame-ce)
-python -m snake_agent evaluate t1 --agent shortcut --board 10x10  # evaluate an agent on held-out games
+python -m snake_agent evaluate t1 --agent shortcut --board 10x10  # evaluate on held-out games (t2: recovery starts)
+python -m snake_agent evaluate t1 --agent my_module:my_agent      # evaluate your own agent; --split test is for final gates only
 python -m snake_agent solve --board 4x4                           # exact numbers for a small board
 python -m snake_agent reproduce [--full]                          # check the probe's reference numbers
+python -m snake_agent train --board 6x6 --out runs/m1-6x6 --device cuda  # M1 self-play training (needs the train extra)
+python -m snake_agent assess runs/m1-6x6/model.pt --games 300    # a trained network against the M1 gates
 ```
 
-CI runs only pytest (`.github/workflows/tests.yml`), on Python 3.10 to 3.14. One more job runs the oldest supported dependencies: numpy 1.24, gymnasium 1.1 and pygame-ce 2.5.0. Code must work with those. Ruff's settings, including the 110-character line length, are in `pyproject.toml`. The UI tests run headless: `tests/conftest.py` sets SDL's dummy drivers.
+CI runs only pytest (`.github/workflows/tests.yml`), on Python 3.10 to 3.14. One more job runs the oldest supported dependencies: numpy 1.24, gymnasium 1.1 and pygame-ce 2.5.0. Code must work with those. A third job adds PyTorch's CPU build, so that the network tests run (they skip without PyTorch). Ruff's settings, including the 110-character line length, are in `pyproject.toml`. The UI tests run headless: `tests/conftest.py` sets SDL's dummy drivers.
 
 ## Conventions that span files
 
@@ -56,7 +59,8 @@ Training, search and evaluation all follow these rules:
   - `NO_LIMIT` is the engine's own rules; the harness ends endless games as censored.
 - **Pruning.**
   - The survival certificate (`survival.Board.has_survival_certificate`) is a hint and an input feature, never a reason to prune.
-  - Search prunes only `FATAL` moves and moves that `prove_lost` proves lost.
+  - Search prunes only `FATAL` moves, moves that `prove_lost` proves lost, moves that time out, and in free mode moves back to a position of the current fruit's epoch (the same position with less budget).
+  - The moves value is the expected moves until the board is full if it is filled: losses never enter it, and only exact wins (the envelope, a filled board) tie at a win value of 1.
 - **Seeds.**
   - `seeds.TRAIN` is for training and experiments.
   - `VALIDATION` and `TEST` are held out, and `TEST` is for the final gates only.
@@ -79,4 +83,5 @@ Results are judged against exact or reproduced numbers, so keep these consistent
   - Documents there are written in English.
   - A pull request for analysis work contains only `analysis/`. Changes to code or other files need a separate, explicit request.
 - **Model files.** `*.pt`, `*.pth`, `*.ckpt`, `*.safetensors`, `*.onnx`, `*.h5`, `*.keras`, `*.zip` and `*.npz` are stored with Git LFS (`.gitattributes`). Run `git lfs install` before committing such files.
-- **PyTorch.** It is the chosen stack for the network (review §4), but it is not a dependency yet.
+- **PyTorch.** The network's stack (review §4), an optional dependency: `pip install -e ".[train]"`. Only `network.py`, `train.py` and `assess.py` import it.
+- **Training runs.** `train` writes logs and checkpoints to `runs/`, which git ignores. Commit a checkpoint only on request (Git LFS).

@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ui = ["pygame-ce>=2.5"]
+train = ["torch>=2.1"]
 dev = ["pytest>=7", "pygame-ce>=2.5"]
 
 [project.scripts]

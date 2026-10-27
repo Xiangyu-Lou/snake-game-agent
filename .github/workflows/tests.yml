@@ -38,3 +38,17 @@ jobs:
           cache-dependency-path: pyproject.toml
       - run: python -m pip install -e ".[dev]" "numpy==1.24.*" "gymnasium==1.1.*" "pygame-ce==2.5.0"
       - run: python -m pytest -W error
+
+  network:
+    name: Network (PyTorch on CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: python -m pytest -W error

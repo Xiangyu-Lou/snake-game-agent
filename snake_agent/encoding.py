@@ -26,8 +26,9 @@ and the walls enter as distances in cells. Boards are placed in the top-left
 corner of a ``size`` x ``size`` canvas, so 4x4 and 6x6 states can share a batch;
 the ``valid`` plane marks real cells.
 
-The moves head works in units of :func:`moves_scale`, the plain cycle's expected
-moves to fill the remaining free cells.
+The moves head predicts the expected moves until the board is full, given that
+it is filled, in units of :func:`moves_scale`: the plain cycle's expected moves
+to fill the remaining free cells.
 """
 
 from __future__ import annotations
@@ -91,8 +92,6 @@ SATURATION = 16
 _P = {name: i for i, name in enumerate(PLANES)}
 _G = {name: i for i, name in enumerate(GLOBALS)}
 _A = {name: i for i, name in enumerate(ACTION_FEATURES)}
-MAX_MOVES = 2.0
-"""The moves head's ceiling, in units of :func:`moves_scale`: the target of lost games."""
 
 
 def moves_scale(free: int) -> float:
@@ -100,9 +99,24 @@ def moves_scale(free: int) -> float:
 
     Following the cycle, the next fruit is on average ``(F + 1) / 2`` cells
     ahead when ``F`` cells are free; summing over ``F, F - 1, ..., 1`` gives
-    ``F(F + 3) / 4``, which keeps the head's targets of order 1 through a game.
+    ``F(F + 3) / 4``, which keeps the head's targets of order 1 through most of a
+    game. A won game can take many times as long, for example when a late fruit
+    appears in a hole behind the tail: see :func:`moves_ceiling`.
     """
     return free * (free + 3) / 4
+
+
+def moves_ceiling(cells: int, free: int) -> float:
+    """The most moves a won game can still take under the fruit timeout, in units of :func:`moves_scale`.
+
+    Each of the ``F = free`` remaining fruits is eaten within ``N + L`` moves,
+    ``L`` being the length at the time, so the board fills within
+    ``2NF - F(F + 1) / 2`` moves: from about 6 units at the start of a game to
+    ``2N - 1`` for the last fruit.
+    """
+    if free <= 0:
+        return 0.0
+    return (2 * cells * free - free * (free + 1) / 2) / moves_scale(free)
 
 
 @dataclass(frozen=True)
@@ -207,17 +221,17 @@ def encode(
     planes[_P["release"], flat] = release / cells
     planes[_P["release_cells"], flat] = np.minimum(release, SATURATION) / SATURATION
 
-    # Free cells reachable from the head, their distance, and the slack of the body cells around them.
+    # Free cells reachable from the head, their distance, and the slack of the body cells around them
+    # (a breadth-first search over plain lists: indexing NumPy arrays one cell at a time is slow).
     board = Board(state)
-    occupied = np.zeros(cells, dtype=bool)
-    occupied[flat] = True
-    release_of = np.zeros(cells, dtype=np.int64)
-    release_of[flat] = release
     neighbours = board.neighbours
-    distance = np.full(cells, -1, dtype=np.int64)
-    slack = np.full(cells, -(1 << 30), dtype=np.int64)
-    frontier, d = [head], 0
+    release_of = [0] * cells  # nonzero exactly on the body
+    for k, cell in enumerate(flat.tolist()):
+        release_of[cell] = length - k
+    unseen = -(1 << 30)
+    distance, slack = [-1] * cells, [unseen] * cells
     distance[head] = 0
+    frontier, arrival = [head], 1
     reverse = (int(state.direction) + 2) % 4
     while frontier:
         layer = []
@@ -225,18 +239,23 @@ def encode(
             for direction, nxt in enumerate(neighbours[cell]):
                 if nxt < 0 or (cell == head and direction == reverse):
                     continue
-                if occupied[nxt]:
-                    slack[nxt] = max(slack[nxt], d + 1 - release_of[nxt])
+                if release_of[nxt]:
+                    if arrival - release_of[nxt] > slack[nxt]:
+                        slack[nxt] = arrival - release_of[nxt]
                 elif distance[nxt] < 0:
-                    distance[nxt] = d + 1
+                    distance[nxt] = arrival
                     layer.append(nxt)
         frontier = layer
-        d += 1
-    reach = (distance > 0) & ~occupied
+        arrival += 1
+    occupied = np.zeros(cells, dtype=bool)
+    occupied[flat] = True
+    distance_ = np.array(distance)
+    reach = (distance_ > 0) & ~occupied
     planes[_P["reach"]] = reach
-    planes[_P["distance"]] = np.where(reach, distance, 0) / cells
-    edge = slack > -(1 << 30)
-    planes[_P["slack"]] = np.where(edge, np.clip(slack / cells, -1.0, 1.0), 0.0)
+    planes[_P["distance"]] = np.where(reach, distance_, 0) / cells
+    slack_ = np.array(slack)
+    edge = slack_ > unseen
+    planes[_P["slack"]] = np.where(edge, np.clip(slack_ / cells, -1.0, 1.0), 0.0)
 
     k = int(state.direction)  # quarter turns that bring the heading up
     toward = np.full(cells, -1, dtype=np.int64)

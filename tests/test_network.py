@@ -1,0 +1,105 @@
+import io
+
+import numpy as np
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from snake_agent.contract import TRAINING_RULES  # noqa: E402
+from snake_agent.encoding import encode, stack  # noqa: E402
+from snake_agent.network import (  # noqa: E402
+    NetworkConfig,
+    NetworkEvaluator,
+    SnakeNet,
+    from_bytes,
+    load,
+    save,
+    tensors,
+    to_bytes,
+)
+from snake_agent.search import Query, run_search  # noqa: E402
+from snake_agent.selfplay import free_starts, play, standard_starts  # noqa: E402
+from snake_game import GameConfig, SnakeGame  # noqa: E402
+
+SMALL = NetworkConfig(channels=16, blocks=2, hidden=32)
+
+
+def network(seed=0, config=SMALL):
+    torch.manual_seed(seed)
+    model = SnakeNet(config)
+    # Break the identity start of the residual blocks so that every layer matters in the tests.
+    with torch.no_grad():
+        for block in model.blocks:
+            block.conv2.weight.normal_(0.0, 0.1)
+    return model.eval()
+
+
+def states(width, height, count=12, seed=0):
+    game = SnakeGame(GameConfig(width, height), seed=seed)
+    rng = np.random.default_rng(seed)
+    collected = []
+    while not game.done and len(collected) < count:
+        collected.append(game.state())
+        safe = game.safe_directions()
+        game.step(safe[int(rng.integers(len(safe)))] if safe else game.direction)
+    return collected
+
+
+def test_outputs_have_one_row_per_state():
+    model = network()
+    batch = stack([encode(s, TRAINING_RULES) for s in states(6, 6)])
+    logits, win, moves = model(*tensors(batch))
+    assert logits.shape == (12, 3) and win.shape == (12,) and moves.shape == (12,)
+    assert (moves >= 0).all()
+
+
+def test_the_network_does_not_see_the_canvas_around_a_board():
+    """A 4x4 board gives the same outputs on its own canvas and padded into a 6x6 one."""
+    model = network(1)
+    board = states(4, 4, seed=3)
+    alone = model(*tensors(stack([encode(s, TRAINING_RULES) for s in board])))
+    padded = model(*tensors(stack([encode(s, TRAINING_RULES, size=6) for s in board])))
+    for a, b in zip(alone, padded, strict=True):
+        assert torch.allclose(a, b, atol=1e-5)
+
+
+def test_the_evaluator_answers_the_search():
+    evaluator = NetworkEvaluator(network(2))
+    queries = [Query(s, TRAINING_RULES) for s in states(4, 4) + states(6, 6)]
+    prediction = evaluator(queries)
+    assert prediction.logits.shape == (24, 3) and prediction.logits.dtype == np.float64
+    assert ((prediction.win > 0) & (prediction.win < 1)).all()
+    result = run_search(evaluator, states(6, 6, seed=4)[-1])
+    assert result.action in range(3)
+
+
+def test_checkpoints_keep_the_weights_and_settings():
+    model = network(3, NetworkConfig(channels=8, blocks=1, hidden=16))
+    buffer = io.BytesIO()
+    save(model, buffer, generation=7)
+    buffer.seek(0)
+    loaded, meta = load(buffer)
+    assert meta == {"generation": 7} and loaded.config == model.config
+    batch = tensors(stack([encode(s, TRAINING_RULES) for s in states(6, 6)]))
+    for a, b in zip(model(*batch), loaded.eval()(*batch), strict=True):
+        assert torch.equal(a, b)
+    assert from_bytes(to_bytes(model)).config == model.config
+
+
+def test_a_few_steps_fit_a_batch_of_self_play():
+    from snake_agent.train import losses
+
+    model = network(4)
+    starts = standard_starts(4, 4, range(2)) + free_starts(4, 4, range(10, 14))
+    _, examples = play(NetworkEvaluator(model), starts, seed=0)
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
+    before = {name: value.item() for name, value in losses(model, examples, "cpu").items()}
+    for _ in range(60):
+        terms = losses(model, examples, "cpu")
+        optimizer.zero_grad()
+        sum(terms.values()).backward()
+        optimizer.step()
+    after = {name: value.item() for name, value in losses(model, examples, "cpu").items()}
+    assert after["win"] < before["win"] and after["moves"] < before["moves"]
+    assert after["policy"] < before["policy"]

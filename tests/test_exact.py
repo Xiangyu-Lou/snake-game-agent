@@ -9,9 +9,10 @@ import pytest
 from snake_agent.contract import NO_LIMIT, TRAINING_RULES
 from snake_agent.cycles import CycleEnvelope, ShortcutCyclePolicy
 from snake_agent.evaluation import AgentSpec, evaluate_standard
-from snake_agent.exact import evaluate_policy, solve, standard_starts
+from snake_agent.exact import evaluate_policy, solve, solve_envelope, standard_starts
 from snake_agent.survival import Board, prove_lost
 from snake_game import Direction, GameConfig, GameState, RelativeAction, SnakeGame, Status
+from snake_game.policies import GreedyPolicy
 
 
 def every_state(solution):
@@ -216,3 +217,40 @@ def test_the_exact_agents_play_their_expected_moves(four):
     assert free.summary().won == 300
     assert free.summary().envelope_exits > 0  # the unconstrained optimum leaves the envelope
     assert close_to_expected(free, four["rules"].start_moves())
+
+
+def test_the_envelope_solver_matches_the_full_solver_on_4x4(four):
+    inside = solve_envelope(4, 4)
+    assert inside.start_moves() == pytest.approx(four["envelope"].start_moves(), abs=1e-9)
+    checked = 0
+    for state in every_state(inside):
+        assert inside.value(state) == 1.0  # every envelope state is a certain win
+        assert inside.moves(state) == pytest.approx(four["envelope"].moves(state), abs=1e-9)
+        assert inside.best_action(state) == four["envelope"].best_action(state)
+        checked += 1
+    assert checked == inside.states == 9_466 - 48 * 14  # without the 48 two-cell bodies
+    with pytest.raises(ValueError, match="cycle order"):  # the body runs against the cycle
+        inside.value(GameState(4, 4, ((0, 1), (0, 0), (1, 0), (1, 1)), Direction.DOWN, (3, 3)))
+
+
+def test_policies_can_be_evaluated_inside_the_envelope(four):
+    envelope = four["cycle"]
+    shortcut = ShortcutCyclePolicy()
+    shortcut(standard_starts(4, 4)[0])
+    inside = evaluate_policy(4, 4, shortcut, envelope=envelope)
+    everywhere = evaluate_policy(4, 4, shortcut)
+    assert (inside.win, inside.moves, inside.states) == (everywhere.win, everywhere.moves, everywhere.states)
+
+    with pytest.raises(ValueError, match="cycle order"):  # greedy ignores the cycle
+        evaluate_policy(4, 4, GreedyPolicy(), envelope=envelope)
+
+
+@pytest.mark.slow
+def test_6x6_envelope_optimum_and_shortcut_cycle():
+    inside = solve_envelope(6, 6)
+    assert inside.states == 1_935_502  # 116,287 bodies of 3 to 35 cells, each with every free fruit cell
+    assert inside.start_moves() == pytest.approx(201.913632, abs=1e-6)
+    shortcut = ShortcutCyclePolicy()
+    shortcut(standard_starts(6, 6)[0])
+    result = evaluate_policy(6, 6, shortcut, envelope=inside.envelope)
+    assert result.win == 1.0 and result.moves == pytest.approx(212.778786, abs=1e-6)

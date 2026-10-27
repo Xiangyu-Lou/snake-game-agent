@@ -64,7 +64,11 @@ class _Level:
         np.put_along_axis(self.column, self.free, np.arange(cells - length)[None, :], axis=1)
 
     def link(self, width: int, height: int, longer: _Level | None) -> None:
-        """Successor tables; ``longer`` is the level one segment longer (None if that fills the board)."""
+        """Successor tables; ``longer`` is the level one segment longer (None if that fills the board).
+
+        When the levels hold only some bodies (cycle order), a move into a body
+        that is not held is ``unlisted``: it is never allowed.
+        """
         neighbours = neighbour_table(width, height)
         count = len(self.keys)
         self.target = np.full((count, 3), -1, dtype=np.int64)
@@ -78,14 +82,16 @@ class _Level:
                 if cell < 0 or cell in body[:-1]:
                     continue
                 self.target[i, a] = cell
-                self.succ[i, a] = self.index[(cell, d) if self.length == 1 else (cell,) + body[:-1]]
+                self.succ[i, a] = self.index.get((cell, d) if self.length == 1 else (cell,) + body[:-1], -1)
                 if cell != body[-1]:  # the fruit is never on the tail
-                    self.grow[i, a] = _WIN if longer is None else longer.index[(cell,) + body]
+                    self.grow[i, a] = _WIN if longer is None else longer.index.get((cell,) + body, -1)
         # For each state and action: does it eat, and which column the fruit has after a move that does not.
         self.eats = self.target[:, :, None] == self.free[:, None, :]
         succ = np.maximum(self.succ, 0)
         column = self.column[succ[:, :, None], self.free[:, None, :]]
         self.next_column = np.where((self.target[:, :, None] >= 0) & ~self.eats, column, 0)
+        missing = np.where(self.eats, (self.grow == -1)[:, :, None], (self.succ < 0)[:, :, None])
+        self.unlisted = (self.target[:, :, None] >= 0) & missing
 
 
 def _bodies(width: int, height: int) -> dict[int, list[tuple[int, ...]]]:
@@ -113,9 +119,40 @@ def _bodies(width: int, height: int) -> dict[int, list[tuple[int, ...]]]:
     return by_length
 
 
-def _levels(width: int, height: int, min_length: int) -> dict[int, _Level]:
+def _cycle_order_bodies(width: int, height: int, position: np.ndarray) -> dict[int, list[tuple[int, ...]]]:
+    """Every head-to-tail body of 2 to ``N - 1`` cells that lies in cycle order, by length.
+
+    Read from tail to head, such a body advances around the cycle (cell ``c``
+    at ``position[c]``) by less than one lap.
+    """
     cells = width * height
-    bodies = _bodies(width, height)
+    neighbours = neighbour_table(width, height)
+    by_length: dict[int, list[tuple[int, ...]]] = {length: [] for length in range(2, cells)}
+    path: list[int] = []  # tail first
+
+    def extend(ahead: int) -> None:
+        if len(path) >= 2:
+            by_length[len(path)].append(tuple(reversed(path)))
+        if len(path) == cells - 1:
+            return
+        for nxt in neighbours[path[-1]]:
+            if nxt >= 0 and (step := (position[nxt] - position[path[0]]) % cells) > ahead:
+                path.append(nxt)
+                extend(step)
+                path.pop()
+
+    for tail in range(cells):
+        path.append(tail)
+        extend(0)
+        path.pop()
+    return by_length
+
+
+def _levels(
+    width: int, height: int, min_length: int, bodies: dict[int, list[tuple[int, ...]]] | None = None
+) -> dict[int, _Level]:
+    cells = width * height
+    bodies = _bodies(width, height) if bodies is None else bodies
     levels = {}
     for length in range(min_length, cells):
         keys = [(c, d) for c in range(cells) for d in range(4)] if length == 1 else bodies[length]
@@ -150,13 +187,15 @@ def _induct(
     eat_moves: np.ndarray,
     allowed: np.ndarray | None,
     budget: int | None,
+    history: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Values and certain-win moves of a level with 0, 1, 2, ... moves left before the timeout.
 
     Stops after ``budget`` moves, or earlier once another move changes nothing:
-    the last entry then holds for every larger budget.
+    the last entry then holds for every larger budget. Without ``history`` only
+    that last entry is returned, which suits a solution without a timeout.
     """
-    blocked = (level.target < 0)[:, :, None]
+    blocked = (level.target < 0)[:, :, None] | level.unlisted
     if allowed is not None:
         blocked = blocked | ~allowed
     blocked = np.broadcast_to(blocked, level.eats.shape)
@@ -173,6 +212,8 @@ def _induct(
             break
         values.append(value)
         moves.append(move)
+        if not history:  # only the converged values are kept
+            values, moves = values[-1:], moves[-1:]
     return np.stack(values), np.stack(moves)
 
 
@@ -245,7 +286,10 @@ class ExactSolution:
         cells = tuple(y * self.width + x for x, y in state.snake)
         body = level.index.get((cells[0], int(state.direction)) if state.length == 1 else cells)
         if body is None or int(level.heading[body]) != int(state.direction):
-            raise ValueError("the heading must point from the neck to the head")
+            raise ValueError(
+                "not a state of this solution: the heading must point from the neck to the head"
+                + ("" if self._allowed is None else ", and the body must be in cycle order")
+            )
         if state.fruit is None:
             raise ValueError("a running game has a fruit")
         column = int(level.column[body, state.fruit[1] * self.width + state.fruit[0]])
@@ -376,19 +420,52 @@ def solve(
     if envelope is not None and envelope.cells != cells:
         raise ValueError("the envelope is for another board")
     levels = _levels(width, height, min_length)
+    return _solve_levels(width, height, levels, envelope, fruit_timeout)
+
+
+def solve_envelope(
+    width: int, height: int, envelope: CycleEnvelope | None = None, *, min_length: int = 3
+) -> ExactSolution:
+    """The fewest expected moves of every state inside the cycle-order envelope.
+
+    Only bodies in cycle order are enumerated, which keeps boards beyond 4x4 in
+    reach: 6x6 has 116,287 such bodies of three or more cells, 1.9 million
+    states with a fruit. From three segments on, every state has an envelope
+    move, so its win probability is 1. (Two-cell bodies are left out by default:
+    when the tail is the head's next cell on the cycle, the only envelope move
+    would be a reversal.) The default ``envelope`` is that of the standard
+    start. The fruit timeout is ignored: inside the envelope each fruit is eaten
+    within ``N`` moves, so from a fresh budget it never binds.
+    """
+    if envelope is None:
+        envelope = CycleEnvelope.for_state(standard_starts(width, height)[0])
+        if envelope is None:
+            raise ValueError(f"the standard start of {width}x{height} is not aligned with any cycle")
+    if envelope.cells != width * height:
+        raise ValueError("the envelope is for another board")
+    if not 2 <= min_length < width * height:
+        raise ValueError(f"min_length must be in [2, {width * height}), got {min_length}")
+    bodies = _cycle_order_bodies(width, height, _cycle_positions(envelope, width))
+    levels = _levels(width, height, min_length, bodies)
+    return _solve_levels(width, height, levels, envelope, False)
+
+
+def _solve_levels(
+    width: int, height: int, levels: dict[int, _Level], envelope: CycleEnvelope | None, fruit_timeout: bool
+) -> ExactSolution:
+    cells = width * height
     position = None if envelope is None else _cycle_positions(envelope, width)
     values, moves, eating = {}, {}, {}
     allowed: dict[int, np.ndarray] | None = None if envelope is None else {}
     after = None
-    for length in range(cells - 1, min_length - 1, -1):
+    for length in sorted(levels, reverse=True):
         level = levels[length]
         eating[length] = _eating(level, after, math.inf)
         mask = None if position is None else _envelope_mask(level, position, cells)
         if allowed is not None:
             allowed[length] = mask
-        values[length], moves[length] = _induct(
-            level, *eating[length], mask, cells + length if fruit_timeout else None
-        )
+        budget = cells + length if fruit_timeout else None
+        values[length], moves[length] = _induct(level, *eating[length], mask, budget, history=fruit_timeout)
         after = _afterstates(values[length][-1], moves[length][-1], certain_only=True)
     return ExactSolution(width, height, fruit_timeout, envelope, levels, values, moves, eating, allowed)
 
@@ -411,15 +488,22 @@ def evaluate_policy(
     policy: Callable[[GameState], RelativeAction | Direction],
     *,
     initial_length: int = 3,
+    envelope: CycleEnvelope | None = None,
 ) -> PolicyValue:
     """Exact win probability and expected moves of ``policy`` from the standard start.
 
     The training rules apply (lost after ``N + L`` moves without fruit). The
     policy must depend on the board alone: it is asked once for every body and
-    fruit it can reach from the start, with the move counters at zero.
+    fruit it can reach from the start, with the move counters at zero. With an
+    ``envelope`` only bodies in its cycle order are enumerated, so larger boards
+    can be evaluated, and the policy must keep the body in cycle order.
     """
     cells = width * height
-    levels = _levels(width, height, initial_length)
+    if envelope is None:
+        levels = _levels(width, height, initial_length)
+    else:
+        bodies = _cycle_order_bodies(width, height, _cycle_positions(envelope, width))
+        levels = _levels(width, height, initial_length, bodies)
     chosen = {length: np.ones(level.free.shape, dtype=np.int64) for length, level in levels.items()}
     start = tuple(y * width + x for x, y in GameConfig(width, height, initial_length).start_snake())
     first = levels[initial_length]
@@ -437,6 +521,8 @@ def evaluate_policy(
         chosen[length][body, j] = a
         if level.target[body, a] < 0 or level.grow[body, a] == _WIN and level.eats[body, a, j]:
             continue
+        if level.unlisted[body, a, j]:
+            raise ValueError(f"the policy left cycle order at {snake}")
         if level.eats[body, a, j]:
             grown = int(level.grow[body, a])
             nexts = [(length + 1, grown, k) for k in range(cells - length - 1)]

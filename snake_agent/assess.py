@@ -9,7 +9,8 @@ worker processes:
 * **T1**, standard starts: completion and mean moves, gated against the shortcut
   cycle (:data:`T1_REFERENCES`). On boards up to 6x6, the exact envelope
   solution also scores every decision: the expected moves it adds to the
-  envelope's optimum (:func:`envelope_regret`).
+  envelope's optimum (:func:`envelope_regret`), and how well the moves head
+  orders the moves the search compares (:func:`sibling_ranking`).
 * **T2**, recovery starts: win rates per occupancy band, against the reference
   policies (and on 4x4 the exact optimum).
 * **4x4 values**: the network's win probabilities against the exact solution,
@@ -32,8 +33,8 @@ import torch
 
 from snake_game import Direction, GameState, RelativeAction, SnakeGame
 
-from .contract import TRAINING_RULES, Rules
-from .encoding import canonical_envelope
+from .contract import TRAINING_RULES, Rules, planning_game, to_relative
+from .encoding import canonical_envelope, moves_ceiling, moves_scale
 from .evaluation import (
     AgentSpec,
     Evaluation,
@@ -49,7 +50,7 @@ from .exact import ExactSolution, evaluate_policy, solve, solve_envelope
 from .network import NetworkEvaluator, from_bytes
 from .recovery import RecoveryStart, held_out_starts
 from .references import REFERENCES
-from .search import EVALUATION, PolicyAgent, Query, SearchAgent, SearchConfig, envelope_certain
+from .search import EVALUATION, Evaluator, PolicyAgent, Query, SearchAgent, SearchConfig, envelope_certain
 from .seeds import VALIDATION, SeedRange, recovery_fruit_seeds, standard_seeds
 
 T1_REFERENCES = {(4, 4): 43.89, (6, 6): 214.0, (10, 10): 1445.0, (20, 20): 20737.0}
@@ -157,6 +158,73 @@ def envelope_regret(
         "extra_moves": round(float(extra_.mean()), 5) if extra else None,
         "optimal_share": round(float((extra_ < 1e-9).mean()), 4) if extra else None,
     }
+
+
+def sibling_ranking(
+    evaluator: Evaluator,
+    solution: ExactSolution,
+    decisions: Sequence[tuple[GameState, RelativeAction]],
+    rules: Rules = TRAINING_RULES,
+) -> dict[str, Any]:
+    """How well the moves head orders the envelope moves of T1 decisions, by the exact envelope ``solution``.
+
+    At each decision with at least two envelope moves, each move's one-step value ``1 + V(child)`` (the
+    afterstate's value if it eats) is compared with its exact expected moves. ``difference_error``: the
+    mean absolute error of each other move's value minus the played move's; ``order_agreement``: the
+    share of pairs of moves with different exact values that the head orders as the solution does.
+    Reported for the first half of the game (at least half the board free) and the second.
+    """
+    queries: list[Query] = []
+    groups = []
+    for state, played in decisions:
+        envelope = canonical_envelope(state.width, state.height)
+        try:
+            costs = solution.action_moves(state)
+        except ValueError:  # out of cycle order
+            continue
+        jumps = envelope.moves(state)
+        if len(jumps) < 2:
+            continue
+        game = planning_game(state, seed=0)
+        children = {}
+        for direction in jumps:
+            action = to_relative(state.direction, direction)
+            child = game.clone()
+            step = child.step_relative(action)
+            if step.won:
+                children[action] = None
+                continue
+            after = dataclasses.replace(child.state(), fruit=None) if step.ate_fruit else child.state()
+            children[action] = len(queries)
+            queries.append(Query(after, rules, afterstate=step.ate_fruit))
+        groups.append((state, played, costs, children))
+    values = []
+    for i in range(0, len(queries), 1024):
+        batch = queries[i : i + 1024]
+        for query, moves in zip(batch, evaluator(batch).moves, strict=True):
+            after = query.state
+            values.append(min(max(float(moves), 0.0), moves_ceiling(after.num_cells, after.free_cells)))
+            values[-1] *= moves_scale(after.free_cells)
+    report = {}
+    for phase, early in (("first_half", True), ("second_half", False)):
+        errors, agree, pairs = [], 0, 0
+        for state, played, costs, children in groups:
+            if (state.free_cells * 2 >= state.num_cells) is not early:
+                continue
+            q = {a: 1.0 + (0.0 if i is None else values[i]) for a, i in children.items()}
+            errors += [(q[a] - q[played]) - (costs[a] - costs[played]) for a in q if a != played]
+            moves = sorted(q)
+            for j, a in enumerate(moves):
+                for b in moves[j + 1 :]:
+                    if costs[a] != costs[b]:
+                        pairs += 1
+                        agree += (q[a] < q[b]) == (costs[a] < costs[b])
+        report[phase] = {
+            "decisions": sum((s.free_cells * 2 >= s.num_cells) is early for s, *_ in groups),
+            "difference_error": round(float(np.mean(np.abs(errors))), 4) if errors else None,
+            "order_agreement": round(agree / pairs, 4) if pairs else None,
+        }
+    return report
 
 
 def t2(
@@ -364,6 +432,8 @@ def assess(
             entry["gate"] = {"reference": reference, "passed": gate.passed, "reasons": list(gate.reasons)}
         if inside is not None:
             entry["exact"] = envelope_regret(inside, decisions)
+            evaluator = NetworkEvaluator(from_bytes(weights))
+            entry["exact"]["siblings"] = sibling_ranking(evaluator, inside, decisions, rules)
         report[f"t1_{kind}"] = entry
     starts = held_out_starts(width, height, sources, split)
     if starts:

@@ -40,7 +40,7 @@ import numpy as np
 from snake_game import Direction, GameState, RelativeAction
 
 from .contract import Rules
-from .cycles import CycleEnvelope, aligned_cycles
+from .cycles import CycleEnvelope
 from .exact import standard_starts
 from .survival import Board, MoveClass, classify_moves, neighbour_table
 
@@ -120,8 +120,8 @@ class Encoded:
 
 
 @functools.cache
-def canonical_cycle(width: int, height: int) -> np.ndarray | None:
-    """Position along the board's canonical cycle of each flat cell; None if the board has none.
+def canonical_envelope(width: int, height: int) -> CycleEnvelope | None:
+    """The envelope of the board's canonical cycle; None if the board has none.
 
     The canonical cycle is the one the standard start is aligned with, which
     defines the T1 envelope (:meth:`CycleEnvelope.for_state`).
@@ -130,10 +130,15 @@ def canonical_cycle(width: int, height: int) -> np.ndarray | None:
         start = standard_starts(width, height)[0]
     except ValueError:  # too small for the standard start
         return None
-    cycles = aligned_cycles(start)
-    if not cycles:
+    return CycleEnvelope.for_state(start)
+
+
+@functools.cache
+def canonical_cycle(width: int, height: int) -> np.ndarray | None:
+    """Position along the board's canonical cycle of each flat cell; None if the board has none."""
+    envelope = canonical_envelope(width, height)
+    if envelope is None:
         return None
-    envelope = CycleEnvelope(cycles[0])
     position = np.zeros(width * height, dtype=np.int64)
     for (x, y), i in envelope.position.items():
         position[y * width + x] = i
@@ -261,8 +266,7 @@ def encode(
             globals_[_G["fruit_ahead"]] = 0.0 if fruit < 0 else ahead[fruit] / cells
             globals_[_G["tail_ahead"]] = tail_ahead / cells
             if not afterstate:
-                envelope = _envelope(width, height)
-                jumps = envelope.moves(state)
+                jumps = canonical_envelope(width, height).moves(state)
 
     globals_[_G["occupancy"]] = length / cells
     globals_[_G["free"]] = (cells - length) / cells
@@ -309,11 +313,6 @@ def _walls(rows: int, columns: int) -> np.ndarray:
     walls = (np.minimum(distances, SATURATION) / SATURATION).astype(np.float32)
     walls.flags.writeable = False
     return walls
-
-
-@functools.cache
-def _envelope(width: int, height: int) -> CycleEnvelope:
-    return CycleEnvelope.for_state(standard_starts(width, height)[0])
 
 
 def stack(encoded: list[Encoded]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:

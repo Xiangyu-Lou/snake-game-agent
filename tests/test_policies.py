@@ -1,7 +1,13 @@
 import pytest
 
 from snake_game import Direction, GameConfig, GameState, SnakeGame
-from snake_game.policies import GreedyPolicy, HamiltonianPolicy, RandomPolicy, safe_directions
+from snake_game.policies import (
+    GreedyPolicy,
+    HamiltonianPolicy,
+    RandomPolicy,
+    hamiltonian_cycles,
+    safe_directions,
+)
 
 
 def play(policy, config, seed, max_steps=200_000):
@@ -22,6 +28,37 @@ def test_hamiltonian_policy_always_fills_the_board(width, height):
 def test_hamiltonian_policy_needs_an_even_side():
     with pytest.raises(ValueError, match="odd"):
         HamiltonianPolicy()(SnakeGame(GameConfig(5, 5), seed=0).state())
+
+
+@pytest.mark.parametrize("width,height", [(2, 2), (4, 4), (6, 5), (5, 6), (3, 4), (20, 20)])
+def test_hamiltonian_cycles_visit_every_cell_once(width, height):
+    cycles = hamiltonian_cycles(width, height)
+    assert cycles
+    for cycle in cycles:
+        assert set(cycle) == {(x, y) for x in range(width) for y in range(height)}
+        cell, seen = (0, 0), set()
+        for _ in range(width * height):
+            seen.add(cell)
+            nxt = cycle[cell]
+            assert abs(nxt[0] - cell[0]) + abs(nxt[1] - cell[1]) == 1
+            cell = nxt
+        assert cell == (0, 0) and len(seen) == width * height
+
+
+def test_hamiltonian_cycles_reject_boards_without_one():
+    with pytest.raises(ValueError, match="odd"):
+        hamiltonian_cycles(5, 5)
+    with pytest.raises(ValueError):
+        hamiltonian_cycles(1, 4)
+
+
+def test_hamiltonian_policy_reports_its_cycle():
+    policy = HamiltonianPolicy()
+    assert policy.cycle is None
+    state = SnakeGame(GameConfig(6, 6), seed=0).state()
+    policy(state)
+    assert policy.cycle in hamiltonian_cycles(6, 6)
+    assert all(policy.cycle[state.snake[k]] == state.snake[k - 1] for k in range(1, state.length))
 
 
 def test_greedy_policy_scores_well_but_is_not_perfect():

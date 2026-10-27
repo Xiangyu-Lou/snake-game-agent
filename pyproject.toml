@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "snake-game-agent"
 version = "0.1.0"
-description = "An AI that learns to beat Snake. Step 1: an exact, fast Snake game with Gymnasium environments and an animated UI."
+description = "An AI that learns to beat Snake: an exact Snake game with Gymnasium environments, and the agent built on it."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -23,11 +23,12 @@ dev = ["pytest>=7", "pygame-ce>=2.5"]
 snake-game = "snake_game.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["snake_game*"]
+include = ["snake_game*", "snake_agent*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["slow: long reproductions of the probe's numbers, skipped unless pytest runs with --slow"]
 
 [tool.ruff]
 line-length = 110

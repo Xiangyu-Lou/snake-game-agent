@@ -41,7 +41,7 @@ import torch.nn.functional as F
 from .assess import assess
 from .contract import TRAINING_RULES, Outcome
 from .encoding import mirror
-from .network import NetworkConfig, NetworkEvaluator, SnakeNet, from_bytes, save, tensors, to_bytes
+from .network import NetworkConfig, NetworkEvaluator, SnakeNet, from_bytes, load, save, tensors, to_bytes
 from .search import SELF_PLAY
 from .selfplay import Examples, GameSummary, Start, free_starts, play, prefix_starts, standard_starts
 
@@ -254,19 +254,27 @@ def train(
     out: str | Path,
     device: str = "cpu",
     log: Callable[[str], None] = print,
+    init: str | Path | None = None,
 ) -> SnakeNet:
     """Run ``config`` and write its log and checkpoints to ``out``; returns the trained network.
 
     With a CUDA ``device`` the self-play workers evaluate their leaves on it too: batched across their
     games, the network then costs little next to the search's own work. Assessment games evaluate one
-    leaf at a time, on the CPU.
+    leaf at a time, on the CPU. ``init`` starts from a checkpoint's weights (its network size must match
+    ``config``); the replay buffer and the optimizer start empty, and a new run ``seed`` gives new games.
     """
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n")
+    settings = asdict(config) | ({"init": str(init)} if init is not None else {})
+    (out / "config.json").write_text(json.dumps(settings, indent=2) + "\n")
     rng = np.random.default_rng(config.seed)
     torch.manual_seed(config.seed)
     model = SnakeNet(config.network).to(device)
+    if init is not None:
+        start, _ = load(init, device)
+        if start.config != config.network:
+            raise ValueError(f"the checkpoint's network {start.config} is not {config.network}")
+        model.load_state_dict(start.state_dict())
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     replay = Replay(config.replay)
     inference = "cuda" if str(device).startswith("cuda") else "cpu"

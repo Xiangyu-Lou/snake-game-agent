@@ -1,3 +1,4 @@
+import dataclasses
 import json
 
 import numpy as np
@@ -94,3 +95,13 @@ def test_a_short_run_writes_its_log_checkpoints_and_assessment(tmp_path):
     model, meta = load(tmp_path / "model-002.pt")
     assert meta["generation"] == 1 and meta["config"]["width"] == 4
     assert json.loads((tmp_path / "config.json").read_text())["games"] == 8
+    # A run can start from a checkpoint's weights.
+    again = dataclasses.replace(config, generations=1, eval_every=5, seed=1)
+    train(again, tmp_path / "again", log=lines.append, init=tmp_path / "model-002.pt")
+    assert json.loads((tmp_path / "again" / "config.json").read_text())["init"].endswith("model-002.pt")
+    with pytest.raises(ValueError, match="network"):
+        train(
+            dataclasses.replace(again, network=NetworkConfig(4, 1, 8)),
+            tmp_path / "x",
+            init=tmp_path / "model-002.pt",
+        )

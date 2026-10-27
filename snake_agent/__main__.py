@@ -170,7 +170,7 @@ def train_network(args: argparse.Namespace) -> int:
         eval_games=args.eval_games,
         eval_sources=args.eval_sources,
     )
-    train(config, args.out, device=args.device or _default_device())
+    train(config, args.out, device=args.device or _default_device(), init=args.init)
     return 0
 
 
@@ -285,6 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--eval-games", type=int, default=100, help="T1 games per assessment")
     tr.add_argument("--eval-sources", type=int, default=60, help="T2 source games per assessment")
     tr.add_argument("--device", help="torch device for training (default: cuda if available, else cpu)")
+    tr.add_argument("--init", help="start from this checkpoint's weights (a model.pt written by train)")
     tr.set_defaults(run=train_network)
 
     asm = commands.add_parser("assess", help="assess a trained network against the M1 gates (needs PyTorch)")

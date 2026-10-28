@@ -1,20 +1,27 @@
-"""Self-play for milestone M1: games played with the search, and the training examples they give.
+"""Self-play: games played with the search, and the training examples they give.
 
 Many games run in one process and share each network call: :func:`play`
 advances every game's search to its next leaf, evaluates all the leaves in one
 batch, and repeats (review §2.4). The live games are :class:`~snake_game.SnakeGame`
-objects that the search never sees: it plans on the public state only.
+objects that the search never sees: it plans on the public state only. Games
+on boards of different sizes can share a batch: their encodings share a canvas.
 
-**Starts.** A game starts from the standard start (:func:`standard_starts`),
-where the search stays inside the cycle-order envelope and every game is won;
-from the standard start after a random prefix (:func:`prefix_starts`): random
-envelope moves up to a random length, then the agent; or from a *free start*
-(:func:`free_starts`): a running state of a reference policy's game that is not
-a certain win inside the envelope, where the search must judge win
-probabilities. Random jumps leave holes that the agent's own games rarely show,
-so prefixes train the network on the kind of position that lies behind the
-moves its policy does not play, which the search must still judge. Seeds must
-be training seeds (:func:`~snake_agent.seeds.check_training_seed`).
+**Starts** (:class:`Start`, one kind per :data:`KINDS`). A game starts from the
+standard start (:func:`standard_start`), where the search stays inside the
+cycle-order envelope and every game is won; from the standard start after a
+random prefix (:func:`prefix_start`): random envelope moves up to a random
+length, then the agent; from a *free start* (:func:`free_start`): a running
+state of a reference policy's game that is not a certain win inside the
+envelope, where the search must judge win probabilities; from a *recovery
+start* (:func:`recovery_start`): track T2's kind of start, a certified state
+that no cycle is aligned with, taken from a guarded-greedy game of a training
+seed; or from a *mid-game start* (:func:`midgame_start`): a state of one of the
+agent's own earlier games, replayed with new fruits (review §2.6), which spends
+the games on the late positions that full games reach only after thousands of
+moves. Random jumps leave holes that the agent's own games rarely show, so
+prefixes train the network on the kind of position that lies behind the moves
+its policy does not play, which the search must still judge. Seeds must be
+training seeds (:func:`~snake_agent.seeds.check_training_seed`).
 
 **Targets.** Every move gives an example of the state before it, and every
 eating move that does not fill the board one of its *afterstate*, the board
@@ -52,6 +59,7 @@ import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Any
 
 import numpy as np
 
@@ -60,6 +68,7 @@ from snake_game.policies import GreedyPolicy, RandomPolicy
 
 from .contract import TRAINING_RULES, Outcome, Rules, planning_game
 from .encoding import canonical_envelope, encode, moves_ceiling, moves_scale
+from .recovery import recovery_starts
 from .references import GuardedGreedyPolicy
 from .search import (
     SELF_PLAY,
@@ -88,17 +97,39 @@ class Label(IntEnum):
 
 
 # --------------------------------------------------------------------- starts
+KINDS = ("standard", "prefix", "free", "recovery", "midgame")
+"""The kinds of start (see :class:`Start`)."""
+
+FRUIT_OFFSET = 500_000_000
+"""Starts taken from another game draw their fruits from their seed plus this, still a training seed."""
+
+
 @dataclass(frozen=True)
 class Start:
-    """Where a self-play game starts, and the seed of its fruits."""
+    """Where a self-play game starts, and the seed of its fruits.
+
+    ``kind`` is one of :data:`KINDS`: the standard start (its first fruit from
+    ``seed`` too), the standard start after a random envelope prefix, a free
+    start (a reference policy's running state), a recovery start (as in track
+    T2, from a training seed) or a mid-game start (a state of one of the agent's
+    own earlier games, replayed with new fruits).
+    """
 
     state: GameState
     seed: int
-    standard: bool
-    """The standard start (its first fruit from ``seed`` too), or a free start."""
+    kind: str = "standard"
     prefix: int = 0
-    """Standard starts: random envelope moves are played until the snake is this long, then the agent
-    takes over (0: no prefix). The prefix gives no examples."""
+    """Prefix starts: random envelope moves are played until the snake is this long, then the agent
+    takes over. The prefix gives no examples."""
+
+    def __post_init__(self) -> None:
+        if self.kind not in KINDS:
+            raise ValueError(f"unknown start kind {self.kind!r}: use {', '.join(KINDS)}")
+
+    @property
+    def standard(self) -> bool:
+        """Whether the game begins at the standard start (with or without a prefix)."""
+        return self.kind in ("standard", "prefix")
 
     def game(self) -> SnakeGame:
         """The live game, positioned where the agent takes over."""
@@ -113,61 +144,105 @@ class Start:
         return game
 
 
-def standard_starts(width: int, height: int, seeds: Sequence[int]) -> list[Start]:
-    """One standard start per training seed."""
-    config = GameConfig(width, height)
-    return [Start(SnakeGame(config, seed=check_training_seed(s)).state(), s, True) for s in seeds]
+def standard_start(width: int, height: int, seed: int) -> Start:
+    """The standard start, with the fruits of a training ``seed``."""
+    return Start(SnakeGame(GameConfig(width, height), seed=check_training_seed(seed)).state(), seed)
 
 
-def prefix_starts(width: int, height: int, seeds: Sequence[int], fill: float = 0.75) -> list[Start]:
-    """One standard start per training seed whose first moves are uniformly random envelope moves.
+def prefix_start(width: int, height: int, seed: int, fill: float = 0.75) -> Start:
+    """The standard start of a training ``seed``, whose first moves are uniformly random envelope moves.
 
     The prefix lasts until the snake is as long as a target drawn uniformly
     between one segment more than at the start and ``fill`` of the board.
     Envelope moves keep the win certain, so the agent takes over a won game.
     """
-    config = GameConfig(width, height)
-    cells = width * height
-    starts = []
-    for seed in seeds:
-        state = SnakeGame(config, seed=check_training_seed(seed)).state()
-        shortest = state.length + 1
-        target = random.Random(seed).randint(shortest, max(shortest, min(int(fill * cells), cells - 2)))
-        starts.append(Start(state, seed, True, target))
-    return starts
+    state = standard_start(width, height, seed).state
+    shortest, cells = state.length + 1, width * height
+    target = random.Random(seed).randint(shortest, max(shortest, min(int(fill * cells), cells - 2)))
+    return Start(state, seed, "prefix", target)
 
 
-def free_starts(
-    width: int,
-    height: int,
-    seeds: Sequence[int],
-    rules: Rules = TRAINING_RULES,
-    fruit_offset: int = 500_000_000,
-) -> list[Start]:
-    """One free start per training seed, where one exists.
+def free_start(width: int, height: int, seed: int, rules: Rules = TRAINING_RULES) -> Start | None:
+    """A free start from a training ``seed``, if its game has one.
 
     The seed's game is played from the standard start by a reference policy
     (random, greedy or guarded greedy, chosen by the seed) for at most ``4 N``
     moves. The start is one of its running states, drawn uniformly, that is not
     a certain win inside the envelope and has not timed out under ``rules``.
-    The self-play game's fruits then come from ``seed + fruit_offset``, so they
-    differ from the source game's.
+    The self-play game's fruits then come from ``seed +`` :data:`FRUIT_OFFSET`,
+    so they differ from the source game's.
     """
-    cells = width * height
-    starts = []
-    for seed in seeds:
-        rng = random.Random(check_training_seed(seed))
-        policy = rng.choice([RandomPolicy(seed), GreedyPolicy(), GuardedGreedyPolicy()])
-        game = SnakeGame(GameConfig(width, height), seed=seed)
-        candidates = []
-        while not game.done and game.steps < 4 * cells:
-            state = game.state()
-            if not rules.timed_out(state) and not envelope_certain(state, rules):
-                candidates.append(state)
-            game.step(policy(state))
-        if candidates:
-            starts.append(Start(rng.choice(candidates), check_training_seed(seed + fruit_offset), False))
-    return starts
+    rng = random.Random(check_training_seed(seed))
+    policy = rng.choice([RandomPolicy(seed), GreedyPolicy(), GuardedGreedyPolicy()])
+    game = SnakeGame(GameConfig(width, height), seed=seed)
+    candidates = []
+    while not game.done and game.steps < 4 * width * height:
+        state = game.state()
+        if not rules.timed_out(state) and not envelope_certain(state, rules):
+            candidates.append(state)
+        game.step(policy(state))
+    if not candidates:
+        return None
+    return Start(rng.choice(candidates), check_training_seed(seed + FRUIT_OFFSET), "free")
+
+
+def recovery_start(width: int, height: int, seed: int) -> Start | None:
+    """A recovery start from a training ``seed``, if its game has one: T2's starts, on training seeds.
+
+    The seed's guarded-greedy game gives a start in each occupancy band it
+    passes through with a certified state that no cycle is aligned with
+    (:func:`~snake_agent.recovery.recovery_starts`); one of them is drawn
+    uniformly. Fruits come from ``seed +`` :data:`FRUIT_OFFSET`.
+    """
+    candidates = recovery_starts(width, height, [check_training_seed(seed)])
+    if not candidates:
+        return None
+    chosen = random.Random(f"{seed}/recovery").choice(candidates)
+    return Start(chosen.state, check_training_seed(seed + FRUIT_OFFSET), "recovery")
+
+
+def midgame_start(state: GameState, seed: int) -> Start:
+    """A state of one of the agent's own games, replayed with the fruits of ``seed +`` :data:`FRUIT_OFFSET`
+    after its current fruit (review §2.6: mid-game starts replayed from the agent's games)."""
+    return Start(state, check_training_seed(seed + FRUIT_OFFSET), "midgame")
+
+
+def make_start(kind: str, width: int, height: int, seed: int, extra: Any = None) -> Start | None:
+    """The start of ``kind`` for a training ``seed`` (None if the seed's source game has none).
+
+    ``extra`` is the prefix fill for prefix starts and the state for mid-game starts.
+    """
+    if kind == "standard":
+        return standard_start(width, height, seed)
+    if kind == "prefix":
+        return prefix_start(width, height, seed, 0.75 if extra is None else extra)
+    if kind == "free":
+        return free_start(width, height, seed)
+    if kind == "recovery":
+        return recovery_start(width, height, seed)
+    if kind == "midgame":
+        return midgame_start(extra, seed)
+    raise ValueError(f"unknown start kind {kind!r}: use {', '.join(KINDS)}")
+
+
+def standard_starts(width: int, height: int, seeds: Sequence[int]) -> list[Start]:
+    """One standard start per training seed."""
+    return [standard_start(width, height, s) for s in seeds]
+
+
+def prefix_starts(width: int, height: int, seeds: Sequence[int], fill: float = 0.75) -> list[Start]:
+    """One prefix start per training seed (:func:`prefix_start`)."""
+    return [prefix_start(width, height, s, fill) for s in seeds]
+
+
+def free_starts(width: int, height: int, seeds: Sequence[int], rules: Rules = TRAINING_RULES) -> list[Start]:
+    """One free start per training seed, where one exists (:func:`free_start`)."""
+    return [start for s in seeds if (start := free_start(width, height, s, rules)) is not None]
+
+
+def recovery_training_starts(width: int, height: int, seeds: Sequence[int]) -> list[Start]:
+    """One recovery start per training seed, where one exists (:func:`recovery_start`)."""
+    return [start for s in seeds if (start := recovery_start(width, height, s)) is not None]
 
 
 # ------------------------------------------------------------------- examples
@@ -210,7 +285,8 @@ class Examples:
 class GameSummary:
     """One self-play game."""
 
-    standard: bool
+    kind: str
+    """The kind of its start (:data:`KINDS`)."""
     seed: int
     outcome: Outcome
     moves: int
@@ -223,6 +299,16 @@ class GameSummary:
     """Moves chosen by a search (the others had at most one move left)."""
     prefix: int = 0
     """Random envelope moves played before the agent took over."""
+    board: tuple[int, int] = (0, 0)
+    leaves: int = 0
+    """Network evaluations the game's searches asked for."""
+    samples: tuple[GameState, ...] = ()
+    """States the agent moved from, drawn uniformly, for mid-game starts (:func:`midgame_start`)."""
+
+    @property
+    def standard(self) -> bool:
+        """Whether the game began at the standard start (with or without a prefix)."""
+        return self.kind in ("standard", "prefix")
 
 
 class _Game:
@@ -239,6 +325,7 @@ class _Game:
         self.steps: list[tuple[GameState, SearchResult]] = []
         self.afterstates: list[tuple[int, GameState]] = []
         self.outcome: Outcome | None = None
+        self.leaves = 0
 
     def advance(self, rng: np.random.Generator) -> Query | None:
         """Play until the search needs an evaluation (returned) or the game ends (None)."""
@@ -248,7 +335,9 @@ class _Game:
                 self.search = search(self.state, self.rules, self.config, rng, self.epoch.observe(self.state))
             value, self.value = self.value, None
             try:
-                return self.search.send(value)
+                query = self.search.send(value)
+                self.leaves += 1
+                return query
             except StopIteration as stop:
                 self.search = None
                 self._move(stop.value)
@@ -266,9 +355,11 @@ class _Game:
         elif self.rules.timed_out(self.game.state()):
             self.outcome = Outcome.TIMED_OUT
 
-    def summary(self) -> GameSummary:
+    def summary(self, samples: int, rng: np.random.Generator) -> GameSummary:
+        """The game's summary, with up to ``samples`` of its states drawn uniformly for mid-game starts."""
+        chosen = rng.choice(len(self.steps), size=min(samples, len(self.steps)), replace=False)
         return GameSummary(
-            self.start.standard,
+            self.start.kind,
             self.start.seed,
             self.outcome,
             len(self.steps),
@@ -277,6 +368,9 @@ class _Game:
             self.start_length,
             sum(not result.forced for _, result in self.steps),
             self.prefix,
+            (self.game.width, self.game.height),
+            self.leaves,
+            tuple(self.steps[i][0] for i in sorted(chosen)),
         )
 
     def examples(
@@ -442,6 +536,7 @@ def play(
     moves_lambda: float = 0.5,
     size: int | None = None,
     sibling_visits: int = 0,
+    samples: int = 0,
 ) -> tuple[list[GameSummary], Examples]:
     """Play a game from each start, all at once, and return their summaries and training examples.
 
@@ -449,10 +544,11 @@ def play(
     fruits), never the games' fruits. ``beta`` is the weight of the search's
     values in the win targets, ``moves_lambda`` the lambda of the moves
     targets (1: the moves the game still took), and ``size`` the canvas of the
-    encodings (by default the largest board side). The afterstates of won games
-    are evaluated once more at the end, for the moves targets. With
-    ``sibling_visits``, envelope moves the search visited that often but did not
-    play give examples too (``Label.SIBLING``).
+    encodings (by default the largest board side; starts on several boards
+    share it). The afterstates of won games are evaluated once more at the end,
+    for the moves targets. With ``sibling_visits``, envelope moves the search
+    visited that often but did not play give examples too (``Label.SIBLING``).
+    Each summary keeps ``samples`` of its game's states for mid-game starts.
     """
     if not rules.fruit_timeout:
         raise ValueError("self-play needs the fruit timeout, which turns loops into losses")
@@ -482,7 +578,7 @@ def play(
     for game in games:
         mine = [next(values) for _ in game.afterstates] if game.outcome is Outcome.WON else []
         rows += game.examples(beta, moves_lambda, mine, size, sibling_visits)
-    return [game.summary() for game in games], _to_examples(rows)
+    return [game.summary(samples, rng) for game in games], _to_examples(rows)
 
 
 def _moves_values(evaluator: Evaluator, afterstates: Sequence[GameState], rules: Rules) -> list[float]:

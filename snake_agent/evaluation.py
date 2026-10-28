@@ -136,70 +136,147 @@ def run_game(
     With an ``envelope``, the first move outside it is recorded. ``start``,
     ``seed`` and ``band`` only label the record.
     """
-    cells = game.width * game.height
-    seen: set[Hashable] = set()
-    moves = fruits = 0
-    longest = game.steps_since_fruit
-    margin = longest / (cells + game.length)
-    inside = envelope is not None and envelope.contains(game.state())
-    exit_move = None if inside or envelope is None else 0
+    run = GameRun(
+        game,
+        rules,
+        memory=memory,
+        detect_loops=detect_loops,
+        stall_limit=stall_limit,
+        move_cap=move_cap,
+        envelope=envelope,
+        record=record,
+        start=start,
+        seed=seed,
+        band=band,
+    )
+    while (state := run.next_state()) is not None:
+        run.play(agent(state))
+    return run.result
 
-    def finish(outcome: Outcome, detail: str | None = None) -> GameRecord:
-        return GameRecord(
-            start, seed, outcome, moves, fruits, game.length, detail, longest, margin, exit_move, band
+
+class GameRun:
+    """:func:`run_game` one move at a time, so that a driver can advance many games together.
+
+    :meth:`next_state` returns the state to move from, or None once the game is
+    over and :attr:`result` holds its record; :meth:`play` makes the agent's move.
+    The options are those of :func:`run_game`.
+    """
+
+    def __init__(
+        self,
+        game: SnakeGame,
+        rules: Rules = TRAINING_RULES,
+        *,
+        memory: Callable[[], Hashable] | None = None,
+        detect_loops: bool = False,
+        stall_limit: int | None = None,
+        move_cap: int | None = None,
+        envelope: CycleEnvelope | None = None,
+        record: list[GameState] | None = None,
+        start: str = "standard",
+        seed: int = -1,
+        band: float | None = None,
+    ) -> None:
+        self.game, self.rules, self.memory = game, rules, memory
+        self.detect_loops, self.stall_limit, self.move_cap = detect_loops, stall_limit, move_cap
+        self.envelope, self.record = envelope, record
+        self.start, self.seed, self.band = start, seed, band
+        self.cells = game.width * game.height
+        self.seen: set[Hashable] = set()
+        self.moves = self.fruits = 0
+        self.longest = game.steps_since_fruit
+        self.margin = self.longest / (self.cells + game.length)
+        self.inside = envelope is not None and envelope.contains(game.state())
+        self.exit_move = None if self.inside or envelope is None else 0
+        self.state: GameState | None = None
+        self.result: GameRecord | None = None
+
+    def _finish(self, outcome: Outcome, detail: str | None = None) -> None:
+        self.state = None
+        self.result = GameRecord(
+            self.start,
+            self.seed,
+            outcome,
+            self.moves,
+            self.fruits,
+            self.game.length,
+            detail,
+            self.longest,
+            self.margin,
+            self.exit_move,
+            self.band,
         )
 
-    while not game.done:
+    def next_state(self) -> GameState | None:
+        """The state the agent must move from, or None if the game is over."""
+        if self.result is not None:
+            return None
+        game = self.game
+        if game.done:
+            if game.won:
+                self._finish(Outcome.WON)
+            else:
+                self._finish(Outcome.LOST, game.death_cause.value)
+            return None
         state = game.state()
-        if record is not None:
-            record.append(state)
-        if detect_loops:
+        if self.record is not None:
+            self.record.append(state)
+        if self.detect_loops:
             if state.steps_since_fruit == 0:
-                seen.clear()
-            key = (state.snake, state.direction, None if memory is None else memory())
-            if key in seen:
-                return finish(Outcome.CENSORED, "loop")
-            seen.add(key)
-        if stall_limit is not None and state.steps_since_fruit > stall_limit:
-            return finish(Outcome.CENSORED, "stall")
-        if move_cap is not None and moves >= move_cap:
-            return finish(Outcome.CENSORED, "cap")
-        action = agent(state)
-        if inside:
+                self.seen.clear()
+            key = (state.snake, state.direction, None if self.memory is None else self.memory())
+            if key in self.seen:
+                self._finish(Outcome.CENSORED, "loop")
+                return None
+            self.seen.add(key)
+        if self.stall_limit is not None and state.steps_since_fruit > self.stall_limit:
+            self._finish(Outcome.CENSORED, "stall")
+            return None
+        if self.move_cap is not None and self.moves >= self.move_cap:
+            self._finish(Outcome.CENSORED, "cap")
+            return None
+        self.state = state
+        return state
+
+    def play(self, action: RelativeAction | Direction) -> None:
+        """Make the agent's ``action`` in the state :meth:`next_state` returned."""
+        state, game = self.state, self.game
+        if state is None:
+            raise RuntimeError("no state to move from: call next_state first")
+        self.state = None
+        if self.inside:
             direction = (
                 to_direction(state.direction, action) if isinstance(action, RelativeAction) else action
             )
-            if not isinstance(direction, Direction) or envelope.jump(state, direction) is None:
-                inside, exit_move = False, moves
+            if not isinstance(direction, Direction) or self.envelope.jump(state, direction) is None:
+                self.inside, self.exit_move = False, self.moves
         result = play_move(game, action)
-        moves += 1
+        self.moves += 1
         if result.ate_fruit:
-            fruits += 1
+            self.fruits += 1
         else:
             since = game.steps_since_fruit
-            longest = max(longest, since)
-            margin = max(margin, since / (cells + game.length))
-            limit = rules.limit(cells, game.length)
+            self.longest = max(self.longest, since)
+            self.margin = max(self.margin, since / (self.cells + game.length))
+            limit = self.rules.limit(self.cells, game.length)
             if limit is not None and since >= limit and not game.done:
-                return finish(Outcome.TIMED_OUT)
-    if game.won:
-        return finish(Outcome.WON)
-    return finish(Outcome.LOST, game.death_cause.value)
+                self._finish(Outcome.TIMED_OUT)
 
 
 def _play(spec: AgentSpec, agent_seed: int, game: SnakeGame, rules: Rules, **kwargs: Any) -> GameRecord:
     agent = spec.factory(agent_seed)
     memory = None if spec.memory is None else (lambda: spec.memory(agent))
+    return run_game(game, agent, rules, memory=memory, **censoring(spec, game, rules), **kwargs)
+
+
+def censoring(spec: AgentSpec, game: SnakeGame, rules: Rules) -> dict[str, Any]:
+    """How the harness censors ``spec``'s endless games without the fruit timeout (:func:`run_game`'s
+    ``detect_loops`` and ``stall_limit``); under the timeout, games end by the rules instead."""
     no_limit = not rules.fruit_timeout
-    return run_game(
-        game,
-        agent,
-        rules,
-        memory=memory,
-        detect_loops=no_limit and spec.deterministic,
-        stall_limit=STALL_FACTOR * game.width * game.height if no_limit else None,
-        **kwargs,
-    )
+    return {
+        "detect_loops": no_limit and spec.deterministic,
+        "stall_limit": STALL_FACTOR * game.width * game.height if no_limit else None,
+    }
 
 
 # --------------------------------------------------------------------- tracks

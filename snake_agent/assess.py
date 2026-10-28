@@ -1,18 +1,20 @@
-"""Assess a trained network against the M1 gates: T1, T2, and the exact 4x4 values.
+"""Assess a trained network against the M1 and M2 gates: T1, T2, and the exact 4x4 values.
 
-Both agents are measured, as the M1 gate asks: the search
+Both agents are measured, as the gates ask: the search
 (:class:`~snake_agent.search.SearchAgent`, no Gumbel noise) and the raw policy
 (:class:`~snake_agent.search.PolicyAgent`, the same network without search).
-Games run through the evaluation harness on held-out seeds, split across
-worker processes:
+Games run on held-out seeds with the evaluation harness's bookkeeping
+(:class:`~snake_agent.evaluation.GameRun`), split across worker processes; each
+worker plays its games at once and evaluates their leaves in batches
+(:func:`play_lockstep`), on the GPU if there is one:
 
 * **T1**, standard starts: completion and mean moves, gated against the shortcut
   cycle (:data:`T1_REFERENCES`). On boards up to 6x6, the exact envelope
   solution also scores every decision: the expected moves it adds to the
   envelope's optimum (:func:`envelope_regret`), and how well the moves head
   orders the moves the search compares (:func:`sibling_ranking`).
-* **T2**, recovery starts: win rates per occupancy band, against the reference
-  policies (and on 4x4 the exact optimum).
+* **T2**, recovery starts: win rates per occupancy band, gated against the best
+  reference policy on the same starts (and on 4x4 the exact optimum).
 * **4x4 values**: the network's win probabilities against the exact solution,
   on the states the search visits in T2 games and on a uniform sample of the
   states outside the envelope (:func:`calibration`), the exact regret of both
@@ -24,34 +26,48 @@ from __future__ import annotations
 import dataclasses
 import math
 import statistics
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 from concurrent.futures import Executor
 from typing import Any
 
 import numpy as np
 import torch
 
-from snake_game import Direction, GameState, RelativeAction, SnakeGame
+from snake_game import Direction, GameConfig, GameState, RelativeAction, SnakeGame
 
 from .contract import TRAINING_RULES, Rules, planning_game, to_relative
+from .cycles import CycleEnvelope
 from .encoding import canonical_envelope, moves_ceiling, moves_scale
 from .evaluation import (
     AgentSpec,
     Evaluation,
     GameRecord,
+    GameRun,
     Provenance,
     best_rates,
+    censoring,
     evaluate_recovery,
-    evaluate_standard,
-    run_game,
+    recovery_gate,
     standard_gate,
 )
 from .exact import ExactSolution, evaluate_policy, solve, solve_envelope
 from .network import NetworkEvaluator, from_bytes
-from .recovery import RecoveryStart, held_out_starts
+from .recovery import RecoveryStart, recovery_starts
 from .references import REFERENCES
-from .search import EVALUATION, Evaluator, PolicyAgent, Query, SearchAgent, SearchConfig, envelope_certain
-from .seeds import VALIDATION, SeedRange, recovery_fruit_seeds, standard_seeds
+from .search import (
+    EVALUATION,
+    Evaluator,
+    LeafValue,
+    PolicyAgent,
+    Query,
+    SearchAgent,
+    SearchConfig,
+    _Epoch,
+    envelope_certain,
+    policy_move,
+)
+from .search import search as root_search
+from .seeds import VALIDATION, SeedRange, recovery_fruit_seeds, recovery_source_seeds, standard_seeds
 
 T1_REFERENCES = {(4, 4): 43.89, (6, 6): 214.0, (10, 10): 1445.0, (20, 20): 20737.0}
 """Mean moves of the shortcut cycle on standard starts: the T1 gate. 4x4 is its exact expectation
@@ -73,31 +89,114 @@ def agent_spec(
         factory = lambda seed: PolicyAgent(evaluator, rules)  # noqa: E731
     else:
         raise ValueError(f"unknown agent {kind!r}: use {' or '.join(AGENTS)}")
-    return AgentSpec(f"m1-{kind}", factory, Provenance.SELF_PLAY)
+    return AgentSpec(f"network-{kind}", factory, Provenance.SELF_PLAY)
+
+
+# ------------------------------------------------------------ batched games
+class _Lockstep:
+    """One harness game of the network agent, advanced a leaf at a time by :func:`play_lockstep`.
+
+    It plays what :func:`agent_spec`'s agent with the same seed plays, move for move, given the same
+    network outputs (a batch on another device can change the last bits of those).
+    """
+
+    def __init__(
+        self,
+        run: GameRun,
+        kind: str,
+        rules: Rules,
+        search: SearchConfig,
+        seed: int,
+        decisions: list[tuple[GameState, RelativeAction]] | None = None,
+    ) -> None:
+        if kind not in AGENTS:
+            raise ValueError(f"unknown agent {kind!r}: use {' or '.join(AGENTS)}")
+        self.run, self.kind, self.rules, self.config = run, kind, rules, search
+        self.rng = np.random.default_rng(seed)
+        self.epoch = _Epoch()
+        self.decisions = decisions
+        self.moving: Generator[Query, LeafValue, Any] | None = None
+        self.state: GameState | None = None
+        self.value: LeafValue | None = None
+
+    def advance(self) -> Query | None:
+        """Play until the agent needs an evaluation (returned) or the game is over (None)."""
+        while True:
+            if self.moving is None:
+                self.state = self.run.next_state()
+                if self.state is None:
+                    return None
+                history = self.epoch.observe(self.state)
+                if self.kind == "search":
+                    self.moving = root_search(self.state, self.rules, self.config, self.rng, history)
+                else:
+                    self.moving = policy_move(self.state, self.rules, history)
+            value, self.value = self.value, None
+            try:
+                return self.moving.send(value)
+            except StopIteration as stop:
+                self.moving = None
+                action = stop.value.action if self.kind == "search" else stop.value
+                if self.decisions is not None:
+                    self.decisions.append((self.state, action))
+                self.run.play(action)
+
+
+def play_lockstep(evaluator: Evaluator, games: Sequence[_Lockstep]) -> list[GameRecord]:
+    """Play ``games`` to the end at once, evaluating all their pending leaves in one batch per round."""
+    waiting = list(games)
+    while waiting:
+        asking, queries = [], []
+        for game in waiting:
+            query = game.advance()
+            if query is not None:
+                asking.append(game)
+                queries.append(query)
+        if queries:
+            prediction = evaluator(queries)
+            for i, game in enumerate(asking):
+                game.value = prediction.row(i)
+        waiting = asking
+    return [game.run.result for game in games]
+
+
+def _runs(
+    kind: str, games: Sequence[SnakeGame], rules: Rules, labels: Sequence[dict[str, Any]], envelope: bool
+) -> list[GameRun]:
+    spec = AgentSpec(f"network-{kind}", lambda seed: None, Provenance.SELF_PLAY)  # censoring only
+    return [
+        GameRun(
+            game,
+            rules,
+            envelope=CycleEnvelope.for_state(game.state()) if envelope else None,
+            **censoring(spec, game, rules),
+            **label,
+        )
+        for game, label in zip(games, labels, strict=True)
+    ]
 
 
 def _t1_task(args: tuple) -> tuple[list[GameRecord], list[tuple[GameState, RelativeAction]]]:
-    weights, kind, width, height, seeds, rules, search, record = args
+    weights, kind, width, height, seeds, rules, search, record, device = args
     torch.set_num_threads(1)
-    spec = agent_spec(weights, kind, rules, search)
-    recorders: list[_Recorder] = []
-    if record:
-        make = spec.factory
-
-        def factory(seed: int) -> _Recorder:
-            recorders.append(_Recorder(make(seed)))
-            return recorders[-1]
-
-        spec = dataclasses.replace(spec, factory=factory)
-    records = list(evaluate_standard(spec, width, height, seeds, rules).records)
-    return records, [move for recorder in recorders for move in recorder.moves]
+    decisions: list[tuple[GameState, RelativeAction]] | None = [] if record else None
+    games = [SnakeGame(GameConfig(width, height), seed=seed) for seed in seeds]
+    runs = _runs(kind, games, rules, [{"seed": seed} for seed in seeds], envelope=True)
+    lockstep = [_Lockstep(run, kind, rules, search, i, decisions) for i, run in enumerate(runs)]
+    records = play_lockstep(NetworkEvaluator(from_bytes(weights), device), lockstep)
+    return records, decisions or []
 
 
 def _t2_task(args: tuple) -> list[GameRecord]:
-    weights, kind, starts, fruit_seeds, rules, search = args
+    weights, kind, starts, fruit_seeds, rules, search, device = args
     torch.set_num_threads(1)
-    spec = REFERENCES[kind] if kind in REFERENCES else agent_spec(weights, kind, rules, search)
-    return list(evaluate_recovery(spec, starts, fruit_seeds, rules).records)
+    if kind in REFERENCES:
+        return list(evaluate_recovery(REFERENCES[kind], starts, fruit_seeds, rules).records)
+    games = [SnakeGame.from_state(s.state, seed=f) for s, f in zip(starts, fruit_seeds, strict=True)]
+    labels = [{"start": s.name, "seed": f, "band": s.band} for s, f in zip(starts, fruit_seeds, strict=True)]
+    runs = _runs(kind, games, rules, labels, envelope=False)
+    lockstep = [_Lockstep(run, kind, rules, search, i) for i, run in enumerate(runs)]
+    return play_lockstep(NetworkEvaluator(from_bytes(weights), device), lockstep)
 
 
 def _chunks(items: Sequence, parts: int) -> list[Sequence]:
@@ -117,22 +216,26 @@ def t1(
     workers: int = 8,
     search: SearchConfig = EVALUATION,
     decisions: list[tuple[GameState, RelativeAction]] | None = None,
+    device: str = "cpu",
 ) -> Evaluation:
     """Track T1 for ``games`` held-out standard starts, the games split across ``pool``.
 
-    The agent's moves, with the states they were played in, are appended to ``decisions`` if given.
+    Each worker plays its games at once, evaluating their leaves in batches on ``device``
+    (:func:`play_lockstep`). The agent's moves, with the states they were played in, are appended to
+    ``decisions`` if given.
     """
     seeds = list(standard_seeds(split, games))
     record = decisions is not None
     tasks = [
-        (weights, kind, width, height, chunk, rules, search, record) for chunk in _chunks(seeds, workers)
+        (weights, kind, width, height, chunk, rules, search, record, device)
+        for chunk in _chunks(seeds, workers)
     ]
     records = []
     for part, moves in pool.map(_t1_task, tasks):
         records += part
         if record:
             decisions += moves
-    return Evaluation("T1", f"m1-{kind}", Provenance.SELF_PLAY, (width, height), rules, tuple(records))
+    return Evaluation("T1", f"network-{kind}", Provenance.SELF_PLAY, (width, height), rules, tuple(records))
 
 
 def envelope_regret(
@@ -236,16 +339,18 @@ def t2(
     rules: Rules = TRAINING_RULES,
     workers: int = 8,
     search: SearchConfig = EVALUATION,
+    device: str = "cpu",
 ) -> Evaluation:
-    """Track T2 on ``starts`` for the network (``"search"``, ``"policy"``) or a reference policy."""
+    """Track T2 on ``starts`` for the network (``"search"``, ``"policy"``; batched on ``device`` as in
+    :func:`t1`) or a reference policy."""
     fruit_seeds = list(recovery_fruit_seeds(split, len(starts)))
     pairs = list(zip(starts, fruit_seeds, strict=True))
     tasks = [
-        (weights, kind, [s for s, _ in chunk], [f for _, f in chunk], rules, search)
+        (weights, kind, [s for s, _ in chunk], [f for _, f in chunk], rules, search, device)
         for chunk in _chunks(pairs, workers)
     ]
     records = [r for part in pool.map(_t2_task, tasks) for r in part]
-    name = kind if kind in REFERENCES else f"m1-{kind}"
+    name = kind if kind in REFERENCES else f"network-{kind}"
     provenance = REFERENCES[kind].provenance if kind in REFERENCES else Provenance.SELF_PLAY
     board = (starts[0].state.width, starts[0].state.height)
     return Evaluation("T2", name, provenance, board, rules, tuple(records))
@@ -313,29 +418,15 @@ def uniform_free_states(solution: ExactSolution, count: int, seed: int = 0) -> l
     return states
 
 
-class _Recorder:
-    """Wraps an agent and keeps the states it saw and the moves it chose."""
-
-    def __init__(self, agent: Any) -> None:
-        self.agent = agent
-        self.moves: list[tuple[GameState, RelativeAction]] = []
-
-    def __call__(self, state: GameState) -> RelativeAction:
-        action = self.agent(state)
-        self.moves.append((state, action))
-        return action
-
-
 def _visited_task(args: tuple) -> list[tuple[GameState, RelativeAction]]:
-    weights, kind, starts, fruit_seeds, rules, search = args
+    weights, kind, starts, fruit_seeds, rules, search, device = args
     torch.set_num_threads(1)
-    spec = agent_spec(weights, kind, rules, search)
-    moves = []
-    for i, (start, seed) in enumerate(zip(starts, fruit_seeds, strict=True)):
-        recorder = _Recorder(spec.factory(i))
-        run_game(SnakeGame.from_state(start.state, seed=seed), recorder, rules)
-        moves += recorder.moves
-    return moves
+    decisions: list[tuple[GameState, RelativeAction]] = []
+    games = [SnakeGame.from_state(s.state, seed=f) for s, f in zip(starts, fruit_seeds, strict=True)]
+    runs = _runs(kind, games, rules, [{} for _ in games], envelope=False)
+    lockstep = [_Lockstep(run, kind, rules, search, i, decisions) for i, run in enumerate(runs)]
+    play_lockstep(NetworkEvaluator(from_bytes(weights), device), lockstep)
+    return decisions
 
 
 def exact_4x4(
@@ -349,6 +440,7 @@ def exact_4x4(
     games: int = 100,
     solution: ExactSolution | None = None,
     search: SearchConfig = EVALUATION,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     """The network's values and both agents' moves on 4x4 against the exact solution.
 
@@ -367,7 +459,7 @@ def exact_4x4(
     }
     for kind in AGENTS:
         tasks = [
-            (weights, kind, [s for s, _ in chunk], [f for _, f in chunk], rules, search)
+            (weights, kind, [s for s, _ in chunk], [f for _, f in chunk], rules, search, device)
             for chunk in _chunks(pairs, workers)
         ]
         moves = [m for part in pool.map(_visited_task, tasks) for m in part]
@@ -408,10 +500,15 @@ def assess(
     workers: int = 8,
     references: dict[float, float] | None = None,
     search: SearchConfig = EVALUATION,
+    device: str = "cpu",
+    agents: Sequence[str] = AGENTS,
 ) -> dict[str, Any]:
-    """T1 and T2 for both agents (and the exact 4x4 values), as a JSON-ready report with the T1 gate.
+    """T1 and T2 for the ``agents`` (and the exact 4x4 values), as a JSON-ready report with the gates.
 
-    ``search`` holds the search agent's settings (simulations per move, moves unit).
+    ``search`` holds the search agent's settings (simulations per move, moves unit); the network's games
+    run in batches on ``device``. The T1 gate compares mean moves with the shortcut cycle
+    (:data:`T1_REFERENCES`); the T2 gate asks that in every band the 95% lower bound of the win rate be
+    above the best reference policy's rate on the same starts (``references``: measured if not given).
     """
     report: dict[str, Any] = {
         "board": [width, height],
@@ -419,13 +516,16 @@ def assess(
         "games": games,
         "simulations": search.simulations,
         "moves_unit": search.moves_unit,
+        "relative_unit": search.relative_unit,
     }
     reference = T1_REFERENCES.get((width, height))
     exact = width * height <= 36 and canonical_envelope(width, height) is not None
     inside = solve_envelope(width, height) if exact else None
-    for kind in AGENTS:
+    for kind in agents:
         decisions: list[tuple[GameState, RelativeAction]] | None = [] if exact else None
-        evaluation = t1(pool, weights, kind, width, height, games, split, rules, workers, search, decisions)
+        evaluation = t1(
+            pool, weights, kind, width, height, games, split, rules, workers, search, decisions, device
+        )
         entry: dict[str, Any] = {"summary": evaluation.summary().to_dict()}
         if reference is not None:
             gate = standard_gate(evaluation, reference)
@@ -435,20 +535,38 @@ def assess(
             evaluator = NetworkEvaluator(from_bytes(weights))
             entry["exact"]["siblings"] = sibling_ranking(evaluator, inside, decisions, rules)
         report[f"t1_{kind}"] = entry
-    starts = held_out_starts(width, height, sources, split)
+    starts = recovery_starts_parallel(pool, width, height, sources, split, workers)
     if starts:
         if references is None:
             references = best_rates(
                 t2(pool, None, name, starts, split, rules, workers) for name in T2_REFERENCES
             )
         report["t2_references"] = {str(band): rate for band, rate in sorted(references.items())}
-        for kind in AGENTS:
-            evaluation = t2(pool, weights, kind, starts, split, rules, workers, search)
+        for kind in agents:
+            evaluation = t2(pool, weights, kind, starts, split, rules, workers, search, device)
+            gate = recovery_gate(evaluation, references)
             report[f"t2_{kind}"] = {
                 str(band): evaluation.summary(band).to_dict() for band in evaluation.bands()
-            } | {"all": evaluation.summary().to_dict()}
+            } | {
+                "all": evaluation.summary().to_dict(),
+                "gate": {"passed": gate.passed, "reasons": list(gate.reasons)},
+            }
         if (width, height) == (4, 4):
             report["exact"] = exact_4x4(
-                pool, weights, starts, split, rules, workers, games=games, search=search
+                pool, weights, starts, split, rules, workers, games=games, search=search, device=device
             )
     return report
+
+
+def _recovery_task(args: tuple) -> list[RecoveryStart]:
+    width, height, seeds = args
+    return recovery_starts(width, height, seeds)
+
+
+def recovery_starts_parallel(
+    pool: Executor, width: int, height: int, sources: int, split: SeedRange = VALIDATION, workers: int = 8
+) -> list[RecoveryStart]:
+    """:func:`~snake_agent.recovery.held_out_starts`, with the source games split across ``pool``."""
+    seeds = list(recovery_source_seeds(split, sources))
+    tasks = [(width, height, chunk) for chunk in _chunks(seeds, workers)]
+    return [start for part in pool.map(_recovery_task, tasks) for start in part]

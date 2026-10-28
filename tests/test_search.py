@@ -341,3 +341,22 @@ def test_agents_remember_the_positions_since_the_last_fruit():
         seen += 1
         game.step(rng.choice(game.safe_directions() or [game.direction]))
     assert calls
+
+
+def test_a_relative_unit_is_a_share_of_the_moves_scale(exact):
+    evaluator = exact_evaluator(exact["envelope"])
+    states = [SnakeGame(GameConfig(4, 4), seed=seed).state() for seed in range(6)]
+    compared = 0
+    for state in states:
+        probe = run_search(uniform_evaluator(), state, TRAINING_RULES, SearchConfig(simulations=0))
+        if sum(probe.valid) < 2:
+            continue
+        compared += 1
+        root_only = SearchConfig(simulations=sum(probe.valid), gumbel_scale=0.0)  # one visit per root move
+        for share in (0.01, 0.3):
+            relative = dataclasses.replace(root_only, moves_unit=None, relative_unit=share)
+            absolute = dataclasses.replace(root_only, moves_unit=share * moves_scale(state.free_cells))
+            a = run_search(evaluator, state, TRAINING_RULES, relative)
+            b = run_search(evaluator, state, TRAINING_RULES, absolute)
+            assert a.action == b.action and np.allclose(a.policy, b.policy)
+    assert compared

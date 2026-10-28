@@ -8,11 +8,23 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from snake_agent.encoding import mirror  # noqa: E402
-from snake_agent.network import NetworkConfig, load  # noqa: E402
+from snake_agent.habits import BANDS, Habit  # noqa: E402
+from snake_agent.network import NetworkConfig, SnakeNet, load, save  # noqa: E402
 from snake_agent.search import Prediction  # noqa: E402
 from snake_agent.seeds import check_training_seed  # noqa: E402
 from snake_agent.selfplay import play, standard_starts  # noqa: E402
-from snake_agent.train import Replay, TrainConfig, _starts, balanced, mirrored, train  # noqa: E402
+from snake_agent.train import (  # noqa: E402
+    DistillConfig,
+    HabitConfig,
+    Replay,
+    TrainConfig,
+    _starts,
+    balanced,
+    distill,
+    improve_habits,
+    mirrored,
+    train,
+)
 
 
 def uniform(queries):
@@ -133,6 +145,10 @@ def test_a_short_run_writes_its_log_checkpoints_and_assessment(tmp_path):
     assert records[0]["throughput"]["leaves_per_second"] > 0 and records[1]["lr"] == config.lr
     report = records[1]["assessment"]
     assert report["t1_search"]["summary"]["games"] == 4 and "gate" in report["t1_policy"]
+    assert (
+        report["t1_shortcut"]["summary"]["games"] == 4
+        and report["t1_policy"]["versus_shortcut"]["games"] == 4
+    )
     assert "exact" in report and "uniform" in report["exact"]
     exact = report["t1_search"]["exact"]  # every T1 decision scored against the envelope's optimum
     assert exact["optimum"] == pytest.approx(43.0848, abs=1e-4) and exact["extra_moves"] >= 0.0
@@ -157,3 +173,58 @@ def test_workers_get_starts_of_similar_total_cost():
     assert sorted(i for group in groups for i in group) == list(range(8))
     assert sorted(sum(costs[i] for i in group) for group in groups) == [10.0, 11.0, 11.0]
     assert balanced([1.0], 4) == [[0]]
+
+
+TINY = NetworkConfig(channels=8, blocks=1, hidden=16)
+SMALL_DISTILL = DistillConfig(
+    width=6, height=6, standard=3, prefix=1, free=2, recovery=1, steps=40, batch=64, lr=3e-3
+)
+
+
+def test_distillation_moves_the_raw_policy_toward_the_habit():
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    torch.manual_seed(0)
+    teacher = SnakeNet(TINY)
+    habit = Habit(tuple(float("inf") if k < BANDS // 2 else 0.0 for k in range(BANDS)))
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(2, mp_context=context) as pool:
+        student, report = distill(pool, teacher, habit, SMALL_DISTILL, workers=2)
+    assert report["games"]["standard"] == 3 and report["examples"] > 0 and report["envelope_decisions"] > 0
+    assert report["habit"] == habit.to_json() and report["habit_standard_mean_moves"] > 0
+    before, after = report["agreement_before"], report["agreement_after"]
+    assert after["habit"] > before["habit"] and 0.0 <= after["other"] <= 1.0  # the jumps the teacher missed
+    assert set(report["losses"]) == {"policy", "win", "moves"}
+    changed = [not torch.equal(a, b) for a, b in zip(student.parameters(), teacher.parameters(), strict=True)]
+    assert any(changed)
+    with pytest.raises(ValueError):
+        dataclasses.replace(SMALL_DISTILL, standard=-1).specs()
+
+
+def test_habit_rounds_write_their_log_and_stop_when_nothing_improves(tmp_path):
+    torch.manual_seed(0)
+    save(SnakeNet(TINY), tmp_path / "init.pt", config={"boards": [[6, 6, 0]]})
+    config = HabitConfig(
+        width=6, height=6, rounds=2, seeds=3, z=-1e9, distill=SMALL_DISTILL, workers=2, eval_games=2
+    )
+    lines = []
+    improve_habits(config, tmp_path / "init.pt", tmp_path / "run", log=lines.append)
+    records = [json.loads(line) for line in (tmp_path / "run" / "log.jsonl").read_text().splitlines()]
+    assert [r["round"] for r in records] == [1, 2] and len(lines) == 2
+    first = records[0]
+    assert first["changes"] and not Habit.from_json(first["habit"]).neutral  # z = -1e9 takes every best
+    assert first["distill"]["examples"] > 0 and first["comparison"]["windows"] > 0
+    assert first["t1_policy"]["summary"]["games"] == 2 and first["t1_policy"]["versus_shortcut"]["games"] == 2
+    model, meta = load(tmp_path / "run" / "model-h02.pt")
+    assert meta["round"] == 2 and meta["config"]["boards"] == [[6, 6, 0]] and len(meta["habit"]) == BANDS
+    settings = json.loads((tmp_path / "run" / "config.json").read_text())
+    assert settings["init"].endswith("init.pt") and "inf" in settings["candidates"]
+    # With an impossible threshold nothing changes and the run stops after its first comparison.
+    strict = dataclasses.replace(config, z=1e9, seed=1)
+    improve_habits(strict, tmp_path / "init.pt", tmp_path / "strict", log=lines.append)
+    records = [json.loads(line) for line in (tmp_path / "strict" / "log.jsonl").read_text().splitlines()]
+    assert len(records) == 1 and records[0]["converged"] and "distill" not in records[0]
+    assert not (tmp_path / "strict" / "model-h01.pt").exists()
+    with pytest.raises(ValueError):
+        HabitConfig(seed=50)

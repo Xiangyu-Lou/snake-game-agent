@@ -35,7 +35,7 @@ import torch
 
 from snake_game import Direction, GameConfig, GameState, RelativeAction, SnakeGame
 
-from .contract import TRAINING_RULES, Rules, planning_game, to_relative
+from .contract import TRAINING_RULES, Outcome, Rules, planning_game, to_relative
 from .cycles import CycleEnvelope
 from .encoding import canonical_envelope, moves_ceiling, moves_scale
 from .evaluation import (
@@ -47,6 +47,7 @@ from .evaluation import (
     best_rates,
     censoring,
     evaluate_recovery,
+    evaluate_standard,
     recovery_gate,
     standard_gate,
 )
@@ -68,6 +69,7 @@ from .search import (
 )
 from .search import search as root_search
 from .seeds import VALIDATION, SeedRange, recovery_fruit_seeds, recovery_source_seeds, standard_seeds
+from .stats import mean_interval
 
 T1_REFERENCES = {(4, 4): 43.89, (6, 6): 214.0, (10, 10): 1445.0, (20, 20): 20737.0}
 """Mean moves of the shortcut cycle on standard starts: the T1 gate. 4x4 is its exact expectation
@@ -236,6 +238,48 @@ def t1(
         if record:
             decisions += moves
     return Evaluation("T1", f"network-{kind}", Provenance.SELF_PLAY, (width, height), rules, tuple(records))
+
+
+def _shortcut_task(args: tuple) -> list[GameRecord]:
+    width, height, seeds, rules = args
+    return list(evaluate_standard(REFERENCES["shortcut"], width, height, seeds, rules).records)
+
+
+def shortcut_t1(
+    pool: Executor,
+    width: int,
+    height: int,
+    games: int,
+    split: SeedRange = VALIDATION,
+    rules: Rules = TRAINING_RULES,
+    workers: int = 8,
+) -> Evaluation:
+    """The shortcut cycle on the same T1 games as :func:`t1` (the same fruit seeds), across ``pool``."""
+    seeds = list(standard_seeds(split, games))
+    tasks = [(width, height, chunk, rules) for chunk in _chunks(seeds, workers)]
+    records = tuple(r for part in pool.map(_shortcut_task, tasks) for r in part)
+    return Evaluation("T1", "shortcut", Provenance.REFERENCE, (width, height), rules, records)
+
+
+def versus(evaluation: Evaluation, reference: Evaluation) -> dict[str, Any]:
+    """``evaluation``'s T1 moves against ``reference``'s on the same fruit seeds: the mean of the paired
+    differences (negative: fewer moves) and its 95% interval, over the games both won."""
+    moves = {r.seed: r.moves for r in reference.records if r.outcome is Outcome.WON}
+    pairs = [
+        (r.moves, moves[r.seed]) for r in evaluation.records if r.outcome is Outcome.WON and r.seed in moves
+    ]
+    if not pairs:
+        return {"games": 0}
+    differences = [a - b for a, b in pairs]
+    low, high = mean_interval(differences)
+    return {
+        "reference": reference.agent,
+        "games": len(pairs),
+        "reference_mean_moves": round(statistics.fmean(b for _, b in pairs), 2),
+        "difference": round(statistics.fmean(differences), 2),
+        "interval": [round(low, 2), round(high, 2)],
+        "fewer_moves": high < 0.0,
+    }
 
 
 def envelope_regret(
@@ -521,6 +565,10 @@ def assess(
     reference = T1_REFERENCES.get((width, height))
     exact = width * height <= 36 and canonical_envelope(width, height) is not None
     inside = solve_envelope(width, height) if exact else None
+    shortcut = None
+    if canonical_envelope(width, height) is not None:
+        shortcut = shortcut_t1(pool, width, height, games, split, rules, workers)
+        report["t1_shortcut"] = {"summary": shortcut.summary().to_dict()}
     for kind in agents:
         decisions: list[tuple[GameState, RelativeAction]] | None = [] if exact else None
         evaluation = t1(
@@ -530,6 +578,8 @@ def assess(
         if reference is not None:
             gate = standard_gate(evaluation, reference)
             entry["gate"] = {"reference": reference, "passed": gate.passed, "reasons": list(gate.reasons)}
+        if shortcut is not None:
+            entry["versus_shortcut"] = versus(evaluation, shortcut)
         if inside is not None:
             entry["exact"] = envelope_regret(inside, decisions)
             evaluator = NetworkEvaluator(from_bytes(weights))

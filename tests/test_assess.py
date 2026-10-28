@@ -1,16 +1,27 @@
 import dataclasses
+import zlib
 
 import numpy as np
 import pytest
 
 pytest.importorskip("torch")
 
-from snake_agent.assess import calibration, sibling_ranking, uniform_free_states  # noqa: E402
+from snake_agent.assess import (  # noqa: E402
+    AGENTS,
+    _Lockstep,
+    _runs,
+    calibration,
+    play_lockstep,
+    sibling_ranking,
+    uniform_free_states,
+)
 from snake_agent.contract import TRAINING_RULES  # noqa: E402
+from snake_agent.cycles import CycleEnvelope  # noqa: E402
 from snake_agent.encoding import moves_scale  # noqa: E402
 from snake_agent.evaluation import run_game  # noqa: E402
 from snake_agent.exact import solve, solve_envelope  # noqa: E402
-from snake_agent.search import Prediction, envelope_certain  # noqa: E402
+from snake_agent.recovery import recovery_starts  # noqa: E402
+from snake_agent.search import EVALUATION, PolicyAgent, Prediction, SearchAgent, envelope_certain  # noqa: E402
 from snake_game import GameConfig, SnakeGame  # noqa: E402
 
 
@@ -67,3 +78,48 @@ def test_exact_values_order_every_pair_of_moves():
         assert report[phase]["decisions"] > 0
         assert report[phase]["difference_error"] == pytest.approx(0.0, abs=1e-9)
         assert report[phase]["order_agreement"] in (None, 1.0)
+
+
+def hashed(queries):
+    """An evaluator whose output for a query depends on nothing else, so batching cannot change it."""
+    n = len(queries)
+    logits, win, moves = np.zeros((n, 3)), np.zeros(n), np.zeros(n)
+    for i, q in enumerate(queries):
+        key = repr((q.state.snake, q.state.direction, q.state.fruit, q.afterstate)).encode()
+        rng = np.random.default_rng(zlib.crc32(key))
+        logits[i], win[i], moves[i] = rng.normal(size=3), rng.uniform(0.2, 0.9), rng.uniform(0.5, 1.5)
+    return Prediction(logits, win, moves)
+
+
+@pytest.mark.parametrize("kind", AGENTS)
+def test_batched_games_play_as_the_agents_do_one_at_a_time(kind):
+    def agent(seed):
+        return (
+            SearchAgent(hashed, TRAINING_RULES, EVALUATION, seed) if kind == "search" else PolicyAgent(hashed)
+        )
+
+    games = [SnakeGame(GameConfig(6, 6), seed=s) for s in range(3)]
+    expected = [
+        run_game(
+            SnakeGame(GameConfig(6, 6), seed=s), agent(i), envelope=CycleEnvelope.for_state(g.state()), seed=s
+        )
+        for i, (s, g) in enumerate(zip(range(3), games, strict=True))
+    ]
+    runs = _runs(kind, games, TRAINING_RULES, [{"seed": s} for s in range(3)], envelope=True)
+    decisions = []
+    lockstep = [_Lockstep(run, kind, TRAINING_RULES, EVALUATION, i, decisions) for i, run in enumerate(runs)]
+    assert play_lockstep(hashed, lockstep) == expected
+    assert len(decisions) == sum(r.moves for r in expected)
+    # Free play from recovery starts, with the T2 labels.
+    starts = recovery_starts(6, 6, range(4))[:3]
+    games = [SnakeGame.from_state(s.state, seed=100 + i) for i, s in enumerate(starts)]
+    expected = [
+        run_game(
+            SnakeGame.from_state(s.state, seed=100 + i), agent(i), start=s.name, seed=100 + i, band=s.band
+        )
+        for i, s in enumerate(starts)
+    ]
+    labels = [{"start": s.name, "seed": 100 + i, "band": s.band} for i, s in enumerate(starts)]
+    runs = _runs(kind, games, TRAINING_RULES, labels, envelope=False)
+    lockstep = [_Lockstep(run, kind, TRAINING_RULES, EVALUATION, i) for i, run in enumerate(runs)]
+    assert play_lockstep(hashed, lockstep) == expected

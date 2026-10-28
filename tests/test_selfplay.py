@@ -1,11 +1,27 @@
+import dataclasses
+
 import numpy as np
 import pytest
 
 from snake_agent.contract import NO_LIMIT, TRAINING_RULES, Outcome
+from snake_agent.cycles import aligned_cycles
 from snake_agent.encoding import canonical_envelope, moves_scale
+from snake_agent.recovery import recovery_starts
 from snake_agent.search import Prediction, envelope_certain
 from snake_agent.seeds import VALIDATION
-from snake_agent.selfplay import Label, free_starts, moves_returns, play, prefix_starts, standard_starts
+from snake_agent.selfplay import (
+    FRUIT_OFFSET,
+    Label,
+    free_starts,
+    make_start,
+    midgame_start,
+    moves_returns,
+    play,
+    prefix_starts,
+    recovery_start,
+    standard_starts,
+)
+from snake_agent.survival import Board
 from snake_game import GameConfig, SnakeGame
 
 
@@ -130,3 +146,43 @@ def test_sibling_examples_take_the_search_value_of_moves_not_played():
     assert (examples.win[siblings] == 1.0).all() and examples.has_moves[siblings].all()
     assert not examples.has_policy[siblings].any() and (examples.moves[siblings] > 0).all()
     assert np.array_equal(examples.planes[~siblings], plain.planes)
+
+
+def test_recovery_and_midgame_starts_come_from_training_seeds():
+    start = next(s for seed in range(20) if (s := recovery_start(6, 6, seed)) is not None)
+    source = start.seed - FRUIT_OFFSET
+    assert start.kind == "recovery" and not start.standard
+    assert start.state in [s.state for s in recovery_starts(6, 6, [source])]
+    assert not aligned_cycles(start.state) and Board(start.state).has_survival_certificate()
+    with pytest.raises(ValueError):
+        recovery_start(6, 6, VALIDATION.start)
+    summaries, _ = play(uniform, [start], seed=0, samples=3)
+    summary = summaries[0]
+    assert (
+        summary.kind == "recovery"
+        and summary.board == (6, 6)
+        and len(summary.samples) == min(3, summary.moves)
+    )
+    assert summary.leaves >= summary.searched * 16
+    state = summary.samples[-1]
+    midgame = make_start("midgame", 6, 6, 7, state)
+    assert (
+        midgame == midgame_start(state, 7) and midgame.kind == "midgame" and midgame.seed == 7 + FRUIT_OFFSET
+    )
+    assert midgame.game().state() == state
+    with pytest.raises(ValueError):
+        midgame_start(state, VALIDATION.start - FRUIT_OFFSET)
+    assert make_start("prefix", 6, 6, 3, 0.5) == prefix_starts(6, 6, [3], 0.5)[0]
+    assert make_start("standard", 6, 6, 3) == standard_starts(6, 6, [3])[0]
+    with pytest.raises(ValueError):
+        make_start("other", 6, 6, 3)
+    with pytest.raises(ValueError):
+        dataclasses.replace(start, kind="other")
+
+
+def test_starts_of_several_boards_share_one_canvas():
+    starts = standard_starts(4, 4, [0]) + free_starts(6, 6, range(10, 12))
+    summaries, examples = play(uniform, starts, seed=0, size=6)
+    assert {s.board for s in summaries} == {(4, 4), (6, 6)}
+    cells = examples.planes[:, 0].astype(float).sum((1, 2))  # the valid plane marks the board's cells
+    assert examples.planes.shape[2:] == (6, 6) and set(cells.tolist()) == {16.0, 36.0}

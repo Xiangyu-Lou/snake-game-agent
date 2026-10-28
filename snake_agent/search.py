@@ -666,10 +666,26 @@ class PolicyAgent:
         self.epoch = _Epoch()
 
     def __call__(self, state: GameState) -> RelativeAction:
-        history = self.epoch.observe(state)
-        mode = Mode.ENVELOPE if envelope_certain(state, self.rules) else Mode.FREE
-        root, _ = _root(state, self.rules, mode, history, self.lost_budget if mode is Mode.FREE else 0)
-        if len(root.actions) <= 1:
-            return root.actions[0] if root.actions else RelativeAction.STRAIGHT
-        logits = self.evaluator([Query(state, self.rules, False, root.classes)]).logits[0]
-        return max(root.actions, key=lambda a: logits[a])
+        generator = policy_move(state, self.rules, self.epoch.observe(state), self.lost_budget)
+        try:
+            query = next(generator)
+            generator.send(self.evaluator([query]).row(0))
+        except StopIteration as stop:
+            return stop.value
+        raise AssertionError("policy_move asks for one evaluation at most")
+
+
+def policy_move(
+    state: GameState,
+    rules: Rules = TRAINING_RULES,
+    history: frozenset = frozenset(),
+    lost_budget: int = 10_000,
+) -> Generator[Query, LeafValue, RelativeAction]:
+    """:class:`PolicyAgent`'s move as a generator, like :func:`search`: it yields the state's query if more
+    than one move is left, and returns the most likely of those moves."""
+    mode = Mode.ENVELOPE if envelope_certain(state, rules) else Mode.FREE
+    root, _ = _root(state, rules, mode, history, lost_budget if mode is Mode.FREE else 0)
+    if len(root.actions) <= 1:
+        return root.actions[0] if root.actions else RelativeAction.STRAIGHT
+    logits = (yield Query(state, rules, False, root.classes)).logits
+    return max(root.actions, key=lambda a: logits[a])

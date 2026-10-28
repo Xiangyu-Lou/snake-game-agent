@@ -1,33 +1,44 @@
-"""Training for milestone M1: self-play with the search, then supervised updates, generation after generation.
+"""Training: self-play with the search, then supervised updates, generation after generation.
 
 Each generation:
 
-1. **Self-play.** ``games`` games with the current network, split across worker
-   processes that each play their games at once (:func:`~snake_agent.selfplay.play`).
-   A ``free_share`` of them start from free starts, a ``prefix_share`` from the
-   standard start after a random prefix, the rest from the standard start. Seeds
-   are training seeds, a block per generation (:meth:`TrainConfig.seeds`).
-2. **Replay.** The examples join a buffer that keeps the most recent ``replay``.
+1. **Self-play.** On each board of the mixture (:attr:`TrainConfig.boards`), that
+   board's games with the current network, split across worker processes that
+   each play their games at once (:func:`~snake_agent.selfplay.play`). A
+   ``free_share`` of each board's games start from free starts, a
+   ``prefix_share`` from the standard start after a random prefix, a
+   ``recovery_share`` from recovery starts on training seeds (track T2's kind of
+   start), a ``midgame_share`` from states of the agent's own earlier games, the
+   rest from the standard start. The workers build the starts. Seeds are
+   training seeds, a block per generation (:meth:`TrainConfig.seeds`).
+2. **Replay.** The examples join a buffer that keeps the most recent ``replay``,
+   encoded on the canvas of the largest board. Each game also leaves a few of
+   its states for later mid-game starts.
 3. **Updates.** ``steps`` optimizer steps on minibatches drawn uniformly from the
-   buffer, each example mirrored left to right with probability 1/2. The policy
-   head learns the search's improved policy (cross-entropy over the moves the
-   search considered), the win head the win target (binary cross-entropy), and
-   the moves head the moves target of won games (Huber loss).
+   buffer, each example mirrored left to right with probability 1/2, once it
+   holds ``min_replay`` examples. The policy head learns the search's improved
+   policy (cross-entropy over the moves the search considered), the win head
+   the win target (binary cross-entropy), and the moves head the moves target of
+   won games (Huber loss). The learning rate warms up linearly over ``warmup``
+   generations and then follows a cosine down to ``lr * lr_floor``.
 4. **Assessment.** Every ``eval_every`` generations, and after the last, the
-   network is assessed on validation seeds (:func:`~snake_agent.assess.assess`).
+   network is assessed on validation seeds on the largest board
+   (:func:`~snake_agent.assess.assess`).
 
 Everything is written to the output directory: ``log.jsonl`` (one line per
-generation), ``model.pt`` (the latest network) and ``model-<generation>.pt`` at
-each assessment.
+generation, with the throughput), ``model.pt`` (the latest network) and
+``model-<generation>.pt`` at each assessment.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import multiprocessing
+import random
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -38,12 +49,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from snake_game import GameState
+
 from .assess import assess
 from .contract import TRAINING_RULES, Outcome
 from .encoding import mirror
 from .network import NetworkConfig, NetworkEvaluator, SnakeNet, from_bytes, load, save, tensors, to_bytes
-from .search import SELF_PLAY
-from .selfplay import Examples, GameSummary, Start, free_starts, play, prefix_starts, standard_starts
+from .search import SELF_PLAY, SearchConfig
+from .selfplay import KINDS, Examples, GameSummary, make_start, play
 
 GAMES_PER_GENERATION_LIMIT = 1000
 GENERATION_LIMIT = 1000
@@ -53,17 +66,23 @@ GENERATION_LIMIT = 1000
 class TrainConfig:
     """Settings of a training run."""
 
-    width: int = 6
-    height: int = 6
+    boards: tuple[tuple[int, int, int], ...] = ((6, 6, 256),)
+    """The mixture of boards: ``(width, height, games per generation)`` for each."""
     generations: int = 50
-    games: int = 256
-    """Self-play games per generation."""
     free_share: float = 0.5
-    """Share of the games from free starts."""
+    """Share of each board's games from free starts."""
     prefix_share: float = 0.0
-    """Share of the games from the standard start after a random envelope prefix (the rest: standard)."""
+    """Share of each board's games from the standard start after a random envelope prefix."""
     prefix_fill: float = 0.75
-    """The longest prefix, as a share of the board the snake fills (see :func:`prefix_starts`)."""
+    """The longest prefix, as a share of the board the snake fills (see :func:`prefix_start`)."""
+    recovery_share: float = 0.0
+    """Share of each board's games from recovery starts on training seeds (see :func:`recovery_start`)."""
+    midgame_share: float = 0.0
+    """Share of each board's games from states of the agent's earlier games (see :func:`midgame_start`)."""
+    midgame_samples: int = 2
+    """States each game leaves for mid-game starts."""
+    midgame_pool: int = 20_000
+    """Mid-game starts are drawn from the most recent this many states left on each board."""
     simulations: int = 16
     beta: float = 0.5
     """Weight of the search's values in the win targets."""
@@ -76,6 +95,12 @@ class TrainConfig:
     """Optimizer steps per generation."""
     batch: int = 512
     lr: float = 1e-3
+    lr_floor: float = 1.0
+    """The learning rate follows a cosine over the run from ``lr`` down to ``lr * lr_floor`` (1: constant)."""
+    warmup: int = 0
+    """Generations over which the learning rate first rises linearly to ``lr``."""
+    min_replay: int = 0
+    """No updates until the buffer holds this many examples."""
     weight_decay: float = 1e-4
     network: NetworkConfig = field(default_factory=NetworkConfig)
     workers: int = 8
@@ -83,23 +108,55 @@ class TrainConfig:
     eval_every: int = 10
     eval_games: int = 100
     eval_sources: int = 60
+    eval_simulations: int = 16
+    eval_moves_unit: float | None = 1.0
+    """The search's moves unit in the assessments (:attr:`~snake_agent.search.SearchConfig.moves_unit`)."""
 
     def __post_init__(self) -> None:
-        if not 0 < self.games <= GAMES_PER_GENERATION_LIMIT or not 0 < self.generations <= GENERATION_LIMIT:
+        if not self.boards or any(games <= 0 for _, _, games in self.boards):
+            raise ValueError("every board needs games")
+        if self.games > GAMES_PER_GENERATION_LIMIT or not 0 < self.generations <= GENERATION_LIMIT:
             raise ValueError(
                 f"at most {GAMES_PER_GENERATION_LIMIT} games per generation "
                 f"and {GENERATION_LIMIT} generations"
             )
+        shares = self.free_share + self.prefix_share + self.recovery_share + self.midgame_share
+        if min(self.free_share, self.prefix_share, self.recovery_share, self.midgame_share) < 0 or shares > 1:
+            raise ValueError("the start shares must be non-negative and add up to at most 1")
         if not 0 <= self.seed < 500:
             raise ValueError("the run seed must be in [0, 500)")
+
+    @property
+    def games(self) -> int:
+        """Self-play games per generation, over all boards."""
+        return sum(games for _, _, games in self.boards)
+
+    @property
+    def canvas(self) -> int:
+        """The side of the canvas the examples are encoded on: the largest board side."""
+        return max(max(width, height) for width, height, _ in self.boards)
+
+    @property
+    def eval_board(self) -> tuple[int, int]:
+        """The board the assessments use: the largest of the mixture."""
+        width, height, _ = max(self.boards, key=lambda b: (b[0] * b[1], b[0]))
+        return width, height
 
     def seeds(self, generation: int) -> range:
         """The generation's training seeds: one block of 1,000 per generation, 10^6 per run seed.
 
-        Free starts take their fruits from these plus 5 x 10^8, still training seeds.
+        Starts taken from another game draw their fruits from these plus 5 x 10^8, still training seeds.
         """
         first = self.seed * 1_000_000 + generation * 1_000
         return range(first, first + self.games)
+
+    def learning_rate(self, generation: int) -> float:
+        """The generation's learning rate: linear warm-up, then a cosine down to ``lr * lr_floor``."""
+        progress = generation / max(1, self.generations - 1)
+        rate = self.lr * (self.lr_floor + (1.0 - self.lr_floor) * 0.5 * (1.0 + math.cos(math.pi * progress)))
+        if generation < self.warmup:
+            rate *= (generation + 1) / self.warmup
+        return rate
 
 
 # --------------------------------------------------------------------- replay
@@ -205,8 +262,11 @@ def _init_worker() -> None:
     torch.set_num_threads(1)
 
 
-def _self_play_task(args: tuple) -> tuple[list[GameSummary], Examples]:
-    weights, starts, simulations, beta, moves_lambda, sibling_visits, seed, device = args
+def _self_play_task(args: tuple) -> tuple[list[GameSummary], Examples | None]:
+    weights, specs, simulations, beta, moves_lambda, sibling_visits, samples, size, seed, device = args
+    starts = [start for spec in specs if (start := make_start(*spec)) is not None]
+    if not starts:
+        return [], None
     config = dataclasses.replace(SELF_PLAY, simulations=simulations)
     evaluator = NetworkEvaluator(from_bytes(weights), device)
     return play(
@@ -217,35 +277,65 @@ def _self_play_task(args: tuple) -> tuple[list[GameSummary], Examples]:
         seed=seed,
         beta=beta,
         moves_lambda=moves_lambda,
+        size=size,
         sibling_visits=sibling_visits,
+        samples=samples,
     )
 
 
-def _starts(config: TrainConfig, generation: int) -> list[Start]:
-    seeds = config.seeds(generation)
-    free = round(config.free_share * len(seeds))
-    prefix = free + round(config.prefix_share * len(seeds))
-    starts = free_starts(config.width, config.height, seeds[:free])
-    starts += prefix_starts(config.width, config.height, seeds[free:prefix], config.prefix_fill)
-    starts += standard_starts(config.width, config.height, seeds[prefix:])
-    return starts
+StartSpec = tuple[str, int, int, int, Any]
+"""What a worker turns into a start: :func:`~snake_agent.selfplay.make_start`'s arguments."""
+
+
+def _starts(
+    config: TrainConfig, generation: int, pools: dict[tuple[int, int], deque[GameState]]
+) -> list[StartSpec]:
+    """The generation's starts, board by board, each with its own training seed."""
+    seeds = iter(config.seeds(generation))
+    rng = random.Random(f"{config.seed}/{generation}/midgame")
+    specs: list[StartSpec] = []
+    for width, height, games in config.boards:
+        pool = pools.get((width, height), ())
+        counts = {
+            "free": round(config.free_share * games),
+            "prefix": round(config.prefix_share * games),
+            "recovery": round(config.recovery_share * games),
+            "midgame": round(config.midgame_share * games) if pool else 0,
+        }
+        counts["standard"] = games - sum(counts.values())
+        if counts["standard"] < 0:  # rounding
+            counts["free"] += counts.pop("standard")
+            counts["standard"] = 0
+        for kind, count in counts.items():
+            for _ in range(count):
+                extra = config.prefix_fill if kind == "prefix" else None
+                if kind == "midgame":
+                    extra = pool[rng.randrange(len(pool))]
+                specs.append((kind, width, height, next(seeds), extra))
+    return specs
 
 
 def _game_stats(summaries: list[GameSummary]) -> dict[str, Any]:
+    """Outcomes, moves and search effort of the games, by board and kind of start."""
     stats: dict[str, Any] = {}
-    kinds = {"standard": (True, False), "prefix": (True, True), "free": (False, False)}
-    for kind, (standard, prefixed) in kinds.items():
-        games = [s for s in summaries if s.standard is standard and (s.prefix > 0) is prefixed]
-        if not games:
-            continue
-        outcomes = Counter(s.outcome.value for s in games)
-        won = [s.moves for s in games if s.outcome is Outcome.WON]
-        stats[kind] = {
-            "games": len(games),
-            **{outcome.value: outcomes.get(outcome.value, 0) for outcome in Outcome if outcome.resolved},
-            "mean_moves_won": round(float(np.mean(won)), 2) if won else None,
-            "searched_share": round(sum(s.searched for s in games) / max(1, sum(s.moves for s in games)), 4),
-        }
+    for board in sorted({s.board for s in summaries}):
+        entry: dict[str, Any] = {}
+        for kind in KINDS:
+            games = [s for s in summaries if s.board == board and s.kind == kind]
+            if not games:
+                continue
+            outcomes = Counter(s.outcome.value for s in games)
+            won = [s.moves for s in games if s.outcome is Outcome.WON]
+            moves = sum(s.moves for s in games)
+            entry[kind] = {
+                "games": len(games),
+                **{outcome.value: outcomes.get(outcome.value, 0) for outcome in Outcome if outcome.resolved},
+                "mean_moves_won": round(float(np.mean(won)), 2) if won else None,
+                "moves": moves,
+                "searched_share": round(sum(s.searched for s in games) / max(1, moves), 4),
+                "leaves": sum(s.leaves for s in games),
+            }
+        stats[f"{board[0]}x{board[1]}"] = entry
     return stats
 
 
@@ -259,9 +349,10 @@ def train(
     """Run ``config`` and write its log and checkpoints to ``out``; returns the trained network.
 
     With a CUDA ``device`` the self-play workers evaluate their leaves on it too: batched across their
-    games, the network then costs little next to the search's own work. Assessment games evaluate one
-    leaf at a time, on the CPU. ``init`` starts from a checkpoint's weights (its network size must match
-    ``config``); the replay buffer and the optimizer start empty, and a new run ``seed`` gives new games.
+    games, the network then costs little next to the search's own work. (With many workers on one GPU,
+    run NVIDIA's Multi-Process Service, which lets their small batches share the GPU.) ``init`` starts
+    from a checkpoint's weights (its network size must match ``config``); the replay buffer and the
+    optimizer start empty, and a new run ``seed`` gives new games.
     """
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -277,59 +368,86 @@ def train(
         model.load_state_dict(start.state_dict())
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     replay = Replay(config.replay)
+    pools: dict[tuple[int, int], deque[GameState]] = {}
     inference = "cuda" if str(device).startswith("cuda") else "cpu"
     if inference == "cuda":
         torch.set_num_threads(2)  # leave the CPUs to the self-play workers
     context = multiprocessing.get_context("spawn")
     references = None
+    search = SearchConfig(
+        simulations=config.eval_simulations, gumbel_scale=0.0, moves_unit=config.eval_moves_unit
+    )
+    games_played = 0
     with ProcessPoolExecutor(config.workers, mp_context=context, initializer=_init_worker) as pool:
         for generation in range(config.generations):
             started = time.perf_counter()
             weights = to_bytes(model)
-            starts = _starts(config, generation)
-            order = np.random.default_rng([config.seed, generation]).permutation(len(starts))
+            specs = _starts(config, generation, pools)
+            order = np.random.default_rng([config.seed, generation]).permutation(len(specs))
             tasks = [
                 (
                     weights,
-                    [starts[i] for i in order[k :: config.workers]],
+                    [specs[i] for i in order[k :: config.workers]],
                     config.simulations,
                     config.beta,
                     config.moves_lambda,
                     config.sibling_visits,
+                    config.midgame_samples,
+                    config.canvas,
                     (config.seed, generation, k),
                     inference,
                 )
-                for k in range(min(config.workers, len(starts)))
+                for k in range(min(config.workers, len(specs)))
             ]
             summaries, parts = [], []
             for task_summaries, examples in pool.map(_self_play_task, tasks):
                 summaries += task_summaries
-                parts.append(examples)
+                if examples is not None:
+                    parts.append(examples)
             examples = Examples.concatenate(parts)
             replay.add(examples)
+            for summary in summaries:
+                pools.setdefault(summary.board, deque(maxlen=config.midgame_pool)).extend(summary.samples)
+            games_played += len(summaries)
             played = time.perf_counter()
-            terms = optimize(model, optimizer, replay, config.steps, config.batch, rng, device)
+            rate = config.learning_rate(generation)
+            for group in optimizer.param_groups:
+                group["lr"] = rate
+            terms = {}
+            if replay.size >= config.min_replay:
+                terms = optimize(model, optimizer, replay, config.steps, config.batch, rng, device)
             trained = time.perf_counter()
+            moves = sum(s.moves for s in summaries)
+            leaves = sum(s.leaves for s in summaries)
             record: dict[str, Any] = {
                 "generation": generation,
                 "games": _game_stats(summaries),
+                "games_played": games_played,
                 "examples": len(examples),
                 "replay": replay.size,
+                "lr": rate,
                 "losses": terms,
                 "seconds": {"self_play": round(played - started, 1), "train": round(trained - played, 1)},
+                "throughput": {
+                    "moves_per_second": round(moves / max(played - started, 1e-9), 1),
+                    "leaves_per_second": round(leaves / max(played - started, 1e-9), 1),
+                },
             }
             save(model, out / "model.pt", generation=generation, config=asdict(config))
             last = generation + 1 == config.generations
             if (generation + 1) % config.eval_every == 0 or last:
+                width, height = config.eval_board
                 report = assess(
                     pool,
                     to_bytes(model),
-                    config.width,
-                    config.height,
+                    width,
+                    height,
                     games=config.eval_games,
                     sources=config.eval_sources,
                     workers=config.workers,
                     references=references,
+                    search=search,
+                    device=inference,
                 )
                 references = {float(k): v for k, v in report.get("t2_references", {}).items()} or None
                 record["assessment"] = report
@@ -346,26 +464,33 @@ def train(
     return model
 
 
+SHORT = {"standard": "std", "prefix": "pre", "free": "free", "recovery": "rec", "midgame": "mid"}
+
+
 def _line(record: dict[str, Any]) -> str:
     """A one-line summary of a generation's record."""
-    games = record["games"]
     parts = [f"gen {record['generation'] + 1:3d}"]
-    if "standard" in games:
-        s = games["standard"]
-        parts.append(f"std won {s['won']}/{s['games']} moves {s['mean_moves_won']}")
-    if "prefix" in games:
-        p = games["prefix"]
-        parts.append(f"prefix won {p['won']}/{p['games']}")
-    if "free" in games:
-        f = games["free"]
-        parts.append(f"free won {f['won']}/{f['games']}")
+    for board, kinds in record["games"].items():
+        games = []
+        for kind, g in kinds.items():
+            text = f"{SHORT[kind]} {g['won']}/{g['games']}"
+            if kind == "standard" and g["mean_moves_won"] is not None:
+                text += f" {g['mean_moves_won']:.1f}"
+            games.append(text)
+        parts.append(f"{board} " + " ".join(games))
     losses_ = record["losses"]
-    parts.append(f"loss p {losses_['policy']:.3f} w {losses_['win']:.3f} m {losses_['moves']:.3f}")
+    if losses_:
+        parts.append(f"loss p {losses_['policy']:.3f} w {losses_['win']:.3f} m {losses_['moves']:.3f}")
     seconds = record["seconds"]
     parts.append(f"{seconds['self_play']:.0f}+{seconds['train']:.0f}s")
     if "assessment" in record:
         report = record["assessment"]
         for kind in ("search", "policy"):
-            t1 = report[f"t1_{kind}"]["summary"]
-            parts.append(f"T1 {kind} {t1['won']}/{t1['games']} {t1['mean_moves']}")
+            if f"t1_{kind}" in report:
+                t1 = report[f"t1_{kind}"]["summary"]
+                parts.append(f"T1 {kind} {t1['won']}/{t1['games']} {t1['mean_moves']}")
+            if f"t2_{kind}" in report:
+                t2 = report[f"t2_{kind}"]
+                bands = " ".join(f"{t2[b]['won']}/{t2[b]['games']}" for b in t2 if b not in ("all", "gate"))
+                parts.append(f"T2 {kind} {bands}")
     return " | ".join(parts)

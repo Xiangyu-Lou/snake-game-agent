@@ -8,6 +8,7 @@ from snake_agent.cycles import CycleEnvelope, ShortcutCyclePolicy
 from snake_agent.evaluation import (
     STALL_FACTOR,
     AgentSpec,
+    GameRun,
     Provenance,
     best_rates,
     evaluate_recovery,
@@ -215,3 +216,18 @@ def test_seed_ranges_are_held_out():
     assert not (blocks[0] & blocks[1] or blocks[0] & blocks[2] or blocks[1] & blocks[2])
     with pytest.raises(ValueError):
         seeds.TEST.take(10, seeds.TEST.stop - seeds.TEST.start - 5)
+
+
+def test_games_can_advance_a_move_at_a_time_together():
+    spec = REFERENCES["guarded-greedy"]
+    expected = [run_game(standard(6, seed), spec.factory(0), seed=seed) for seed in range(4)]
+    runs = [GameRun(standard(6, seed), seed=seed) for seed in range(4)]
+    agents = [spec.factory(0) for _ in runs]
+    while any(run.result is None for run in runs):
+        for run, agent in zip(runs, agents, strict=True):
+            if (state := run.next_state()) is not None:
+                run.play(agent(state))
+    assert [run.result for run in runs] == expected
+    assert runs[0].next_state() is None
+    with pytest.raises(RuntimeError):
+        runs[0].play(RelativeAction.STRAIGHT)

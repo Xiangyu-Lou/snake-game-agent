@@ -6,7 +6,10 @@ Milestone **M0, contracts and instruments**, holds the rules every agent plays
 by, the exact tools that training and search use, the evaluation harness, and
 an exact solution of 4×4. Milestone **M1, self-play on 4×4 and 6×6**, adds the
 network inputs, the search, the network, self-play and training
-([below](#m1-self-play-on-44-and-66)).
+([below](#m1-self-play-on-44-and-66)). Milestone **M2, 8×8 and 10×10 with
+recovery**, adds board mixtures, recovery and mid-game starts, batched
+assessment and a moves unit that scales with the board
+([below](#m2-88-and-1010-recovery)).
 
 M0's gate is met: the tests pass, and the harness reproduces the reference
 numbers of the [Architecture B probe](../analysis/architecture_b_probe.py):
@@ -19,6 +22,7 @@ analytic network cost model ([below](#reproducing-the-probe)).
 - [Evaluation harness](#evaluation-harness)
 - [4×4 solved exactly](#44-solved-exactly)
 - [M1: self-play on 4×4 and 6×6](#m1-self-play-on-44-and-66)
+- [M2: 8×8 and 10×10, recovery](#m2-88-and-1010-recovery)
 - [Reproducing the probe](#reproducing-the-probe)
 - [Package layout](#package-layout)
 
@@ -32,9 +36,12 @@ python -m snake_agent solve --board 4x4                                        #
 python -m snake_agent reproduce [--full]                                       # the probe's numbers
 pytest [--slow]                                                                # --slow: full reproduction
 
-pip install -e ".[train]"                                                      # PyTorch, for M1
+pip install -e ".[train]"                                                      # PyTorch, for M1 and M2
 python -m snake_agent train --board 6x6 --out runs/m1-6x6 --device cuda        # self-play and training
 python -m snake_agent assess runs/m1-6x6/model.pt --games 300                  # the M1 gates
+python -m snake_agent train --board 10x10:160 --board 8x8:48 --board 6x6:48 \
+    --relative-unit 0.3 --eval-relative-unit 0.3 --out runs/m2 --device cuda   # a board mixture
+python -m snake_agent assess runs/m2/model.pt --relative-unit 0.3 --sources 100  # the M2 gates (10x10)
 ```
 
 ```python
@@ -453,7 +460,222 @@ share of pairs ordered as the exact solution orders them.
   Early in the game no variant orders close moves much better than chance:
   they differ by 0.6 to 1.5 moves out of about 170 still to come. Next steps: a
   decaying learning rate or fewer updates per generation against the late
-  decline, and value targets precise enough for the first half.
+  decline, and value targets precise enough for the first half. (M2 traced the
+  decline: self-play searched with the one-move unit, whose improved policy, the
+  policy target, is worse than the raw policy from generation 10 on; see
+  [the moves unit](#the-moves-unit-a-share-of-the-scale).)
+
+## M2: 8×8 and 10×10, recovery
+
+M2 grows the network to 8×8 and 10×10 and to recovery starts. Its gate, on
+10×10: T1 with no failures and mean moves below the shortcut cycle's 1,445; T2
+beating the best reference policy in every occupancy band, the 95% lower bound
+of the win rate above that policy's rate on the same starts. The plan also asks
+for mixed sizes, replayed mid-game starts, a sweep of the search budget (8, 16,
+32 and 64 simulations) at equal compute, and the measured games to a plateau
+and throughput, which size the 20×20 run of M3.
+
+**Status:** T2 is met, on the test seeds by both agents. T1 is met only by the
+letter: on 1,000 test games the raw policy of the checkpoint chosen on
+validation averages 1,444.5 moves, under the gate's 1,445 by half a move, but
+the shortcut cycle averages 1,435.1 on the same games
+([the gate](#the-m2-gate-test-seeds)). The agents plateau near the shortcut
+cycle's pace, and the cause is pinned down
+([below](#why-t1-stops-short-of-the-shortcut-cycle)).
+
+### What M2 adds
+
+- **Board mixtures** (`--board 10x10:160 --board 8x8:48 --board 6x6:48`): each
+  generation plays that many games on each board. Their examples share one
+  canvas, the largest board's, and the assessments use the largest board.
+- **Two more kinds of start** (`selfplay.KINDS`), besides M1's standard, prefix
+  and free starts: *recovery starts* (`--recovery-share`, `recovery_start`),
+  track T2's kind of start (a certified state that no cycle is aligned with)
+  taken from a guarded-greedy game of a training seed; and *mid-game starts*
+  (`--midgame-share`, `midgame_start`), a state of one of the agent's own
+  earlier games replayed with new fruits (review §2.6). Each game leaves a few
+  states for later mid-game starts (`--midgame-samples`). The workers build the
+  starts, so the guarded-greedy games behind recovery starts run in parallel.
+- **A relative moves unit** (`--relative-unit`, `SearchConfig.relative_unit`):
+  the envelope search compares expected moves in a share of `moves_scale` at the
+  node instead of a fixed number of moves ([below](#the-moves-unit-a-share-of-the-scale)).
+- **Training settings** for runs that start from a checkpoint (`--init`): a
+  learning-rate warm-up (`--warmup`), a cosine decay (`--lr-floor`), and no
+  updates before the buffer holds `--min-replay` examples.
+- **Throughput.** The starts go to the workers by the longest-processing-time
+  rule, priced by the last generation's network evaluations per game of their
+  board and kind, and the log records moves and evaluations per second and how
+  busy the workers were. With many workers on one GPU, run NVIDIA's
+  Multi-Process Service (`nvidia-cuda-mps-control -d`): without it the workers'
+  small batches take turns on the GPU, and 10×10 self-play runs 2.5 to 3.5
+  times slower.
+- **Batched assessment.** The harness's game loop is a stepper
+  (`evaluation.GameRun`), so `assess` plays a worker's games at once and
+  evaluates their pending leaves in one batch on the GPU (`play_lockstep`). The
+  batched games play exactly what `SearchAgent` and `PolicyAgent` play one game
+  at a time (the tests check this move for move). A 10×10 assessment (100 T1
+  games and about 220 T2 starts, both agents and the references) takes 3 to 4
+  minutes. `assess` also applies the T2 gate (`recovery_gate`).
+
+### The moves unit: a share of the scale
+
+The moves head predicts in units of `moves_scale(F)`, so its errors grow with
+it: about 300 moves at the 6×6 start, 2,425 at the 10×10 start, 39,700 on 20×20.
+A fixed unit suited to one board is wrong for the next. The M1 network on 10×10
+T1 (100 validation games, 16 simulations):
+
+| Search unit | Mean moves | | Relative unit | Mean moves |
+| --- | ---: | --- | --- | ---: |
+| 4 moves | 1,562.6 | | 0.01 of the scale | 1,567.3 |
+| 16 moves | 1,535.2 | | 0.03 | 1,510.9 |
+| 64 moves | 1,516.7 | | 0.1 | 1,471.9 |
+| 256 moves | 1,474.6 | | 0.3 | **1,452.3** |
+| Raw policy | 1,494.6 | | Raw policy | 1,494.6 |
+
+On 6×6 (300 games) the same shares give 215.9, 213.2, 209.6 and 207.3 moves
+against 208.3 for the raw policy: 0.3 is the only share where the search beats
+the policy on both boards. The improved policy is the policy target, so a unit
+too small for the moves head makes the targets worse than the policy itself.
+The first 10×10 run, self-play with the one-move unit, made the raw policy
+worse within five generations (1,494.6 to 1,732.9 moves; its search at a 4-move
+unit, 1,645.7, was still better than its policy). With a 0.3 share in self-play
+and assessment, the policy improved instead (1,472.2 at generation 5).
+
+### Why T1 stops short of the shortcut cycle
+
+The main run (`runs/m2-main`): the three boards above, 10% free, 15% prefix
+(fill up to 75%), 25% recovery and 20% mid-game starts, the rest standard; 16
+simulations at a 0.3 share; 400 steps of 512 examples per generation, a buffer
+of a million, warm-up over 3 generations, cosine decay to a tenth; starting
+from M1's best checkpoint (`runs/m1-6x6-prefix/model-020.pt`). Validation seeds:
+the raw policy over 300 T1 games (95% intervals about ±10 moves), the search
+over 100 (±16), and the T2 starts of 100 source games (98, 73 and 46 by band):
+
+| Generation | 10×10 games | T1 raw policy | T1 search | T2 raw policy | T2 search |
+| ---: | ---: | ---: | ---: | --- | --- |
+| 0 (M1's network) | 0 | 1,482.3 | 1,452.3 | 67, 46, 41: fails | 98, 65, 45: passes |
+| 5 | 795 | **1,463.2** | 1,471.9 | 65, 56, 43: fails | 97, 62, 46: passes |
+| 10 | 1,588 | 1,470.6 | 1,479.5 | 80, 58, 44: passes | 98, 69, 44: passes |
+| 15 | 2,381 | 1,472.3 | 1,487.7 | 84, 56, 39: passes | 97, 68, 44: passes |
+| 20 | 3,180 | 1,476.4 | 1,487.7 | 87, 69, 45: passes | 98, 72, 46: passes |
+
+T2 counts are games won per band; the best reference wins 63%, 36% and 24% of
+these starts. Every T1 game was won inside the envelope. A generation (256
+games, 160 of them on 10×10) took about 100 seconds of self-play and 10 of
+training, with 13,600 network evaluations a second and the workers 77% to 83%
+busy; an assessment took 200 seconds.
+
+T1 peaks after about 800 10×10 games and then drifts back, as M1's runs did
+once the search stopped improving on the policy: by generation 10 it no longer
+does at any setting (1,476.7 to 1,512.1 at shares from 1.0 down to 0.03, and
+1,484.8 and 1,493.0 with 64 simulations, against 1,479.0 for the policy, 100
+games each). Hybrids of the best policy (generation 5) and the shortcut
+cycle's rule locate the loss (300 games each, ±10 moves):
+
+| Agent | Mean moves |
+| --- | ---: |
+| Raw policy | 1,463.2 |
+| Shortcut cycle | 1,442.2 |
+| The policy to 25% fill, then the shortcut rule | 1,436.5 |
+| The shortcut rule to 25% fill, then the policy | 1,462.4 |
+| The shortcut rule to 50% fill, then the policy | **1,429.5** |
+
+The policy plays the first quarter and the second half better than the
+shortcut cycle, and gives away about 33 moves between 25% and 50% fill, where
+it jumps less than the cycle's longest-jump rule. Over the 150 or so decisions
+in that range that is a fifth of a move each, and single decisions are
+near-ties: at 300 of them (generation 20), each move followed by the shortcut
+rule to the end, averaged over 16 fruit seeds shared by the moves, the
+policy's move costs 0.07 moves more than the longest jump on average, and the
+longest jump is better in 51% of them. The moves head's sibling differences do
+not correlate with these rollout differences (r = −0.09). Trusting the head
+more in the first half only makes the search worse (shares of 0.003 to 0.03
+below 50% fill: 1,514.8 to 1,560.2 moves). The shortcut cycle wins by a habit,
+jumping consistently while the snake is short, whose value shows over a whole
+trajectory and not in any one decision a one-step search compares. Closing the
+gap needs a training signal at that level, or values far more precise than
+these.
+
+### The search budget at equal compute
+
+Four runs side by side (`runs/m2-sweep-*`), 5 workers each, with the main run's
+mixture and settings except the budget, all from M1's network. Each budget's
+games per generation follow its measured cost per 10×10 game (below), and its
+steps, buffer and minimum buffer follow the examples those games give, so that
+every generation of every run spends about 0.7 million network evaluations.
+Validation seeds; the raw policy over 300 T1 games (±10 moves):
+
+| Simulations | Games per generation (10×10, 8×8, 6×6) | Self-play per generation | T1 raw policy, generation 10 | T1 raw policy, generation 20 |
+| ---: | --- | ---: | ---: | ---: |
+| 8 | 178, 59, 59 | 123 s | 1,464.4 | 1,463.8 |
+| 16 | 96, 32, 32 | 146 s | 1,461.0 | 1,472.8 |
+| 32 | 47, 16, 16 | 217 s | 1,475.1 | 1,496.2 |
+| 64 | 22, 7, 7 | 297 s | **1,450.7** | 1,496.0 |
+| 64, another seed, twice the games | 44, 14, 14 | 300 s (12 workers) | 1,474.6 | |
+
+Both agents pass T2 at every assessment of every run (100 source games each),
+and no run's search beats its raw policy on T1 (the 64-simulation run's
+generation 10: 1,458.1 at 16 simulations, 1,459.7 at 64, against 1,453.2 for
+its policy over the same 100 games). At equal evaluations the budget matters
+little for what the network learns: generation 10 of the 64-simulation run came
+within 6 moves of the gate, but its replication on another seed did not
+(1,474.6), and both of its later checkpoints fell back, as do the 16- and
+32-simulation runs. The high budgets fall back hardest: they play the fewest
+games per generation and keep the smallest buffers. In wall-clock time low
+budgets win clearly, because their many games fill the workers' batches: the
+same evaluations took 2.4 times longer at 64 simulations (7 games per worker)
+than at 8 (59 per worker).
+
+### The M2 gate, test seeds
+
+The checkpoint is the one with the lowest raw-policy T1 mean on validation (300
+games) among those whose agents both pass T2 there: generation 10 of the
+64-simulation run (1,450.7). Choosing the best of 13 checkpoints favors a lucky
+one, and this one is: its replication reached 1,474.6 and its own run 1,496.0
+ten generations later. The test seeds give it an unbiased measure: 1,000 T1
+games, and the T2 starts of 300 source games (290, 217 and 138 by band); the
+search uses 16 simulations and a 0.3 share.
+
+| Agent | T1 won | T1 mean moves (95% interval) | T1 gate (below 1,445) | T2 won by band (95% lower bounds) | T2 gate |
+| --- | ---: | ---: | --- | --- | --- |
+| Raw policy | 1,000 | 1,444.52 (1,438.81–1,450.23) | passed | 288, 193, 126 (0.975, 0.840, 0.853) | passed |
+| Search | 1,000 | 1,448.57 (1,443.11–1,454.03) | failed | 280, 184, 121 (0.938, 0.793, 0.810) | passed |
+| Shortcut cycle | 1,000 | 1,435.1 | | | |
+| Best reference policy | | | | 67.6%, 46.5%, 31.9% | |
+
+No game left the envelope. The gate's 1,445 is the probe's shortcut-cycle mean
+on other seeds; on these 1,000 games the cycle is 9.4 moves faster than the
+policy (about two standard errors), so the raw policy passes the T1 gate as
+written without beating the cycle. T2 is a clear pass: in every band the 95%
+lower bound of both agents' win rates is at least 0.79, where the best
+reference wins at most 68%.
+
+### Throughput, and the size of a 20×20 run
+
+On the server (an RTX 4090 and a 24.5-CPU container quota, 22 workers, MPS),
+the cost of self-play is the cost of a network evaluation, the leaf's expansion
+(move classes, the survival certificate, the encoding) and the batched network
+call together: games per hour fall in proportion to the simulations. M1's
+network on 10×10 standard starts, 6 games per worker (`runs/m2-bench`):
+
+| Simulations per searched move | Games per hour | Mean moves | Evaluations per second |
+| ---: | ---: | ---: | ---: |
+| 8 | 11,900 | 1,677 | 13,900 |
+| 16 | 6,410 | 1,603 | 15,000 |
+| 32 | 3,130 | 1,556 | 14,500 |
+| 64 | 1,460 | 1,534 | 14,200 |
+
+(Self-play keeps its Gumbel noise, so these games are slower than T1's.) Free
+starts cost the same per evaluation (5,350 games an hour at 16 simulations).
+Larger batches help: with 48 positions per worker, an evaluation costs a
+worker 0.8 to 1.1 ms on 10×10, 0.9 to 1.5 ms on 14×14 and 1.3 to 2.0 ms on
+20×20 (free and envelope positions), so 20×20 needs only 1.5 to 2 times 10×10's
+work per evaluation for four times the cells. A 20×20 game at the shortcut cycle's
+pace is about 20,700 moves, a third of them searched, about 110,000
+evaluations at 16 simulations: 7 to 10 seconds of this server, 360 to 540
+games an hour. The review's 3,000-game 20×20 run would take 6 to 8 hours here.
+On 10×10, T1 peaked after about 800 games from M1's network, while T2 kept
+improving for at least 3,200.
 
 ## Reproducing the probe
 
@@ -489,13 +711,14 @@ survivable.
 | [`cycles.py`](cycles.py) | cycle order, `CycleEnvelope`, `ShortcutCyclePolicy` |
 | [`references.py`](references.py) | `GuardedGreedyPolicy`, the `REFERENCES` registry |
 | [`recovery.py`](recovery.py) | recovery starts for T2 |
-| [`evaluation.py`](evaluation.py) | `run_game`, `AgentSpec`, the tracks, summaries and gates |
+| [`evaluation.py`](evaluation.py) | `run_game`, `GameRun`, `AgentSpec`, the tracks, summaries and gates |
 | [`exact.py`](exact.py) | `solve`, `solve_envelope`, `ExactSolution`, `evaluate_policy` |
 | [`seeds.py`](seeds.py), [`stats.py`](stats.py) | held-out seed ranges; binomial and mean intervals |
 | [`reproduce.py`](reproduce.py) | the probe's reference numbers |
 | [`encoding.py`](encoding.py) | M1: the network inputs, `mirror`, `moves_scale`, `canonical_envelope` |
-| [`search.py`](search.py) | M1: Gumbel root search, `SearchAgent`, `PolicyAgent` |
+| [`search.py`](search.py) | M1: Gumbel root search, `SearchAgent`, `PolicyAgent`, `policy_move`; M2: the relative unit |
 | [`network.py`](network.py) | M1: `SnakeNet`, `NetworkEvaluator`, checkpoints (PyTorch) |
-| [`selfplay.py`](selfplay.py) | M1: batched self-play, starts and training examples |
-| [`train.py`](train.py), [`assess.py`](assess.py) | M1: the training loop; assessment against the gates (PyTorch) |
+| [`selfplay.py`](selfplay.py) | M1 and M2: batched self-play, the kinds of start, training examples |
+| [`train.py`](train.py) | M1 and M2: the training loop over board mixtures, worker balancing (PyTorch) |
+| [`assess.py`](assess.py) | M1 and M2: batched assessment against the gates (PyTorch) |
 | [`__main__.py`](__main__.py) | `python -m snake_agent evaluate | solve | reproduce | train | assess` |

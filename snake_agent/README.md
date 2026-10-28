@@ -9,7 +9,10 @@ network inputs, the search, the network, self-play and training
 ([below](#m1-self-play-on-44-and-66)). Milestone **M2, 8×8 and 10×10 with
 recovery**, adds board mixtures, recovery and mid-game starts, batched
 assessment and a moves unit that scales with the board
-([below](#m2-88-and-1010-recovery)).
+([below](#m2-88-and-1010-recovery)). **Habits** then make the 10×10 agent
+faster than the shortcut cycle on T1: jump biases per band of fill, compared on
+paired games and distilled into the network
+([below](#habits-faster-than-the-shortcut-cycle-on-1010)).
 
 M0's gate is met: the tests pass, and the harness reproduces the reference
 numbers of the [Architecture B probe](../analysis/architecture_b_probe.py):
@@ -23,6 +26,7 @@ analytic network cost model ([below](#reproducing-the-probe)).
 - [4×4 solved exactly](#44-solved-exactly)
 - [M1: self-play on 4×4 and 6×6](#m1-self-play-on-44-and-66)
 - [M2: 8×8 and 10×10, recovery](#m2-88-and-1010-recovery)
+- [Habits: faster than the shortcut cycle on 10×10](#habits-faster-than-the-shortcut-cycle-on-1010)
 - [Reproducing the probe](#reproducing-the-probe)
 - [Package layout](#package-layout)
 
@@ -42,6 +46,7 @@ python -m snake_agent assess runs/m1-6x6/model.pt --games 300                  #
 python -m snake_agent train --board 10x10:160 --board 8x8:48 --board 6x6:48 \
     --relative-unit 0.3 --eval-relative-unit 0.3 --out runs/m2 --device cuda   # a board mixture
 python -m snake_agent assess runs/m2/model.pt --relative-unit 0.3 --sources 100  # the M2 gates (10x10)
+python -m snake_agent habits runs/m2/model.pt --out runs/habits --device cuda     # jump habits, distilled
 ```
 
 ```python
@@ -475,13 +480,17 @@ for mixed sizes, replayed mid-game starts, a sweep of the search budget (8, 16,
 32 and 64 simulations) at equal compute, and the measured games to a plateau
 and throughput, which size the 20×20 run of M3.
 
-**Status:** T2 is met, on the test seeds by both agents. T1 is met only by the
-letter: on 1,000 test games the raw policy of the checkpoint chosen on
+**Status:** T2 is met, on the test seeds by both agents. T1 was first met only by
+the letter: on 1,000 test games the raw policy of the checkpoint chosen on
 validation averages 1,444.5 moves, under the gate's 1,445 by half a move, but
 the shortcut cycle averages 1,435.1 on the same games
 ([the gate](#the-m2-gate-test-seeds)). The agents plateau near the shortcut
 cycle's pace, and the cause is pinned down
-([below](#why-t1-stops-short-of-the-shortcut-cycle)).
+([below](#why-t1-stops-short-of-the-shortcut-cycle)). Habit rounds from that
+checkpoint then make both agents faster than the shortcut cycle on the same
+games: by 28.9 moves for the raw policy and 30.1 for the search on the 1,000
+test games, with T2 still passed
+([below](#habits-faster-than-the-shortcut-cycle-on-1010)).
 
 ### What M2 adds
 
@@ -677,6 +686,212 @@ games an hour. The review's 3,000-game 20×20 run would take 6 to 8 hours here.
 On 10×10, T1 peaked after about 800 games from M1's network, while T2 kept
 improving for at least 3,200.
 
+## Habits: faster than the shortcut cycle on 10×10
+
+M2's 10×10 agents stop a few moves short of the shortcut cycle on T1 because
+what the cycle does better is a habit, jumping while the snake is short, that no
+single decision shows ([above](#why-t1-stops-short-of-the-shortcut-cycle)).
+[`habits.py`](habits.py) adds a training signal at that level: a bias toward
+longer or shorter jumps in each band of fill, compared on paired games that
+share their fruits and then distilled into the network. No reference moves are
+used: the habits are compared on the agent's own games, and the result is still
+a self-play agent (track T3). Four distillations from M2's checkpoint give a
+network whose raw policy averages 1,406.2 moves on the 1,000 test T1 games,
+28.9 fewer than the shortcut cycle on the same games (95% interval 24.9 to
+32.9), its search 30.1 fewer, and both still pass T2
+([the gate](#validation-and-the-gate)).
+
+### One decision is lost in the noise
+
+From states of shortcut-cycle games on 10×10, two continuations that differ in
+one move and then follow the same rule, with the same fruit seed, almost always
+*merge*: they reach the same body and fruit at the same length, after which the
+two games coincide. Until then they drift apart. The standard deviation of the
+difference in moves, over 16 fruit seeds at each of 40 states per fill:
+
+| Fill | Standard deviation of the difference | Merged |
+| ---: | ---: | ---: |
+| 10% | 3.8 | 100% |
+| 20% | 14.7 | 100% |
+| 30% | 34.6 | 99% |
+| 40% | 28.2 | 99% |
+| 45% | 22.7 | 98% |
+| 55% | 35.2 | 92% |
+| 70% | 35.4 | 43% |
+
+Below half fill the two moves of a decision differ by a fraction of a move to
+two or three moves in expectation (0.07 on average in M2's paired rollouts), so
+ranking them takes hundreds of paired games each. A habit
+applied to all the decisions of a band adds up instead: following the cycle from
+45% fill rather than 50% costs 18.6 moves, with a paired standard deviation of
+57 over 400 games. The bands' effects are measurable; one decision's are not.
+
+### Habits and paired windows
+
+A **habit** ([`Habit`](habits.py)) holds a bias for each of 20 bands of fill (5%
+of the board each). At an envelope decision with a choice the agent plays the
+move that maximizes `logit + bias · (jump − shortest jump)`, jumps counted in
+cells along the canonical cycle: bias 0 is the raw policy, +∞ the longest jump,
+−∞ the cycle's next cell. On 10×10 almost every decision has exactly two
+envelope moves, the next cell and a jump about 9 cells along, and below half fill
+the M2 policy takes the jump 23% to 56% of the time with logit margins near 1.
+`HabitEvaluator` applies a habit to any evaluator's logits, so that `PolicyAgent`
+plays it and the search gets it as its prior.
+
+**Paired windows** (`compare`). The current habit plays games from the standard
+start of training seeds, and the position where each band begins (a fruit just
+placed) starts a *window*: branches play the candidate biases in that band and
+the current habit everywhere else, all with one planning seed, so that they draw
+the same fruits. A branch stops when it merges with the window's base branch,
+the same position at the same length once their habits agree from there on, or
+when its game ends; its difference in moves to the base is a sample of the
+candidate's effect. The tests check that these differences equal the
+differences of the full games. A game gives a window in each band, so 400 games
+give 400 windows per band, and a 10×10 round (8,000 windows, four candidates
+each) takes 2.5 minutes on 10 of the server's workers.
+
+**Improvement** (`improve`): in each band, the candidate with the fewest mean
+moves replaces the current bias if it saves moves by more than two standard
+errors. **Distillation** (`train.distill`) then makes the network's raw policy
+play the improved habit. The teacher, the network before, plays 300 games of the
+habit from the standard start and 100 after a random envelope prefix (up to 75%
+fill); inside the envelope each decision's target is the habit's policy, the
+softmax of its scores (an infinite bias puts 98% on its move). Outside the
+envelope the *anchor*, the network the run started from, plays its raw policy
+from 150 free and 150 recovery starts, and its own policy and values are the
+targets there; every afterstate keeps the teacher's values inside the envelope
+and the anchor's outside. A copy of the teacher then takes 1,500 steps of 512
+examples at a learning rate of 3 × 10⁻⁴ on the training losses. The next round
+compares habits around the distilled network, starting from the neutral habit
+again: a policy iteration whose improvement step compares habits rather than
+moves, with the play outside the envelope held where it started.
+
+The anchor matters. A first version kept the outputs of each round's own
+network outside the envelope, from 50 free and 50 recovery games, and the drift
+added up: on the T2 starts of 100 validation sources the raw policy won 68 of
+the 73 starts of the 50% band with M2's network, 64 after two distillations and
+55 after three, while T1 kept improving.
+
+```bash
+python -m snake_agent habits runs/m2-sweep-64/model-010.pt --out runs/habits \
+    --rounds 4 --seeds 400 --workers 10 --device cuda   # stage 1; stops when no band improves
+python -m snake_agent habits runs/habits/model-h02.pt --anchor runs/m2-sweep-64/model-010.pt \
+    --out runs/habits-fine --rounds 3 --seeds 1600 --candidates=-0.15,-0.05,0.05,0.15,inf \
+    --workers 10 --device cuda --seed 2                  # stage 2: four times the windows, finer biases
+python -m snake_agent assess runs/habits-fine/model-h02.pt --games 1000 --sources 100 --relative-unit 0.3
+```
+
+`assess` plays the shortcut cycle on the same T1 games and reports each
+agent's paired difference from it (`versus_shortcut`: the mean difference in
+moves and its 95% interval).
+
+### Rounds from M2's checkpoint
+
+The run starts from M2's checkpoint (`runs/m2-sweep-64/model-010.pt`), which is
+also the anchor throughout. Stage 1 (`runs/habits`) compares the biases −∞,
+−0.15, +0.15 and +∞ on 400 windows per band. Its first round's windows, mean
+moves gained or lost per window against the raw policy (standard errors 0.2 to
+0.7 below 15% fill, 1.6 to 3.5 from 15% to 50%, 1.6 to 3.7 above; in bold the
+bands that changed):
+
+| Band of fill | Cycle (−∞) | −0.15 | +0.15 | Longest jump (+∞) |
+| --- | ---: | ---: | ---: | ---: |
+| 0–5% | +76.4 | +31.8 | **−1.5** | +1.3 |
+| 5–10% | +176.0 | +64.5 | +1.1 | +3.5 |
+| 15–20% | +142.2 | +44.2 | **−6.6** | −6.2 |
+| 20–25% | +121.2 | +38.1 | **−7.6** | −6.2 |
+| 25–30% | +111.6 | +43.2 | −5.0 | −1.8 |
+| 30–35% | +82.8 | +39.2 | **−8.5** | −8.4 |
+| 35–40% | +62.5 | +35.5 | **−6.9** | −2.9 |
+| 40–45% | +47.8 | +34.0 | −1.8 | +1.4 |
+| 45–50% | +26.0 | +22.0 | −0.7 | +2.8 |
+| 50–55% | +5.6 | +5.0 | −1.5 | +8.1 |
+| 55–60% | +1.8 | +1.8 | +4.2 | +29.0 |
+| 70–75% | 0 | 0 | 0 | +96.7 |
+| 85–90% | 0 | 0 | 0 | +125.1 |
+
+Below half fill, jumping less is expensive: following the cycle through one
+band costs up to 176 moves. Jumping a little more (+0.15, which flips the
+decisions whose logit margin is under about 1.2) saves 5 to 9 moves per band
+between 15% and 40%. Above half fill the policy follows the cycle with large
+margins, and only the longest jump changes anything: it costs 29 to 133 moves
+per band. When stage 1 stops, stage 2 (`runs/habits-fine`) goes on from its last
+network with 1,600 windows per band and the biases −0.15, −0.05, +0.05, +0.15
+and +∞. Each round's distilled network plays 300 validation games, against the
+shortcut cycle on the same games (the bands changed, with the moves a window
+saved there):
+
+| Round | Bands changed (moves saved per window) | Decisions the habit changes | Raw policy, 300 validation games | Minus the shortcut cycle (95% interval) |
+| ---: | --- | ---: | ---: | ---: |
+| 0 (M2) | | | 1,450.8 | +8.6 (−0.5 to +17.7) |
+| 1 | +0.15: 0–5% (1.5), 15–20% (6.6), 20–25% (7.6), 30–35% (8.5), 35–40% (6.9) | 3.1% | 1,424.9 | −17.3 (−26.0 to −8.7) |
+| 2 | +0.15: 10–15% (1.5), 15–20% (1.7), 45–50% (7.8) | 1.4% | 1,418.2 | −24.0 (−32.3 to −15.7) |
+| 3 | none: stage 1 stops | | | |
+| 4 | +∞: 20–25% (2.3), 25–30% (3.4), 35–40% (3.0) | 1.2% | 1,418.5 | −23.7 (−31.4 to −16.1) |
+| 5 | +0.15: 25–30% (0.3), 30–35% (2.1) | 0.2% | 1,415.4 | −26.8 (−34.2 to −19.5) |
+| 6 | none: stage 2 stops | | | |
+
+"Decisions the habit changes" are the envelope decisions of the distillation
+games where the habit's move is not the raw policy's. A stage-1 round took 3.5
+to 4 minutes on 10 of the server's workers (2 to 2.5 minutes of windows, 1.3 of
+distillation), a stage-2 round 9 to 10 minutes. The distilled networks play the
+habit's move at 94.5% to 99.8% of the decisions in the bands that changed, and
+the raw policy's at 98.4% to 99.7% elsewhere.
+
+### Validation and the gate
+
+On 1,000 validation games, against the shortcut cycle on the same games, and on
+the T2 starts of 100 validation source games (the best reference wins 63%, 36%
+and 24% of the three bands):
+
+| Network | T1 raw policy | Minus the shortcut cycle (95% interval) | T2 raw policy, won by band |
+| --- | ---: | ---: | --- |
+| M2's checkpoint | 1,451.1 | +14.2 (+9.0 to +19.4) | 97/98, 68/73, 44/46 |
+| Without the anchor, after two distillations | 1,419.5 | −17.3 (−22.1 to −12.5) | 96/98, 64/73, 44/46 |
+| Without the anchor, after three | 1,413.3 | −23.5 (−28.2 to −18.9) | 96/98, 55/73, 42/46 |
+| **Anchored, after four (`runs/habits-fine/model-h02.pt`)** | **1,410.6** | **−26.2 (−30.4 to −22.1)** | 96/98, 60/73, 45/46 |
+| Shortcut cycle | 1,436.8 | | |
+
+Every T1 game was won inside the envelope. The anchor keeps most of M2's play
+outside the envelope, not all of it: the 50% band of T2 still lost 8 of 73
+starts (and the 30% band one), a cost of distilling through the network's
+shared layers, though its win rate stays far above the reference's 36%.
+
+**The gate, test seeds.** The final network (`runs/habits-fine/model-h02.pt`),
+the procedure's last and the best on validation, on the test seeds as in M2
+([above](#the-m2-gate-test-seeds)): 1,000 T1 games, and the T2 starts of 300
+source games (290, 217 and 138 by band); the search uses 16 simulations and a
+0.3 share.
+
+| Agent | T1 won | T1 mean moves (95% interval) | Minus the shortcut cycle (95% interval) | T1 gate (below 1,445) | T2 won by band (95% lower bounds) | T2 gate |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| Raw policy | 1,000 | 1,406.20 (1,400.54–1,411.85) | **−28.9 (−32.9 to −24.9)** | passed | 285, 190, 128 (0.960, 0.824, 0.871) | passed |
+| Search | 1,000 | 1,404.96 (1,399.28–1,410.64) | **−30.1 (−34.2 to −26.1)** | passed | 289, 196, 122 (0.981, 0.856, 0.819) | passed |
+| M2's raw policy | 1,000 | 1,444.52 | +9.4 | passed | 288, 193, 126 | passed |
+| M2's search | 1,000 | 1,448.57 | +13.5 | failed | 280, 184, 121 | passed |
+| Shortcut cycle | 1,000 | 1,435.08 (1,429.53–1,440.63) | | | | |
+| Best reference policy | | | | | 67.6%, 46.5%, 31.9% | |
+
+No game left the envelope. Both agents now beat the shortcut cycle on the same
+games by about 2% of its moves, with intervals far from zero, where M2's were
+slower than it; the search, which M2 found no better than the raw policy, is
+now 1.2 moves faster than it (within the noise). On T2 the raw policy's wins by
+band moved by −3, −3 and +2 starts from M2's, within the noise, and the
+search's rose by 9, 12 and 1. How far the envelope's optimum lies below is
+unknown on 10×10; on 6×6 it is 5% below the shortcut cycle.
+
+**A replicate.** The same stage 1 on other training seeds (run seed 1, on the
+Mac) changed 0–5%, 30–40% and 45–50% to +0.15 and 20–30% to +∞ in its first
+round, and its distilled network played 1,419.7 moves on the 300 validation
+games, 22.5 (14.6 to 30.3) fewer than the shortcut cycle.
+
+**For comparison, with the reference's rule (not self-play).** Grafting the
+shortcut cycle's longest-jump rule onto M2's network, by hand, on the same
+1,000 validation games: the rule between 25% and 50% fill and the network
+elsewhere plays 1,427.2 moves; the rule below 50% and the network above, 1,423.0
+(13.8 fewer than the shortcut cycle). These hybrids use a reference policy's
+moves, so they are not track T3 agents; the habits pass them without that rule.
+
 ## Reproducing the probe
 
 `python -m snake_agent reproduce` (about 20 seconds) replays the probe's
@@ -719,6 +934,7 @@ survivable.
 | [`search.py`](search.py) | M1: Gumbel root search, `SearchAgent`, `PolicyAgent`, `policy_move`; M2: the relative unit |
 | [`network.py`](network.py) | M1: `SnakeNet`, `NetworkEvaluator`, checkpoints (PyTorch) |
 | [`selfplay.py`](selfplay.py) | M1 and M2: batched self-play, the kinds of start, training examples |
-| [`train.py`](train.py) | M1 and M2: the training loop over board mixtures, worker balancing (PyTorch) |
-| [`assess.py`](assess.py) | M1 and M2: batched assessment against the gates (PyTorch) |
-| [`__main__.py`](__main__.py) | `python -m snake_agent evaluate | solve | reproduce | train | assess` |
+| [`train.py`](train.py) | M1 and M2: the training loop over board mixtures, worker balancing; `distill`, `improve_habits` (PyTorch) |
+| [`assess.py`](assess.py) | M1 and M2: batched assessment against the gates, the shortcut cycle on the same seeds (PyTorch) |
+| [`habits.py`](habits.py) | `Habit`, `HabitEvaluator`, paired windows (`compare`), `improve`, distillation examples |
+| [`__main__.py`](__main__.py) | `python -m snake_agent evaluate | solve | reproduce | train | assess | habits` |

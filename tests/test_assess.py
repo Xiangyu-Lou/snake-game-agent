@@ -12,13 +12,15 @@ from snake_agent.assess import (  # noqa: E402
     _runs,
     calibration,
     play_lockstep,
+    shortcut_t1,
     sibling_ranking,
     uniform_free_states,
+    versus,
 )
-from snake_agent.contract import TRAINING_RULES  # noqa: E402
+from snake_agent.contract import TRAINING_RULES, Outcome  # noqa: E402
 from snake_agent.cycles import CycleEnvelope  # noqa: E402
 from snake_agent.encoding import moves_scale  # noqa: E402
-from snake_agent.evaluation import run_game  # noqa: E402
+from snake_agent.evaluation import Evaluation, GameRecord, Provenance, run_game  # noqa: E402
 from snake_agent.exact import solve, solve_envelope  # noqa: E402
 from snake_agent.recovery import recovery_starts  # noqa: E402
 from snake_agent.search import EVALUATION, PolicyAgent, Prediction, SearchAgent, envelope_certain  # noqa: E402
@@ -123,3 +125,28 @@ def test_batched_games_play_as_the_agents_do_one_at_a_time(kind):
     runs = _runs(kind, games, TRAINING_RULES, labels, envelope=False)
     lockstep = [_Lockstep(run, kind, TRAINING_RULES, EVALUATION, i) for i, run in enumerate(runs)]
     assert play_lockstep(hashed, lockstep) == expected
+
+
+def test_the_shortcut_cycle_is_compared_on_the_same_games():
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(2) as pool:
+        shortcut = shortcut_t1(pool, 6, 6, 4, workers=2)
+    assert [r.seed for r in shortcut.records] == list(range(1_000_000_000, 1_000_000_004))
+    assert all(r.outcome is Outcome.WON for r in shortcut.records)
+
+    def evaluation(moves, outcomes=None):
+        records = tuple(
+            GameRecord("standard", seed, (outcomes or {}).get(seed, Outcome.WON), m, 33, 36)
+            for seed, m in moves.items()
+        )
+        return Evaluation("T1", "x", Provenance.SELF_PLAY, (6, 6), TRAINING_RULES, records)
+
+    reference = evaluation({1: 200, 2: 210, 3: 220})
+    report = versus(evaluation({1: 190, 2: 205, 3: 230, 4: 100}), reference)
+    assert report["games"] == 3 and report["difference"] == pytest.approx(-5 / 3, abs=0.01)
+    assert report["reference_mean_moves"] == 210 and not report["fewer_moves"]
+    assert report["interval"][0] < report["difference"] < report["interval"][1]
+    faster = versus(evaluation({1: 190, 2: 199, 3: 211}), reference)
+    assert faster["difference"] == -10 and faster["fewer_moves"]
+    assert versus(evaluation({1: 190}, {1: Outcome.LOST}), reference) == {"games": 0}

@@ -1,4 +1,4 @@
-"""Command line: ``python -m snake_agent {evaluate,solve,reproduce,train,assess} --help``."""
+"""Command line: ``python -m snake_agent {evaluate,solve,reproduce,train,assess,habits} --help``."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from .evaluation import (
     standard_gate,
 )
 from .exact import evaluate_policy, solve
+from .habits import CANDIDATES
 from .recovery import held_out_starts
 from .references import REFERENCES
 
@@ -234,6 +235,46 @@ def assess_network(args: argparse.Namespace) -> int:
     return 0 if all(gate["passed"] for gate in gates if gate is not None) else 1
 
 
+def biases(text: str) -> tuple[float, ...]:
+    """Comma-separated biases, for example ``-inf,-0.15,0.15,inf``."""
+    try:
+        return tuple(float(part) for part in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"biases must look like -inf,-0.15,0.15,inf, got {text!r}") from None
+
+
+def improve_network_habits(args: argparse.Namespace) -> int:
+    from .train import DistillConfig, HabitConfig, improve_habits  # needs PyTorch
+
+    width, height = args.board
+    config = HabitConfig(
+        width=width,
+        height=height,
+        rounds=args.rounds,
+        seeds=args.seeds,
+        candidates=args.candidates,
+        z=args.z,
+        distill=DistillConfig(
+            standard=args.standard,
+            prefix=args.prefix,
+            prefix_fill=args.prefix_fill,
+            free=args.free,
+            recovery=args.recovery,
+            steps=args.steps,
+            batch=args.batch,
+            lr=args.lr,
+            smoothing=args.smoothing,
+        ),
+        workers=args.workers,
+        eval_games=args.eval_games,
+        seed=args.seed,
+    )
+    improve_habits(
+        config, args.checkpoint, args.out, device=args.device or _default_device(), anchor=args.anchor
+    )
+    return 0
+
+
 def _default_device() -> str:
     import torch
 
@@ -242,7 +283,7 @@ def _default_device() -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m snake_agent", description="Snake agent tools (milestones M0 to M2)."
+        prog="python -m snake_agent", description="Snake agent tools (milestones M0 to M2, and habits)."
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -372,6 +413,43 @@ def build_parser() -> argparse.ArgumentParser:
     asm.add_argument("--device", help="torch device for the games (default: cuda if available, else cpu)")
     asm.add_argument("--json", help="write the report to this JSON file")
     asm.set_defaults(run=assess_network)
+
+    hb = commands.add_parser(
+        "habits", help="improve a network's jump habits by paired games and distil them (needs PyTorch)"
+    )
+    hb.add_argument("checkpoint", help="a model.pt written by train (or by habits)")
+    hb.add_argument("--out", required=True, help="output directory for the log and checkpoints")
+    hb.add_argument("--board", type=board_size, default=(10, 10), help="board size (default: 10x10)")
+    hb.add_argument("--rounds", type=int, default=2, help="rounds of comparison and distillation")
+    hb.add_argument("--seeds", type=int, default=400, help="games per round whose windows compare habits")
+    hb.add_argument(
+        "--candidates",
+        type=biases,
+        default=CANDIDATES,
+        help="biases tried in each band, comma-separated (default: -inf,-0.15,0,0.15,inf)",
+    )
+    hb.add_argument("--z", type=float, default=2.0, help="standard errors a band's improvement needs")
+    hb.add_argument("--standard", type=int, default=300, help="distillation games from the standard start")
+    hb.add_argument("--prefix", type=int, default=100, help="... after a random envelope prefix")
+    hb.add_argument(
+        "--prefix-fill", type=float, default=0.75, help="the longest prefix, as a share of the board"
+    )
+    hb.add_argument("--free", type=int, default=150, help="... from free starts (the anchor's own policy)")
+    hb.add_argument("--recovery", type=int, default=150, help="... from recovery starts (the same)")
+    hb.add_argument(
+        "--anchor", help="the checkpoint whose play outside the envelope is kept (default: the checkpoint)"
+    )
+    hb.add_argument("--steps", type=int, default=1500, help="distillation optimizer steps")
+    hb.add_argument("--batch", type=int, default=512)
+    hb.add_argument("--lr", type=float, default=3e-4)
+    hb.add_argument("--smoothing", type=float, default=0.02, help="target share left by an infinite bias")
+    hb.add_argument("--workers", type=int, default=8)
+    hb.add_argument(
+        "--eval-games", type=int, default=300, help="validation T1 games after each round (0: none)"
+    )
+    hb.add_argument("--seed", type=int, default=0, help="run seed (selects the training seeds)")
+    hb.add_argument("--device", help="torch device for distillation (default: cuda if available, else cpu)")
+    hb.set_defaults(run=improve_network_habits)
     return parser
 
 

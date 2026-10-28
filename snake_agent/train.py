@@ -28,6 +28,11 @@ Each generation:
 Everything is written to the output directory: ``log.jsonl`` (one line per
 generation, with the throughput), ``model.pt`` (the latest network) and
 ``model-<generation>.pt`` at each assessment.
+
+**Habits** (after M2, :mod:`snake_agent.habits`): :func:`improve_habits` starts
+from a checkpoint and runs rounds of :func:`compare_habits` (paired windows for
+each band of fill, across worker processes) and :func:`distill` (the network
+trained to play the improved habit with its raw policy).
 """
 
 from __future__ import annotations
@@ -39,7 +44,7 @@ import multiprocessing
 import random
 import time
 from collections import Counter, deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -51,12 +56,13 @@ import torch.nn.functional as F
 
 from snake_game import GameState
 
-from .assess import assess
+from .assess import assess, shortcut_t1, t1, versus
 from .contract import TRAINING_RULES, Outcome
-from .encoding import mirror
+from .encoding import GLOBALS, mirror
+from .habits import BANDS, CANDIDATES, Comparison, Habit, compare, distillation_examples, improve
 from .network import NetworkConfig, NetworkEvaluator, SnakeNet, from_bytes, load, save, tensors, to_bytes
 from .search import SELF_PLAY, SearchConfig
-from .selfplay import KINDS, Examples, GameSummary, make_start, play
+from .selfplay import KINDS, Examples, GameSummary, Label, make_start, play
 
 GAMES_PER_GENERATION_LIMIT = 1000
 GENERATION_LIMIT = 1000
@@ -534,4 +540,345 @@ def _line(record: dict[str, Any]) -> str:
                 t2 = report[f"t2_{kind}"]
                 bands = " ".join(f"{t2[b]['won']}/{t2[b]['games']}" for b in t2 if b not in ("all", "gate"))
                 parts.append(f"T2 {kind} {bands}")
+    return " | ".join(parts)
+
+
+# --------------------------------------------------------------------- habits
+COMPARE_SEEDS = 400_000_000
+"""Training seeds of the games whose windows compare habits: a block of 10,000 per round of a run seed."""
+DISTILL_SEEDS = 450_000_000
+"""Training seeds of the distillation games: a block of 10,000 per round of a run seed."""
+
+
+def _compare_task(args: tuple) -> Comparison:
+    weights, habit, width, height, seeds, candidates, device = args
+    evaluator = NetworkEvaluator(from_bytes(weights), device)
+    return compare(evaluator, Habit.from_json(habit), width, height, seeds, candidates)
+
+
+def compare_habits(
+    pool: ProcessPoolExecutor,
+    weights: bytes,
+    habit: Habit,
+    width: int,
+    height: int,
+    seeds: Sequence[int],
+    candidates: Sequence[float] = CANDIDATES,
+    device: str = "cpu",
+    chunk: int = 8,
+) -> Comparison:
+    """:func:`~snake_agent.habits.compare` for the network, ``chunk`` seeds per task of ``pool``."""
+    tasks = [
+        (weights, habit.to_json(), width, height, list(seeds[i : i + chunk]), tuple(candidates), device)
+        for i in range(0, len(seeds), chunk)
+    ]
+    total = Comparison(habit)
+    for part in pool.map(_compare_task, tasks):
+        total.merge(part)
+    return total
+
+
+@dataclass(frozen=True)
+class DistillConfig:
+    """Settings of :func:`distill`: its games, by kind of start, and its optimizer steps."""
+
+    width: int = 10
+    height: int = 10
+    standard: int = 300
+    """Games of the habit from the standard start."""
+    prefix: int = 100
+    """Games of the habit from the standard start after a random envelope prefix (up to ``prefix_fill``)."""
+    prefix_fill: float = 0.75
+    free: int = 150
+    """Games of the anchor's raw policy from free starts, which keep its outputs outside the envelope."""
+    recovery: int = 150
+    """The same from recovery starts (track T2's kind of start)."""
+    steps: int = 1500
+    batch: int = 512
+    lr: float = 3e-4
+    weight_decay: float = 1e-4
+    smoothing: float = 0.02
+    """Share of an infinite bias's target left to the other envelope moves (:meth:`Habit.target`)."""
+    seed: int = 0
+    """Selects the training seeds: a block of 10,000 from :data:`DISTILL_SEEDS`."""
+
+    def specs(self) -> list[StartSpec]:
+        """The starts, kind by kind, each with its own training seed."""
+        counts = {
+            "standard": self.standard,
+            "prefix": self.prefix,
+            "free": self.free,
+            "recovery": self.recovery,
+        }
+        if min(counts.values()) < 0 or sum(counts.values()) > 10_000:
+            raise ValueError("between 0 and 10,000 distillation games")
+        seeds = iter(range(DISTILL_SEEDS + self.seed * 10_000, DISTILL_SEEDS + (self.seed + 1) * 10_000))
+        specs: list[StartSpec] = []
+        for kind, count in counts.items():
+            extra = self.prefix_fill if kind == "prefix" else None
+            specs += [(kind, self.width, self.height, next(seeds), extra) for _ in range(count)]
+        return specs
+
+
+def _distill_task(args: tuple) -> tuple[Examples | None, dict[str, Any]]:
+    weights, anchor, habit, specs, smoothing, size, device = args
+    starts = [start for spec in specs if (start := make_start(*spec)) is not None]
+    if not starts:
+        return None, {}
+    evaluator = NetworkEvaluator(from_bytes(weights), device)
+    anchor_ = evaluator if anchor is None else NetworkEvaluator(from_bytes(anchor), device)
+    return distillation_examples(
+        evaluator, Habit.from_json(habit), starts, anchor=anchor_, size=size, smoothing=smoothing
+    )
+
+
+def agreement(
+    model: SnakeNet, examples: Examples, habit: Habit, device: torch.device | str, limit: int = 20_000
+) -> dict[str, float | None]:
+    """Share of the envelope decisions among ``examples`` (at most ``limit``) where the network's most likely
+    valid move is the target's: in the bands where ``habit`` has a bias (``"habit"``) and elsewhere."""
+    index = np.flatnonzero(examples.has_policy & (examples.label == Label.ENVELOPE))[:limit]
+    biased = np.array([b != 0 for b in habit.biases])
+    agree = {True: [0, 0], False: [0, 0]}
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, len(index), 2048):
+            batch = examples.take(index[i : i + 2048])
+            logits = model(*tensors((batch.planes, batch.actions, batch.globals, batch.head), device))[0]
+            logits = logits.masked_fill(~torch.as_tensor(batch.valid, device=device), -torch.inf)
+            same = logits.argmax(1).cpu().numpy() == batch.policy.argmax(1)
+            occupancy = batch.globals[:, GLOBALS.index("occupancy")].astype(np.float64)
+            bands = np.minimum((occupancy * BANDS + 1e-6).astype(int), BANDS - 1)
+            for key in (True, False):
+                inside = biased[bands] == key
+                agree[key][0] += int(same[inside].sum())
+                agree[key][1] += int(inside.sum())
+    return {
+        name: round(agree[key][0] / agree[key][1], 4) if agree[key][1] else None
+        for name, key in (("habit", True), ("other", False))
+    }
+
+
+def distill(
+    pool: ProcessPoolExecutor,
+    teacher: SnakeNet,
+    habit: Habit,
+    config: DistillConfig | None = None,
+    workers: int = 8,
+    device: torch.device | str = "cpu",
+    inference: str = "cpu",
+    anchor: SnakeNet | None = None,
+) -> tuple[SnakeNet, dict[str, Any]]:
+    """A copy of ``teacher`` trained to play ``habit`` with its raw policy, and a report.
+
+    The examples come from :func:`~snake_agent.habits.distillation_examples`, played across ``pool``
+    (evaluating on ``inference``) by ``teacher`` inside the envelope and by ``anchor`` (by default the
+    teacher) outside it; the copy then takes ``config.steps`` optimizer steps on them on ``device``, with
+    random left-right mirroring, minimizing the training losses of :func:`losses`.
+    """
+    config = DistillConfig() if config is None else config
+    specs = config.specs()
+    weights = to_bytes(teacher)
+    anchor_weights = None if anchor is None else to_bytes(anchor)
+    size = max(config.width, config.height)
+    tasks = [
+        (weights, anchor_weights, habit.to_json(), specs[k::workers], config.smoothing, size, inference)
+        for k in range(min(workers, len(specs)))
+    ]
+    parts, stats = [], []
+    for examples, part_stats in pool.map(_distill_task, tasks):
+        if examples is not None:
+            parts.append(examples)
+            stats.append(part_stats)
+    if not parts:
+        raise ValueError("no distillation games")
+    examples = Examples.concatenate(parts)
+    replay = Replay(len(examples))
+    replay.add(examples)
+    student = SnakeNet(teacher.config).to(device)
+    student.load_state_dict(teacher.state_dict())
+    before = agreement(student, examples, habit, device)
+    optimizer = torch.optim.AdamW(student.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    terms = optimize(
+        student, optimizer, replay, config.steps, config.batch, np.random.default_rng(config.seed), device
+    )
+    standard = [m for s in stats for m in s["standard_moves"]]
+    report = {
+        "habit": habit.to_json(),
+        "games": dict(sum((Counter(s["games"]) for s in stats), Counter())),
+        "examples": len(examples),
+        **{
+            key: sum(s[key] for s in stats)
+            for key in ("envelope_decisions", "free_decisions", "afterstates", "changed")
+        },
+        "habit_standard_mean_moves": round(float(np.mean(standard)), 2) if standard else None,
+        "losses": terms,
+        "agreement_before": before,
+        "agreement_after": agreement(student, examples, habit, device),
+    }
+    return student, report
+
+
+@dataclass(frozen=True)
+class HabitConfig:
+    """Settings of :func:`improve_habits`."""
+
+    width: int = 10
+    height: int = 10
+    rounds: int = 2
+    seeds: int = 400
+    """Games per round whose windows compare the habits, a window per band and game."""
+    candidates: tuple[float, ...] = CANDIDATES
+    z: float = 2.0
+    """A band takes a candidate's bias if it saves moves by more than this many standard errors."""
+    distill: DistillConfig = field(default_factory=DistillConfig)
+    workers: int = 8
+    eval_games: int = 300
+    """Validation T1 games of the distilled raw policy after each round, with the shortcut cycle on the same
+    games (0: none)."""
+    seed: int = 0
+    """Run seed: selects the training seeds."""
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.seed < 50 or not 0 < self.rounds <= 100 or not 0 < self.seeds <= 10_000:
+            raise ValueError("the run seed must be in [0, 50), with 1 to 100 rounds of 1 to 10,000 games")
+
+    def compare_seeds(self, round_: int) -> range:
+        """The training seeds of a round's comparison: a block of 10,000 from :data:`COMPARE_SEEDS`."""
+        first = COMPARE_SEEDS + (self.seed * 100 + round_) * 10_000
+        return range(first, first + self.seeds)
+
+
+def _jsonable(value: Any) -> Any:
+    """``value`` with infinite floats as strings, for JSON."""
+    if isinstance(value, float) and math.isinf(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def improve_habits(
+    config: HabitConfig,
+    init: str | Path,
+    out: str | Path,
+    device: str = "cpu",
+    log: Callable[[str], None] = print,
+    anchor: str | Path | None = None,
+) -> SnakeNet:
+    """Rounds of habit improvement from the checkpoint ``init``, written to ``out``; returns the network.
+
+    Each round compares the habits of every band by paired windows (:func:`compare_habits`), keeps the
+    significant improvements (:func:`~snake_agent.habits.improve`) and distills them into the network
+    (:func:`distill`), whose raw policy then plays them; the next round compares habits around the
+    distilled network. Every distillation keeps the play outside the envelope of the checkpoint ``anchor``
+    (by default ``init``), so that it cannot drift from round to round. The run stops early when a round
+    finds nothing to improve. ``log.jsonl`` gets a line per round and ``model-hNN.pt`` the network after
+    round ``NN``; with ``eval_games``, its raw policy plays validation T1 games against the shortcut cycle
+    on the same games.
+    """
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    anchor = init if anchor is None else anchor
+    settings = _jsonable(asdict(config)) | {"init": str(init), "anchor": str(anchor)}
+    (out / "config.json").write_text(json.dumps(settings, indent=2) + "\n")
+    model, _ = load(init, device)
+    anchor_model, _ = load(anchor, device)
+    inference = "cuda" if str(device).startswith("cuda") else "cpu"
+    if inference == "cuda":
+        torch.set_num_threads(2)
+    width, height = config.width, config.height
+    meta = {"config": settings | {"boards": [[width, height, 0]]}}
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(config.workers, mp_context=context, initializer=_init_worker) as pool:
+        shortcut = None
+        if config.eval_games:
+            shortcut = shortcut_t1(pool, width, height, config.eval_games, workers=config.workers)
+        for round_ in range(config.rounds):
+            started = time.perf_counter()
+            comparison = compare_habits(
+                pool,
+                to_bytes(model),
+                Habit(),
+                width,
+                height,
+                config.compare_seeds(round_),
+                config.candidates,
+                inference,
+            )
+            habit, changes = improve(Habit(), comparison, config.z)
+            compared = time.perf_counter()
+            record: dict[str, Any] = {
+                "round": round_ + 1,
+                "habit": habit.to_json(),
+                "habit_text": str(habit),
+                "changes": changes,
+                "comparison": comparison.to_dict(),
+                "seconds": {"compare": round(compared - started, 1)},
+            }
+            if habit.neutral:
+                record["converged"] = True
+            else:
+                settings_ = dataclasses.replace(
+                    config.distill, width=width, height=height, seed=config.seed * 100 + round_
+                )
+                model, record["distill"] = distill(
+                    pool, model, habit, settings_, config.workers, device, inference, anchor_model
+                )
+                record["seconds"]["distill"] = round(time.perf_counter() - compared, 1)
+                save(
+                    model,
+                    out / f"model-h{round_ + 1:02d}.pt",
+                    round=round_ + 1,
+                    habit=habit.to_json(),
+                    **meta,
+                )
+                if shortcut is not None:
+                    evaluation = t1(
+                        pool,
+                        to_bytes(model),
+                        "policy",
+                        width,
+                        height,
+                        config.eval_games,
+                        workers=config.workers,
+                        device=inference,
+                    )
+                    record["t1_policy"] = {
+                        "summary": evaluation.summary().to_dict(),
+                        "versus_shortcut": versus(evaluation, shortcut),
+                    }
+            with open(out / "log.jsonl", "a") as handle:
+                handle.write(json.dumps(_jsonable(record)) + "\n")
+            log(_habit_line(record))
+            if habit.neutral:
+                break
+    return model
+
+
+def _habit_line(record: dict[str, Any]) -> str:
+    """A one-line summary of a round of :func:`improve_habits`."""
+    parts = [f"round {record['round']}", f"habit {record['habit_text']}"]
+    seconds = record["seconds"]
+    parts.append(f"{record['comparison']['windows']} windows {seconds['compare']:.0f}s")
+    if "distill" in record:
+        d = record["distill"]
+        parts.append(
+            f"distilled {d['examples']} examples, agreement in the habit's bands "
+            f"{d['agreement_before']['habit']} -> {d['agreement_after']['habit']}, elsewhere "
+            f"{d['agreement_before']['other']} -> {d['agreement_after']['other']}, "
+            f"the habit's T1 {d['habit_standard_mean_moves']} "
+            f"({seconds['distill']:.0f}s)"
+        )
+    if "t1_policy" in record:
+        t1_ = record["t1_policy"]
+        versus_ = t1_["versus_shortcut"]
+        parts.append(
+            f"T1 policy {t1_['summary']['won']}/{t1_['summary']['games']} {t1_['summary']['mean_moves']}, "
+            f"minus shortcut {versus_['difference']} [{versus_['interval'][0]}, {versus_['interval'][1]}]"
+        )
+    if record.get("converged"):
+        parts.append("converged: no band improves")
     return " | ".join(parts)

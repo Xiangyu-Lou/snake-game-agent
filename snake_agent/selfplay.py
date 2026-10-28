@@ -39,6 +39,8 @@ records its provenance (:class:`Label`):
   search visited but did not play (1, exact). Its moves target is the search's
   value of that move: the search compares exactly those positions, and the
   policy's own games rarely show them.
+* ``TEACHER``: when a habit is distilled (:func:`snake_agent.habits.distillation_examples`),
+  the value the network had before, which the distilled network keeps outside the envelope.
 
 The moves target, for won games only, is a TD(lambda) return over the game's
 fruits, in units of :func:`~snake_agent.encoding.moves_scale`: the moves until
@@ -94,6 +96,7 @@ class Label(IntEnum):
     PROVEN_LOST = 3
     AFTERSTATE = 4
     SIBLING = 5
+    TEACHER = 6
 
 
 # --------------------------------------------------------------------- starts

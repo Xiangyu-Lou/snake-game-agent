@@ -137,6 +137,11 @@ class SearchConfig:
     for little against the prior. None rescales the moves to [0, 1] at each node, as the paper does with
     values, which turns the moves head's errors into full-size differences. The best unit grows with
     those errors: 1 on 4x4, 16 for the 6x6 network at 16 simulations (``snake_agent/README.md``)."""
+    relative_unit: float | None = None
+    """If set, it replaces ``moves_unit``: the unit at a node is this share of
+    :func:`~snake_agent.encoding.moves_scale` of its free cells, the scale the moves head predicts in.
+    Its errors grow with that scale (from about 300 moves at the 6x6 start to 2,425 on 10x10 and 39,700
+    on 20x20), so one share serves every board and every stage of a game."""
     lost_budget: int = 10_000
     """States :func:`~snake_agent.survival.prove_lost` may visit per root move of a free search."""
     search_forced: bool = False
@@ -416,11 +421,10 @@ class _Stats:
         self.win = np.where(visited, q_win, mixed_win)
         self.moves = np.where(visited, q_moves, mixed_moves)
         if mode is Mode.ENVELOPE:
-            q = (
-                _rescale(-self.moves)
-                if config.moves_unit is None
-                else (self.moves.min() - self.moves) / config.moves_unit
-            )
+            unit = config.moves_unit
+            if config.relative_unit is not None:
+                unit = config.relative_unit * moves_scale(node.state.free_cells)
+            q = _rescale(-self.moves) if unit is None else (self.moves.min() - self.moves) / unit
         else:
             q = _lexicographic(self.win, self.moves, config.tie_weight)
         self.sigma = (config.c_visit + visits.max()) * config.c_scale * q

@@ -167,6 +167,8 @@ def train_network(args: argparse.Namespace) -> int:
         midgame_share=args.midgame_share,
         midgame_samples=args.midgame_samples,
         simulations=args.simulations,
+        moves_unit=args.moves_unit,
+        relative_unit=args.relative_unit,
         beta=args.beta,
         moves_lambda=args.moves_lambda,
         sibling_visits=args.sibling_visits,
@@ -185,6 +187,7 @@ def train_network(args: argparse.Namespace) -> int:
         eval_sources=args.eval_sources,
         eval_simulations=args.eval_simulations,
         eval_moves_unit=args.eval_moves_unit,
+        eval_relative_unit=args.eval_relative_unit,
     )
     train(config, args.out, device=args.device or _default_device(), init=args.init)
     return 0
@@ -214,7 +217,12 @@ def assess_network(args: argparse.Namespace) -> int:
             sources=args.sources,
             split=SPLITS[args.split],
             workers=args.workers,
-            search=SearchConfig(simulations=args.simulations, gumbel_scale=0.0, moves_unit=args.moves_unit),
+            search=SearchConfig(
+                simulations=args.simulations,
+                gumbel_scale=0.0,
+                moves_unit=args.moves_unit,
+                relative_unit=args.relative_unit,
+            ),
             device=args.device or _default_device(),
             agents=args.agents,
         )
@@ -295,6 +303,12 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--midgame-samples", type=int, default=2, help="states each game leaves for those")
     tr.add_argument("--simulations", type=int, default=16)
     tr.add_argument(
+        "--moves-unit", type=float, default=1.0, help="the self-play search's unit for comparing moves"
+    )
+    tr.add_argument(
+        "--relative-unit", type=float, help="instead, that unit as a share of the moves scale (e.g. 0.05)"
+    )
+    tr.add_argument(
         "--beta", type=float, default=0.5, help="weight of the search's values in the win targets"
     )
     tr.add_argument(
@@ -325,6 +339,7 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--eval-sources", type=int, default=60, help="T2 source games per assessment")
     tr.add_argument("--eval-simulations", type=int, default=16, help="the assessed search's simulations")
     tr.add_argument("--eval-moves-unit", type=float, default=1.0, help="the assessed search's moves unit")
+    tr.add_argument("--eval-relative-unit", type=float, help="instead, its relative unit")
     tr.add_argument("--device", help="torch device for training (default: cuda if available, else cpu)")
     tr.add_argument("--init", help="start from this checkpoint's weights (a model.pt written by train)")
     tr.set_defaults(run=train_network)
@@ -342,6 +357,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     asm.add_argument(
         "--moves-unit", type=float, default=1.0, help="the search's unit for comparing moves (default: 1)"
+    )
+    asm.add_argument(
+        "--relative-unit", type=float, help="instead, that unit as a share of the moves scale (e.g. 0.05)"
     )
     asm.add_argument("--workers", type=int, default=8)
     asm.add_argument(

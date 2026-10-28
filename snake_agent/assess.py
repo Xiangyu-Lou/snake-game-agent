@@ -516,6 +516,7 @@ def assess(
         "games": games,
         "simulations": search.simulations,
         "moves_unit": search.moves_unit,
+        "relative_unit": search.relative_unit,
     }
     reference = T1_REFERENCES.get((width, height))
     exact = width * height <= 36 and canonical_envelope(width, height) is not None

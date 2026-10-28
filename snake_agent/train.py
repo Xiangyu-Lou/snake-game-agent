@@ -84,6 +84,13 @@ class TrainConfig:
     midgame_pool: int = 20_000
     """Mid-game starts are drawn from the most recent this many states left on each board."""
     simulations: int = 16
+    moves_unit: float | None = 1.0
+    """The self-play search's moves unit (:attr:`~snake_agent.search.SearchConfig.moves_unit`). Its
+    improved policy is the policy target, so it should be no worse than the raw policy: a unit far
+    below the moves head's errors makes the targets chase those errors."""
+    relative_unit: float | None = None
+    """If set, the self-play search's unit is this share of the moves scale instead
+    (:attr:`~snake_agent.search.SearchConfig.relative_unit`)."""
     beta: float = 0.5
     """Weight of the search's values in the win targets."""
     moves_lambda: float = 0.5
@@ -111,6 +118,8 @@ class TrainConfig:
     eval_simulations: int = 16
     eval_moves_unit: float | None = 1.0
     """The search's moves unit in the assessments (:attr:`~snake_agent.search.SearchConfig.moves_unit`)."""
+    eval_relative_unit: float | None = None
+    """If set, the assessed search's relative unit instead."""
 
     def __post_init__(self) -> None:
         if not self.boards or any(games <= 0 for _, _, games in self.boards):
@@ -263,12 +272,13 @@ def _init_worker() -> None:
 
 
 def _self_play_task(args: tuple) -> tuple[list[GameSummary], Examples | None, float]:
-    weights, specs, simulations, beta, moves_lambda, sibling_visits, samples, size, seed, device = args
+    weights, specs, simulations, units, beta, moves_lambda, sibling_visits, samples, size, seed, device = args
     began = time.perf_counter()
     starts = [start for spec in specs if (start := make_start(*spec)) is not None]
     if not starts:
         return [], None, time.perf_counter() - began
-    config = dataclasses.replace(SELF_PLAY, simulations=simulations)
+    unit, relative = units
+    config = dataclasses.replace(SELF_PLAY, simulations=simulations, moves_unit=unit, relative_unit=relative)
     evaluator = NetworkEvaluator(from_bytes(weights), device)
     summaries, examples = play(
         evaluator,
@@ -399,7 +409,10 @@ def train(
     context = multiprocessing.get_context("spawn")
     references = None
     search = SearchConfig(
-        simulations=config.eval_simulations, gumbel_scale=0.0, moves_unit=config.eval_moves_unit
+        simulations=config.eval_simulations,
+        gumbel_scale=0.0,
+        moves_unit=config.eval_moves_unit,
+        relative_unit=config.eval_relative_unit,
     )
     games_played = 0
     summaries: list[GameSummary] = []  # the last generation's games, which price the next one's starts
@@ -413,6 +426,7 @@ def train(
                     weights,
                     [specs[i] for i in group],
                     config.simulations,
+                    (config.moves_unit, config.relative_unit),
                     config.beta,
                     config.moves_lambda,
                     config.sibling_visits,

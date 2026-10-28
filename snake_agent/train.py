@@ -330,16 +330,17 @@ def _starts(
     specs: list[StartSpec] = []
     for width, height, games in config.boards:
         pool = pools.get((width, height), ())
-        counts = {
-            "free": round(config.free_share * games),
-            "prefix": round(config.prefix_share * games),
-            "recovery": round(config.recovery_share * games),
-            "midgame": round(config.midgame_share * games) if pool else 0,
+        shares = {
+            "free": config.free_share,
+            "prefix": config.prefix_share,
+            "recovery": config.recovery_share,
+            "midgame": config.midgame_share if pool else 0.0,
         }
-        counts["standard"] = games - sum(counts.values())
-        if counts["standard"] < 0:  # rounding
-            counts["free"] += counts.pop("standard")
-            counts["standard"] = 0
+        counts, left = {}, games
+        for kind, share in shares.items():
+            counts[kind] = min(round(share * games), left)  # rounding up must not overdraw the games
+            left -= counts[kind]
+        counts["standard"] = left
         for kind, count in counts.items():
             for _ in range(count):
                 extra = config.prefix_fill if kind == "prefix" else None

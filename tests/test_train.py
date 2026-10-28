@@ -107,6 +107,9 @@ def test_the_starts_follow_the_shares_board_by_board():
     }
     assert all(s[4] is state for s in specs if s[0] == "midgame")
     assert all(s[4] == config.prefix_fill for s in specs if s[0] == "prefix")
+    # Shares that round up never ask for more games than the board has.
+    tight = TrainConfig(boards=((4, 4, 3),), free_share=0.0, prefix_share=0.5, recovery_share=0.5)
+    assert Counter(s[0] for s in _starts(tight, 0, {})) == {"prefix": 2, "recovery": 1}
 
 
 def test_a_short_run_writes_its_log_checkpoints_and_assessment(tmp_path):

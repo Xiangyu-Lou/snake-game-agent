@@ -12,7 +12,7 @@ from snake_agent.network import NetworkConfig, load  # noqa: E402
 from snake_agent.search import Prediction  # noqa: E402
 from snake_agent.seeds import check_training_seed  # noqa: E402
 from snake_agent.selfplay import play, standard_starts  # noqa: E402
-from snake_agent.train import Replay, TrainConfig, _starts, mirrored, train  # noqa: E402
+from snake_agent.train import Replay, TrainConfig, _starts, balanced, mirrored, train  # noqa: E402
 
 
 def uniform(queries):
@@ -146,3 +146,11 @@ def test_a_short_run_writes_its_log_checkpoints_and_assessment(tmp_path):
             tmp_path / "x",
             init=tmp_path / "model-002.pt",
         )
+
+
+def test_workers_get_starts_of_similar_total_cost():
+    costs = [9.0, 1.0, 5.0, 5.0, 4.0, 3.0, 3.0, 2.0]
+    groups = balanced(costs, 3)
+    assert sorted(i for group in groups for i in group) == list(range(8))
+    assert sorted(sum(costs[i] for i in group) for group in groups) == [10.0, 11.0, 11.0]
+    assert balanced([1.0], 4) == [[0]]

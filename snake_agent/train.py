@@ -262,14 +262,15 @@ def _init_worker() -> None:
     torch.set_num_threads(1)
 
 
-def _self_play_task(args: tuple) -> tuple[list[GameSummary], Examples | None]:
+def _self_play_task(args: tuple) -> tuple[list[GameSummary], Examples | None, float]:
     weights, specs, simulations, beta, moves_lambda, sibling_visits, samples, size, seed, device = args
+    began = time.perf_counter()
     starts = [start for spec in specs if (start := make_start(*spec)) is not None]
     if not starts:
-        return [], None
+        return [], None, time.perf_counter() - began
     config = dataclasses.replace(SELF_PLAY, simulations=simulations)
     evaluator = NetworkEvaluator(from_bytes(weights), device)
-    return play(
+    summaries, examples = play(
         evaluator,
         starts,
         TRAINING_RULES,
@@ -281,6 +282,29 @@ def _self_play_task(args: tuple) -> tuple[list[GameSummary], Examples | None]:
         sibling_visits=sibling_visits,
         samples=samples,
     )
+    return summaries, examples, time.perf_counter() - began
+
+
+def balanced(costs: list[float], parts: int) -> list[list[int]]:
+    """Indices of ``costs`` split into ``parts`` groups of similar total cost: each item, the costliest
+    first, joins the group with the least cost so far (the longest-processing-time rule)."""
+    groups: list[list[int]] = [[] for _ in range(min(parts, len(costs)))]
+    loads = [0.0] * len(groups)
+    for i in sorted(range(len(costs)), key=lambda i: -costs[i]):
+        k = loads.index(min(loads))
+        groups[k].append(i)
+        loads[k] += costs[i]
+    return [sorted(group) for group in groups]
+
+
+def _costs(specs: list[StartSpec], summaries: list[GameSummary]) -> list[float]:
+    """Each start's expected self-play cost: the mean leaves of the last generation's games of its board
+    and kind (``cells^1.5`` for a board and kind not seen yet, the scale of a game's moves)."""
+    leaves: dict[tuple[tuple[int, int], str], list[int]] = {}
+    for s in summaries:
+        leaves.setdefault((s.board, s.kind), []).append(max(s.leaves, s.moves))
+    mean = {key: float(np.mean(values)) for key, values in leaves.items()}
+    return [mean.get(((w, h), kind), float(w * h) ** 1.5) for kind, w, h, _, _ in specs]
 
 
 StartSpec = tuple[str, int, int, int, Any]
@@ -378,16 +402,16 @@ def train(
         simulations=config.eval_simulations, gumbel_scale=0.0, moves_unit=config.eval_moves_unit
     )
     games_played = 0
+    summaries: list[GameSummary] = []  # the last generation's games, which price the next one's starts
     with ProcessPoolExecutor(config.workers, mp_context=context, initializer=_init_worker) as pool:
         for generation in range(config.generations):
             started = time.perf_counter()
             weights = to_bytes(model)
             specs = _starts(config, generation, pools)
-            order = np.random.default_rng([config.seed, generation]).permutation(len(specs))
             tasks = [
                 (
                     weights,
-                    [specs[i] for i in order[k :: config.workers]],
+                    [specs[i] for i in group],
                     config.simulations,
                     config.beta,
                     config.moves_lambda,
@@ -397,11 +421,12 @@ def train(
                     (config.seed, generation, k),
                     inference,
                 )
-                for k in range(min(config.workers, len(specs)))
+                for k, group in enumerate(balanced(_costs(specs, summaries), config.workers))
             ]
-            summaries, parts = [], []
-            for task_summaries, examples in pool.map(_self_play_task, tasks):
+            summaries, parts, busy = [], [], []
+            for task_summaries, examples, seconds in pool.map(_self_play_task, tasks):
                 summaries += task_summaries
+                busy.append(seconds)
                 if examples is not None:
                     parts.append(examples)
             examples = Examples.concatenate(parts)
@@ -431,6 +456,7 @@ def train(
                 "throughput": {
                     "moves_per_second": round(moves / max(played - started, 1e-9), 1),
                     "leaves_per_second": round(leaves / max(played - started, 1e-9), 1),
+                    "worker_busy": round(float(np.mean(busy)) / max(max(busy), 1e-9), 3),
                 },
             }
             save(model, out / "model.pt", generation=generation, config=asdict(config))

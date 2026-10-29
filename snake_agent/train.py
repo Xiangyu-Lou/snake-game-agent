@@ -97,6 +97,17 @@ class TrainConfig:
     relative_unit: float | None = None
     """If set, the self-play search's unit is this share of the moves scale instead
     (:attr:`~snake_agent.search.SearchConfig.relative_unit`)."""
+    win_unit: float | None = None
+    """The self-play search's free-mode win unit (:attr:`~snake_agent.search.SearchConfig.win_unit`)."""
+    full_share: float = 1.0
+    """Playout-cap randomization: the share of moves that get the full search and give policy targets;
+    the others get ``fast_simulations`` (see :func:`~snake_agent.selfplay.play`)."""
+    fast_simulations: int = 0
+    confident: float | None = None
+    """The self-play search skips roots whose prior is this confident when nothing is at stake
+    (:attr:`~snake_agent.search.SearchConfig.confident`)."""
+    max_examples: int = 0
+    """The most examples one game gives (0: all); longer games give a uniform sample of their states."""
     beta: float = 0.5
     """Weight of the search's values in the win targets."""
     moves_lambda: float = 0.5
@@ -126,6 +137,10 @@ class TrainConfig:
     """The search's moves unit in the assessments (:attr:`~snake_agent.search.SearchConfig.moves_unit`)."""
     eval_relative_unit: float | None = None
     """If set, the assessed search's relative unit instead."""
+    eval_confident: float | None = None
+    """The assessed search's adaptive budget (:attr:`~snake_agent.search.SearchConfig.confident`)."""
+    eval_win_unit: float | None = None
+    """The assessed search's free-mode win unit."""
 
     def __post_init__(self) -> None:
         if not self.boards or any(games <= 0 for _, _, games in self.boards):
@@ -135,6 +150,8 @@ class TrainConfig:
                 f"at most {GAMES_PER_GENERATION_LIMIT} games per generation "
                 f"and {GENERATION_LIMIT} generations"
             )
+        if not 0.0 < self.full_share <= 1.0:
+            raise ValueError("the full-search share must be in (0, 1]")
         shares = self.free_share + self.prefix_share + self.recovery_share + self.midgame_share
         if min(self.free_share, self.prefix_share, self.recovery_share, self.midgame_share) < 0 or shares > 1:
             raise ValueError("the start shares must be non-negative and add up to at most 1")
@@ -278,26 +295,14 @@ def _init_worker() -> None:
 
 
 def _self_play_task(args: tuple) -> tuple[list[GameSummary], Examples | None, float]:
-    weights, specs, simulations, units, beta, moves_lambda, sibling_visits, samples, size, seed, device = args
+    weights, specs, search, options, size, seed, device = args
     began = time.perf_counter()
     starts = [start for spec in specs if (start := make_start(*spec)) is not None]
     if not starts:
         return [], None, time.perf_counter() - began
-    unit, relative = units
-    config = dataclasses.replace(SELF_PLAY, simulations=simulations, moves_unit=unit, relative_unit=relative)
     evaluator = NetworkEvaluator(from_bytes(weights), device)
-    summaries, examples = play(
-        evaluator,
-        starts,
-        TRAINING_RULES,
-        config,
-        seed=seed,
-        beta=beta,
-        moves_lambda=moves_lambda,
-        size=size,
-        sibling_visits=sibling_visits,
-        samples=samples,
-    )
+    summaries, examples = play(evaluator, starts, TRAINING_RULES, search, seed=seed, size=size, **options)
+    evaluator.release()
     return summaries, examples, time.perf_counter() - began
 
 
@@ -420,7 +425,26 @@ def train(
         gumbel_scale=0.0,
         moves_unit=config.eval_moves_unit,
         relative_unit=config.eval_relative_unit,
+        confident=config.eval_confident,
+        win_unit=config.eval_win_unit,
     )
+    self_play = dataclasses.replace(
+        SELF_PLAY,
+        simulations=config.simulations,
+        moves_unit=config.moves_unit,
+        relative_unit=config.relative_unit,
+        confident=config.confident,
+        win_unit=config.win_unit,
+    )
+    options = {
+        "beta": config.beta,
+        "moves_lambda": config.moves_lambda,
+        "sibling_visits": config.sibling_visits,
+        "samples": config.midgame_samples,
+        "full_share": config.full_share,
+        "fast_simulations": config.fast_simulations,
+        "max_examples": config.max_examples,
+    }
     games_played = 0
     summaries: list[GameSummary] = []  # the last generation's games, which price the next one's starts
     with ProcessPoolExecutor(config.workers, mp_context=context, initializer=_init_worker) as pool:
@@ -432,12 +456,8 @@ def train(
                 (
                     weights,
                     [specs[i] for i in group],
-                    config.simulations,
-                    (config.moves_unit, config.relative_unit),
-                    config.beta,
-                    config.moves_lambda,
-                    config.sibling_visits,
-                    config.midgame_samples,
+                    self_play,
+                    options,
                     config.canvas,
                     (config.seed, generation, k),
                     inference,
@@ -553,7 +573,9 @@ DISTILL_SEEDS = 450_000_000
 def _compare_task(args: tuple) -> Comparison:
     weights, habit, width, height, seeds, candidates, device = args
     evaluator = NetworkEvaluator(from_bytes(weights), device)
-    return compare(evaluator, Habit.from_json(habit), width, height, seeds, candidates)
+    comparison = compare(evaluator, Habit.from_json(habit), width, height, seeds, candidates)
+    evaluator.release()
+    return comparison
 
 
 def compare_habits(
@@ -627,9 +649,11 @@ def _distill_task(args: tuple) -> tuple[Examples | None, dict[str, Any]]:
         return None, {}
     evaluator = NetworkEvaluator(from_bytes(weights), device)
     anchor_ = evaluator if anchor is None else NetworkEvaluator(from_bytes(anchor), device)
-    return distillation_examples(
+    result = distillation_examples(
         evaluator, Habit.from_json(habit), starts, anchor=anchor_, size=size, smoothing=smoothing
     )
+    evaluator.release()
+    return result
 
 
 def agreement(

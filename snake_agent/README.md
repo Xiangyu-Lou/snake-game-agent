@@ -12,7 +12,11 @@ assessment and a moves unit that scales with the board
 ([below](#m2-88-and-1010-recovery)). **Habits** then make the 10×10 agent
 faster than the shortcut cycle on T1: jump biases per band of fill, compared on
 paired games and distilled into the network
-([below](#habits-faster-than-the-shortcut-cycle-on-1010)).
+([below](#habits-faster-than-the-shortcut-cycle-on-1010)). Milestone **M3,
+20×20**, adds adaptive search budgets, a win unit for free play and bounded GPU
+memory, and meets its gate: on the test seeds the agent wins every T1 game,
+faster than the shortcut cycle, and beats the reference policies on T2
+([below](#m3-2020)).
 
 M0's gate is met: the tests pass, and the harness reproduces the reference
 numbers of the [Architecture B probe](../analysis/architecture_b_probe.py):
@@ -27,6 +31,7 @@ analytic network cost model ([below](#reproducing-the-probe)).
 - [M1: self-play on 4×4 and 6×6](#m1-self-play-on-44-and-66)
 - [M2: 8×8 and 10×10, recovery](#m2-88-and-1010-recovery)
 - [Habits: faster than the shortcut cycle on 10×10](#habits-faster-than-the-shortcut-cycle-on-1010)
+- [M3: 20×20](#m3-2020)
 - [Reproducing the probe](#reproducing-the-probe)
 - [Package layout](#package-layout)
 
@@ -40,13 +45,18 @@ python -m snake_agent solve --board 4x4                                        #
 python -m snake_agent reproduce [--full]                                       # the probe's numbers
 pytest [--slow]                                                                # --slow: full reproduction
 
-pip install -e ".[train]"                                                      # PyTorch, for M1 and M2
+pip install -e ".[train]"                                                      # PyTorch, for M1 to M3
 python -m snake_agent train --board 6x6 --out runs/m1-6x6 --device cuda        # self-play and training
 python -m snake_agent assess runs/m1-6x6/model.pt --games 300                  # the M1 gates
 python -m snake_agent train --board 10x10:160 --board 8x8:48 --board 6x6:48 \
     --relative-unit 0.3 --eval-relative-unit 0.3 --out runs/m2 --device cuda   # a board mixture
 python -m snake_agent assess runs/m2/model.pt --relative-unit 0.3 --sources 100  # the M2 gates (10x10)
 python -m snake_agent habits runs/m2/model.pt --out runs/habits --device cuda     # jump habits, distilled
+python -m snake_agent habits runs/habits/model-h02.pt --board 20x20 --seeds 120 --standard 24 --prefix 8 \
+    --free 12 --recovery 12 --steps 1000 --eval-games 44 --anchor runs/habits/model-h02.pt \
+    --out runs/m3-habits --device cuda                                         # 20x20 habits (M3)
+python -m snake_agent assess runs/m3-habits/model-h01.pt --board 20x20 --games 299 --sources 500 \
+    --relative-unit 0.3 --win-unit 0.3 --confident 0 --careful-fill 0 --split test  # the M3 gate
 ```
 
 ```python
@@ -892,6 +902,192 @@ elsewhere plays 1,427.2 moves; the rule below 50% and the network above, 1,423.0
 (13.8 fewer than the shortcut cycle). These hybrids use a reference policy's
 moves, so they are not track T3 agents; the habits pass them without that rule.
 
+## M3: 20×20
+
+M3 takes the agent to the full 20×20 board. Its gate: a 100-game development
+run, then 299 T1 games with no failures and mean moves below the shortcut
+cycle's 20,737, plus T2 at 20×20 against the reference policies. The plan's
+work: fine-tune from M2, adaptive budgets, batched leaves, and a Transformer
+only if the CNN's errors point to capacity or long-range limits.
+
+**Status:** the gate is met on the test seeds
+([below](#the-m3-gate-test-seeds)). The search with the adaptive budget wins all
+299 T1 games in 20,581.4 moves on average, 301.1 fewer than the shortcut cycle
+on the same games, and beats the best reference policy in every T2 band. Its
+network is the habits' 10×10 network after one round of habits on 20×20; the
+agent plays its prior inside the envelope and searches free play with a win
+unit.
+
+### What M3 adds
+
+- **Adaptive budgets** (review §2.4):
+  - *Confident priors* (`SearchConfig.confident`, `assess --confident`): the
+    root is evaluated but not searched when the prior gives its likeliest move
+    at least that probability and nothing is at stake beyond moves: inside the
+    envelope always, in free mode only when every move left is certified and
+    the board is less than `careful_fill` (70%) full. Such a move has no policy
+    target (`SearchResult.skipped`).
+  - *Playout-cap randomization* (`--full-share`, `--fast-simulations`; Wu,
+    2019): in self-play only that share of the moves get the full search and
+    give policy targets; the others play the prior's likeliest move, or a small
+    search, without Gumbel noise.
+- **A free-mode win unit** (`SearchConfig.win_unit`, `--win-unit`,
+  `--eval-win-unit`, `assess --win-unit`), below.
+- **An example cap** (`--max-examples`): a game gives at most that many of its
+  states, drawn uniformly, and only those are encoded. A 20×20 game is about
+  22,000 moves, and an example on a 20×20 canvas takes 20 kB.
+- **Bounded GPU memory**: `NetworkEvaluator` evaluates at most 256 queries per
+  network call (`max_batch`) and its workers give their cached memory back
+  after each task (`release`). A batch of 1,024 on a 20×20 canvas left each
+  worker holding about a gigabyte, and two jobs of a dozen workers each ran the
+  GPU out of memory.
+- **Batched leaves** were already in place: self-play has evaluated one pending
+  leaf per game in one network call since M1, and assessments since M2. On
+  20×20 the cost per leaf is the Python work around it: a profile of 20×20
+  searches puts the encoding at about 0.8 ms per leaf, the move classes at 0.3
+  ms, and the search's own bookkeeping at 0.1 to 0.2 ms, against well under a
+  millisecond for a batched network call. Halving it needs compiled code (the
+  review's Numba or JAX step), a separate change with a new dependency.
+
+### Zero-shot, and the win unit
+
+M2's networks have never seen a 20×20 board. Validation seeds, 44 T1 games and
+the T2 starts of 44 source games (29, 8 and 4 by band):
+
+| Agent | T1 mean moves (95% interval) | T2 won by band |
+| --- | ---: | --- |
+| M2's checkpoint, raw policy | 22,139.7 (21,908.9–22,370.5) | 17, 0, 1 |
+| M2's checkpoint, search (0.3 moves unit) | 24,734.3 (24,450.0–25,018.6) | 0, 1, 3 |
+| The same search, win unit 0.3 | | 20, 4, 3 |
+| The same search, win unit 0.1 | | 21, 1, 3 |
+| The habits checkpoint, raw policy | **20,947.9** (20,758.5–21,137.5) | |
+| Best reference policy | | 31%, 13%, 50% |
+
+The search won none of the 29 starts of the 30% band (27 deaths and 2
+timeouts, after nine fruits on average), where the raw policy wins 17. Free mode compared win values rescaled to [0, 1]
+at every node, so on a board the win head barely knows its noise decided every
+move. With a win unit, `(win − best) / win_unit` is compared instead, so that
+differences far below the unit count for little against the prior, and certain
+wins tied at 1 are ordered by the moves unit: the M2 fix for moves, applied to
+win values. At 0.3 the same network's search wins 27 of the 41 starts. The
+habits' 10×10 checkpoint, whose bands of fill are size-independent, plays 20×20
+T1 6% faster than M2's and within 1% of the shortcut cycle, so M3 starts from
+it.
+
+### Habit rounds on 20×20, and self-play
+
+Two runs started from the habits checkpoint at once, on 10 and 12 of the
+server's workers:
+
+- **Habit rounds** (`runs/m3-habits`): `habits --board 20x20` with 120 windows
+  per band and the default candidate biases. Every distillation was anchored to
+  the starting network: 24 standard and 8 prefix games, 12 free and 12 recovery
+  games, and 1,000 steps. The first round took 27 minutes of windows and 3 of
+  distillation. It changed six bands:
+
+  | Band of fill | New bias | Moves saved per window |
+  | --- | --- | ---: |
+  | 0–5% | +0.15 | 3.9 ± 1.9 |
+  | 5–10% | +0.15 | 2.8 ± 1.2 |
+  | 55–60% | −0.15 | 64.4 ± 26.4 |
+  | 60–65% | −0.15 | 142.4 ± 24.7 |
+  | 65–70% | −∞ (follow the cycle) | 102.2 ± 21.2 |
+  | 70–75% | −∞ | 38.8 ± 11.9 |
+
+  The habits carried over from 10×10 jump too much in the second half of a
+  20×20 game, where a jump leaves holes for many more fruits to fall into. The
+  distilled network's raw policy plays 44 validation games in 20,622.6 moves,
+  282.6 fewer than the shortcut cycle on the same games (95% interval 150.4 to
+  414.9). The second round found no band to improve (2,400 more windows), and
+  the run stopped.
+- **Self-play** (`runs/m3-self`): the M2 recipe on a mixture of 20×20, 14×14
+  and 10×10 (16, 16 and 32 games per generation), with 30% mid-game and 20%
+  recovery starts, a 32-simulation search on a quarter of the moves
+  (playout-cap randomization), 0.3 units for moves and wins, and at most 2,000
+  examples per game. A generation took 6 to 8 minutes. At generation 6 its raw
+  policy played 24 validation games in 20,830.4 moves and its search in
+  20,915.5. Both were no better than the habits checkpoint, while its 10×10
+  self-play games rose from 1,383 moves to between 1,416 and 1,484 (8 games a
+  generation). As on 10×10, the search
+  cannot see what the habits encode, so self-play does not add to them, and the
+  run was stopped there. A first self-play run from M2's own checkpoint
+  (`runs/m3-from-m2`) played its 20×20 self-play games in about 24,000 moves
+  over 5 generations.
+
+### The development run
+
+The plan's 100-game development run, on validation seeds, of the habit round's
+network (`runs/m3-habits/model-h01.pt`), 0.3 units, with the T2 starts of 100
+source games (62, 16 and 6 by band):
+
+| Agent | T1 mean moves (95% interval) | Against the shortcut cycle, same games | T2 won by band |
+| --- | ---: | ---: | --- |
+| Raw policy | **20,547.4** (20,417.8–20,677.0) | **−319.0** (−401.1 to −236.9) | 43, 1, 2 |
+| Search, 16 simulations | 20,791.2 (20,645.7–20,936.7) | −75.2 (−186.0 to +35.6) | 44, 6, 4 |
+| Shortcut cycle | 20,866.4 | | |
+| Best reference policy | | | 32%, 6%, 33% |
+
+Every game was won inside the envelope. The raw policy is the faster player and
+the search the safer one: in free mode its win unit lets it avoid traps the
+policy walks into. Inside the envelope the search has not beaten the policy on
+10×10 or 20×20. So the gate's search agent uses the adaptive budget to the full:
+`confident=0` and `careful_fill=0` trust the prior at every envelope decision
+(nothing is at stake there but moves) and search every free decision. On T1 it
+plays the raw policy's moves, and on T2 the search's.
+
+### The M3 gate, test seeds
+
+The same network and settings on the test seeds: 299 T1 games, with the
+shortcut cycle on the same games, and the T2 starts of 500 source games (327,
+113 and 38 by band), with the three references on the same starts. Inside the
+envelope the adaptive search plays the raw policy's moves, so the two agents
+play the same T1 games:
+
+| Agent | T1 won | T1 mean moves (95% interval) | Against the shortcut cycle, same games | T1 gate (below 20,737) | T2 won by band (95% lower bounds) | T2 gate |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| Search with the adaptive budget | 299 | **20,581.4** (20,500.5–20,662.3) | **−301.1** (−350.8 to −251.4) | passed | **252, 63, 30** (0.721, 0.461, 0.627) | **passed** |
+| Raw policy | 299 | 20,581.4 | −301.1 | passed | 239, 10, 8 (0.679, 0.043, 0.096) | failed |
+| Shortcut cycle | 299 | 20,882.5 | | | | |
+| Best reference policy | | | | | 42.5%, 11.5%, 26.3% | |
+
+**The M3 gate is met** by the search with the adaptive budget. No T1 game
+failed: with 299 games, the one-sided 95% bound on the failure rate is under
+1%, the completion gate the architecture report first asked for. Every game
+stayed inside the envelope, and the agent is 301 moves faster than the
+shortcut cycle on the same games, not only below the probe's reference mean.
+On T2 it beats the best reference in every band, by a wide margin where the
+references fail most. The raw policy plays the same T1 games but walks into
+traps on recovery starts that the search, reading the win head through its
+unit, avoids.
+
+### No Transformer yet
+
+The plan keeps the CNN unless its errors point to capacity or long-range
+limits, and none do. Its receptive field covers 25 cells, plus a global-pooling
+bias in every block, and the long-range structure that matters enters as exact
+input planes: the canonical cycle's order, the envelope's free arc, the holes
+behind the tail. The distilled network plays the 20×20 habit at 99.9% of the
+envelope decisions of the bands it changed. What limited T1 on both boards was
+a training signal (one-step comparisons cannot see a habit), and what limited
+T2 on 20×20 was how the search read the win head, not what the head could
+represent. A Transformer would cost about 2.6 times the CNN per evaluation
+(review §2.6), where per-leaf Python work already sets the pace.
+
+### Costs on the server
+
+With 22 workers on the RTX 4090 and its 24.5-CPU quota (shared part of the
+time with another session's jobs), and MPS:
+
+- a 20×20 habit round with 120 windows per band: 24 to 27 minutes of windows
+  on 10 workers and 3 of distillation, then the 44 checking games;
+- a self-play generation of the mixture above: 6 to 8 minutes on 12 workers;
+- the development run (100 T1 games of both agents and the shortcut cycle, and
+  the T2 starts of 100 source games for both agents and the three references):
+  44 minutes on 22 workers;
+- the test gate (299 T1 games, and the 478 T2 starts of 500 source games): 41
+  minutes on 22 workers, the adaptive budget playing T1 at the raw policy's
+  cost.
+
 ## Reproducing the probe
 
 `python -m snake_agent reproduce` (about 20 seconds) replays the probe's
@@ -931,10 +1127,10 @@ survivable.
 | [`seeds.py`](seeds.py), [`stats.py`](stats.py) | held-out seed ranges; binomial and mean intervals |
 | [`reproduce.py`](reproduce.py) | the probe's reference numbers |
 | [`encoding.py`](encoding.py) | M1: the network inputs, `mirror`, `moves_scale`, `canonical_envelope` |
-| [`search.py`](search.py) | M1: Gumbel root search, `SearchAgent`, `PolicyAgent`, `policy_move`; M2: the relative unit |
-| [`network.py`](network.py) | M1: `SnakeNet`, `NetworkEvaluator`, checkpoints (PyTorch) |
-| [`selfplay.py`](selfplay.py) | M1 and M2: batched self-play, the kinds of start, training examples |
-| [`train.py`](train.py) | M1 and M2: the training loop over board mixtures, worker balancing; `distill`, `improve_habits` (PyTorch) |
+| [`search.py`](search.py) | M1: Gumbel root search, `SearchAgent`, `PolicyAgent`, `policy_move`; M2: the relative unit; M3: the win unit and adaptive budgets |
+| [`network.py`](network.py) | M1: `SnakeNet`, `NetworkEvaluator` (M3: bounded batches, `release`), checkpoints (PyTorch) |
+| [`selfplay.py`](selfplay.py) | M1 to M3: batched self-play, the kinds of start, training examples, playout caps |
+| [`train.py`](train.py) | M1 to M3: the training loop over board mixtures, worker balancing; `distill`, `improve_habits` (PyTorch) |
 | [`assess.py`](assess.py) | M1 and M2: batched assessment against the gates, the shortcut cycle on the same seeds (PyTorch) |
 | [`habits.py`](habits.py) | `Habit`, `HabitEvaluator`, paired windows (`compare`), `improve`, distillation examples |
 | [`__main__.py`](__main__.py) | `python -m snake_agent evaluate | solve | reproduce | train | assess | habits` |

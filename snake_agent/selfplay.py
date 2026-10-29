@@ -317,8 +317,16 @@ class GameSummary:
 class _Game:
     """One self-play game: the live game, its search in progress and its record."""
 
-    def __init__(self, start: Start, rules: Rules, config: SearchConfig) -> None:
+    def __init__(
+        self,
+        start: Start,
+        rules: Rules,
+        config: SearchConfig,
+        fast: SearchConfig | None = None,
+        full_share: float = 1.0,
+    ) -> None:
         self.start, self.rules, self.config = start, rules, config
+        self.fast, self.full_share, self.full = fast, full_share, True
         self.game = start.game()
         self.prefix, self.start_length = self.game.steps if start.prefix else 0, self.game.length
         self.epoch = _Epoch()
@@ -335,7 +343,9 @@ class _Game:
         while self.outcome is None:
             if self.search is None:
                 self.state = self.game.state()
-                self.search = search(self.state, self.rules, self.config, rng, self.epoch.observe(self.state))
+                self.full = self.fast is None or rng.random() < self.full_share
+                config = self.config if self.full else self.fast
+                self.search = search(self.state, self.rules, config, rng, self.epoch.observe(self.state))
             value, self.value = self.value, None
             try:
                 query = self.search.send(value)
@@ -343,7 +353,10 @@ class _Game:
                 return query
             except StopIteration as stop:
                 self.search = None
-                self._move(stop.value)
+                result = stop.value
+                if not self.full and not result.forced:
+                    result = dataclasses.replace(result, skipped=True)  # a fast move: no policy target
+                self._move(result)
         return None
 
     def _move(self, result: SearchResult) -> None:
@@ -369,7 +382,7 @@ class _Game:
             self.game.length - self.start_length,
             self.game.length,
             self.start_length,
-            sum(not result.forced for _, result in self.steps),
+            sum(not result.forced and not result.skipped for _, result in self.steps),
             self.prefix,
             (self.game.width, self.game.height),
             self.leaves,
@@ -377,11 +390,20 @@ class _Game:
         )
 
     def examples(
-        self, beta: float, moves_lambda: float, values: Sequence[float], size: int, sibling_visits: int = 0
+        self,
+        beta: float,
+        moves_lambda: float,
+        values: Sequence[float],
+        size: int,
+        sibling_visits: int = 0,
+        cap: int = 0,
+        rng: np.random.Generator | None = None,
     ) -> list[tuple]:
         """The game's examples as rows: (encoding, width, valid, policy, has_policy, win, moves, has_moves,
         label, free). ``values`` are the network's moves values of the afterstates (won games only);
-        with ``sibling_visits``, envelope moves visited that often but not played give examples too."""
+        with ``sibling_visits``, envelope moves visited that often but not played give examples too. With
+        a ``cap``, a longer game gives that many of its states, drawn uniformly with ``rng``, so that long
+        games do not crowd the buffer (review §2.5); only those are encoded."""
         won = self.outcome is Outcome.WON
         z = float(won)
         eats = [t for t, _ in self.afterstates]
@@ -390,9 +412,15 @@ class _Game:
             if won
             else ([0.0] * len(self.steps), [])
         )
+        total = len(self.steps) + len(self.afterstates)
+        keep = None
+        if cap and total > cap:
+            keep = set((rng or np.random.default_rng()).choice(total, size=cap, replace=False).tolist())
         rows = []
         for t, (state, result) in enumerate(self.steps):
-            searched = not result.forced and not result.lost
+            if keep is not None and t not in keep:
+                continue
+            searched = not result.forced and not result.lost and not result.skipped
             if result.mode is Mode.ENVELOPE:
                 win, label = 1.0, Label.ENVELOPE
             elif result.lost:
@@ -420,13 +448,15 @@ class _Game:
             if sibling_visits and searched and result.mode is Mode.ENVELOPE:
                 rows += self._siblings(state, result, sibling_visits, size)
         for k, (t, after) in enumerate(self.afterstates):
+            if keep is not None and len(self.steps) + k not in keep:
+                continue
             _, following = self.steps[t + 1]
             moves = afters[k] / moves_scale(after.free_cells) if won else 0.0
             if envelope_certain(after, self.rules) or following.mode is Mode.ENVELOPE:
                 win, label = 1.0, Label.ENVELOPE
             else:
                 win, label = z, Label.AFTERSTATE
-                if not following.forced and not following.lost:
+                if not following.forced and not following.lost and not following.skipped:
                     win = (1.0 - beta) * z + beta * following.value_win
             rows.append(
                 (
@@ -540,6 +570,9 @@ def play(
     size: int | None = None,
     sibling_visits: int = 0,
     samples: int = 0,
+    full_share: float = 1.0,
+    fast_simulations: int = 0,
+    max_examples: int = 0,
 ) -> tuple[list[GameSummary], Examples]:
     """Play a game from each start, all at once, and return their summaries and training examples.
 
@@ -552,13 +585,22 @@ def play(
     for the moves targets. With ``sibling_visits``, envelope moves the search
     visited that often but did not play give examples too (``Label.SIBLING``).
     Each summary keeps ``samples`` of its game's states for mid-game starts.
+
+    Playout-cap randomization (review §2.4): with ``full_share`` below 1, only
+    that share of the moves get the full search; the others get
+    ``fast_simulations`` without Gumbel noise (0: the prior's likeliest move)
+    and give no policy target. ``max_examples`` caps the examples of each game
+    (see :meth:`_Game.examples`).
     """
     if not rules.fruit_timeout:
         raise ValueError("self-play needs the fruit timeout, which turns loops into losses")
     if not starts:
         raise ValueError("no starts")
     rng = np.random.default_rng(seed)
-    games = [_Game(start, rules, config) for start in starts]
+    fast = None
+    if full_share < 1.0:
+        fast = dataclasses.replace(config, simulations=fast_simulations, gumbel_scale=0.0)
+    games = [_Game(start, rules, config, fast, full_share) for start in starts]
     waiting = games
     while waiting:
         asking, queries = [], []
@@ -580,7 +622,7 @@ def play(
     rows = []
     for game in games:
         mine = [next(values) for _ in game.afterstates] if game.outcome is Outcome.WON else []
-        rows += game.examples(beta, moves_lambda, mine, size, sibling_visits)
+        rows += game.examples(beta, moves_lambda, mine, size, sibling_visits, max_examples, rng)
     return [game.summary(samples, rng) for game in games], _to_examples(rows)
 
 

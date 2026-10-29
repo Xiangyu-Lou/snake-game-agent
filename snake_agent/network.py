@@ -138,25 +138,33 @@ def tensors(
 class NetworkEvaluator:
     """Evaluates the search's queries with a network (an :data:`~snake_agent.search.Evaluator`).
 
-    Queries are encoded on a canvas as large as the largest board among them.
+    Queries are encoded on a canvas as large as the largest board among them, and evaluated at most
+    ``max_batch`` at a time: on a GPU shared by many worker processes, each keeps a cache as large as its
+    largest batch (a batch of 1,024 on a 20x20 canvas leaves about a gigabyte).
     """
 
-    def __init__(self, model: SnakeNet, device: torch.device | str = "cpu") -> None:
+    def __init__(self, model: SnakeNet, device: torch.device | str = "cpu", max_batch: int = 256) -> None:
         self.model = model.to(device).eval()
         self.device = device
+        self.max_batch = max_batch
 
     @torch.no_grad()
     def __call__(self, queries: Sequence[Query]) -> Prediction:
         size = max(max(q.state.width, q.state.height) for q in queries)
-        encoded = [
-            encode(q.state, q.rules, size, afterstate=q.afterstate, classes=q.classes) for q in queries
-        ]
-        logits, win, moves = self.model(*tensors(stack(encoded), self.device))
-        return Prediction(
-            logits.double().cpu().numpy(),
-            torch.sigmoid(win).double().cpu().numpy(),
-            moves.double().cpu().numpy(),
-        )
+        parts = []
+        for i in range(0, len(queries), self.max_batch):
+            encoded = [
+                encode(q.state, q.rules, size, afterstate=q.afterstate, classes=q.classes)
+                for q in queries[i : i + self.max_batch]
+            ]
+            logits, win, moves = self.model(*tensors(stack(encoded), self.device))
+            parts.append((logits, torch.sigmoid(win), moves))
+        return Prediction(*(torch.cat([part[k] for part in parts]).double().cpu().numpy() for k in range(3)))
+
+    def release(self) -> None:
+        """Give the GPU memory this process cached back to the device, for other processes."""
+        if str(self.device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
 
 # --------------------------------------------------------------- checkpoints

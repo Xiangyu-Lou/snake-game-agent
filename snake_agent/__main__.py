@@ -170,6 +170,11 @@ def train_network(args: argparse.Namespace) -> int:
         simulations=args.simulations,
         moves_unit=args.moves_unit,
         relative_unit=args.relative_unit,
+        win_unit=args.win_unit,
+        full_share=args.full_share,
+        fast_simulations=args.fast_simulations,
+        confident=args.confident,
+        max_examples=args.max_examples,
         beta=args.beta,
         moves_lambda=args.moves_lambda,
         sibling_visits=args.sibling_visits,
@@ -189,6 +194,8 @@ def train_network(args: argparse.Namespace) -> int:
         eval_simulations=args.eval_simulations,
         eval_moves_unit=args.eval_moves_unit,
         eval_relative_unit=args.eval_relative_unit,
+        eval_confident=args.eval_confident,
+        eval_win_unit=args.eval_win_unit,
     )
     train(config, args.out, device=args.device or _default_device(), init=args.init)
     return 0
@@ -223,6 +230,9 @@ def assess_network(args: argparse.Namespace) -> int:
                 gumbel_scale=0.0,
                 moves_unit=args.moves_unit,
                 relative_unit=args.relative_unit,
+                confident=args.confident,
+                careful_fill=args.careful_fill,
+                win_unit=args.win_unit,
             ),
             device=args.device or _default_device(),
             agents=args.agents,
@@ -349,6 +359,13 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument(
         "--relative-unit", type=float, help="instead, that unit as a share of the moves scale (e.g. 0.05)"
     )
+    tr.add_argument("--win-unit", type=float, help="the self-play search's free-mode win unit (e.g. 0.1)")
+    tr.add_argument(
+        "--full-share", type=float, default=1.0, help="share of moves with a full search and policy target"
+    )
+    tr.add_argument("--fast-simulations", type=int, default=0, help="simulations of the other moves")
+    tr.add_argument("--confident", type=float, help="skip the search where the prior is this confident")
+    tr.add_argument("--max-examples", type=int, default=0, help="the most examples one game gives (0: all)")
     tr.add_argument(
         "--beta", type=float, default=0.5, help="weight of the search's values in the win targets"
     )
@@ -381,6 +398,8 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--eval-simulations", type=int, default=16, help="the assessed search's simulations")
     tr.add_argument("--eval-moves-unit", type=float, default=1.0, help="the assessed search's moves unit")
     tr.add_argument("--eval-relative-unit", type=float, help="instead, its relative unit")
+    tr.add_argument("--eval-confident", type=float, help="the assessed search's adaptive budget")
+    tr.add_argument("--eval-win-unit", type=float, help="the assessed search's free-mode win unit")
     tr.add_argument("--device", help="torch device for training (default: cuda if available, else cpu)")
     tr.add_argument("--init", help="start from this checkpoint's weights (a model.pt written by train)")
     tr.set_defaults(run=train_network)
@@ -402,6 +421,14 @@ def build_parser() -> argparse.ArgumentParser:
     asm.add_argument(
         "--relative-unit", type=float, help="instead, that unit as a share of the moves scale (e.g. 0.05)"
     )
+    asm.add_argument("--confident", type=float, help="skip the search where the prior is this confident")
+    asm.add_argument(
+        "--careful-fill",
+        type=float,
+        default=0.7,
+        help="free mode: search above this fill whatever the prior (0: always; default: 0.7)",
+    )
+    asm.add_argument("--win-unit", type=float, help="free mode: compare win values in this unit (e.g. 0.1)")
     asm.add_argument("--workers", type=int, default=8)
     asm.add_argument(
         "--agents",

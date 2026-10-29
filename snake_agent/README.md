@@ -1127,6 +1127,16 @@ games, and 999 of 1,000 games of 10×10 in 925.3 moves, 34% fewer than the
 habits network M3 started from (1,406.2); it passes the T2 gate on both boards
 ([results](#results)). On validation it won every game on both boards.
 
+<p align="center"><a href="docs/plan-agent-20x20.mp4"><img src="docs/plan-agent-20x20.png" alt="The plan agent on 20×20 at length 223, in its certified finish" width="420"></a></p>
+
+**Demo.** [The video](docs/plan-agent-20x20.mp4) (100 seconds, two moves per
+frame) shows the current network ([below](#the-current-network)) on the first
+validation game of 20×20, won in 11,458 moves. The caption at the top right
+names the phase: free play, then the certified finish from 30% fill. In the
+still, at length 223, the body lies along the walk around a spanning tree of
+2×2 blocks, and every free cell lies on that walk between the head and the
+tail.
+
 ### Where the moves go
 
 Inside the envelope the cycle sets the pace. The shortcut cycle on 20×20, by
@@ -1316,13 +1326,61 @@ trusting it by its precision fixed that. Counting the next trip exactly
 helped late in the game: in 6 games of the same network, 5 won against 2, and
 fewer moves per fruit in every band from 60% fill.
 
+### The current network
+
+Every result in this section comes from one network, an interim result of the
+plan agent's own training: generation 30 of the arrival-plane run,
+`runs/plans/p6/model-030.pt` (local and git-ignored, like every checkpoint).
+Its training continues in the next stage.
+
+- **Architecture.** M1's `SnakeNet` ([above](#network)): a residual CNN of 6
+  blocks of 64 channels with global-pooling biases, masked to the board, with
+  595,931 parameters (`NetworkConfig(channels=64, blocks=6, hidden=128,
+  cycle=False, arrival=True)`).
+- **Inputs.** 28 planes and 11 global features. The canonical cycle's inputs
+  are off (`cycle=False`): its planes, `envelope_free`, `hole` and the
+  cycle-order features stay at zero, so the network knows no Hamiltonian
+  cycle. The three arrival planes are on (`arrival=True`): when the head can
+  first enter each cell, through cells vacated in time, in moves and in cells,
+  and which free cells it cannot reach that way yet.
+- **Outputs used.** The win head, the probability of filling the board from a
+  state or an afterstate, and the moves head, the expected moves until the
+  board is full. The plan agent compares afterstates, not moves, so the policy
+  head gets no targets and is not used.
+- **Role in play.** It decides free play before 30% fill and judges the
+  transition's partial paths; once the body is certified the agent no longer
+  asks it. Early on 20×20 its moves values barely count (`trust` is 0.0006 at
+  the start), and its win values decide which plans are safe enough.
+- **Training.** Only the plan agent's own self-play (track T3), all of it in
+  pure free play: the certified finish came later, and the network has not
+  been trained with it. Four runs, each starting from the checkpoint of the one
+  before:
+
+  | Run | Starts from | Boards (games per generation) | Generations | Inputs |
+  | --- | --- | --- | ---: | --- |
+  | p2 | random weights | 10×10 (128), 8×8 (64), 6×6 (64) | 20 | no cycle |
+  | p3 | p2, generation 20 | the same | 60 | no cycle |
+  | p4 | p3, generation 60 | 20×20 (24), 14×14 (24), 10×10 (64) | 14 | no cycle |
+  | p6 | p4's last | 20×20 (32), 14×14 (16), 10×10 (32) | 30 | the arrival planes, added with zero weights (`network.widen`) |
+
+  A generation plays its games, picking a random acceptable plan one time in
+  ten (`explore` 0.1), then takes 400 Adam steps of 512 examples (learning rate
+  10⁻³, weight decay 10⁻⁴) from a replay of the last 400,000 examples (500,000
+  in p6). Besides standard starts, 30% to 40% of the games start mid-game and
+  5% to 10% from recovery starts. Win targets blend the outcome with the chosen
+  option's value (`0.5 z + 0.5 w`), and moves targets are TD(0.5) returns over
+  the fruits. In all: 24,367 games, 49 million moves and 4.3 million examples,
+  about 1.3 hours of the training server (20 workers, one RTX 4090).
+- **Choice of generation.** p6's assessments every five generations (24 games
+  of 20×20, pure free play) won 13, 9, 12, 16, 15 and 18 games: training on
+  20×20 is noisy at a constant learning rate of 10⁻³. Generation 30 scored best,
+  so it is the one used.
+
 ### Results
 
-The network is the arrival-plane run's at generation 30
-(`runs/plans/p6/model-030.pt`, local and git-ignored), trained in pure free
-play and played with the exact next trip, tolerance 0.02 and the certified
-finish from 30% fill (64 trees, 8 shortcuts and 20,000 steps of search per
-decision). Validation seeds; on 20×20, the 100 T1 games and the T2 starts of
+The network is the current one ([above](#the-current-network)), played with the
+exact next trip, tolerance 0.02 and the certified finish from 30% fill (64
+trees, 8 shortcuts and 20,000 steps of search per decision). Validation seeds; on 20×20, the 100 T1 games and the T2 starts of
 100 source games (62, 16 and 6 by band) of M3's development run, whose numbers
 are repeated here:
 

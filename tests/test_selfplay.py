@@ -186,3 +186,25 @@ def test_starts_of_several_boards_share_one_canvas():
     assert {s.board for s in summaries} == {(4, 4), (6, 6)}
     cells = examples.planes[:, 0].astype(float).sum((1, 2))  # the valid plane marks the board's cells
     assert examples.planes.shape[2:] == (6, 6) and set(cells.tolist()) == {16.0, 36.0}
+
+
+def test_only_full_searches_give_policy_targets():
+    starts = standard_starts(6, 6, range(4)) + free_starts(6, 6, range(40, 44))
+    full, everything = play(uniform, starts, seed=5)
+    capped, examples = play(uniform, starts, seed=5, full_share=0.3, fast_simulations=0)
+    assert sum(s.searched for s in capped) < 0.5 * sum(s.searched for s in full)
+    assert sum(s.leaves for s in capped) < sum(s.leaves for s in full)
+    assert examples.has_policy.sum() == sum(s.searched for s in capped)
+    assert np.allclose(examples.policy[examples.has_policy].sum(axis=1), 1.0)
+    assert not examples.policy[~examples.has_policy].any()
+
+
+def test_long_games_give_at_most_the_capped_examples():
+    starts = standard_starts(6, 6, range(3))
+    summaries, everything = play(uniform, starts, seed=2)
+    capped_summaries, capped = play(uniform, starts, seed=2, max_examples=40)
+    assert capped_summaries == summaries and len(everything) > 120
+    assert len(capped) == 3 * 40
+    assert set(map(bytes, capped.planes.reshape(len(capped), -1))) <= set(
+        map(bytes, everything.planes.reshape(len(everything), -1))
+    )

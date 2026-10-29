@@ -185,7 +185,9 @@ def _t1_task(args: tuple) -> tuple[list[GameRecord], list[tuple[GameState, Relat
     games = [SnakeGame(GameConfig(width, height), seed=seed) for seed in seeds]
     runs = _runs(kind, games, rules, [{"seed": seed} for seed in seeds], envelope=True)
     lockstep = [_Lockstep(run, kind, rules, search, i, decisions) for i, run in enumerate(runs)]
-    records = play_lockstep(NetworkEvaluator(from_bytes(weights), device), lockstep)
+    evaluator = NetworkEvaluator(from_bytes(weights), device)
+    records = play_lockstep(evaluator, lockstep)
+    evaluator.release()
     return records, decisions or []
 
 
@@ -198,7 +200,10 @@ def _t2_task(args: tuple) -> list[GameRecord]:
     labels = [{"start": s.name, "seed": f, "band": s.band} for s, f in zip(starts, fruit_seeds, strict=True)]
     runs = _runs(kind, games, rules, labels, envelope=False)
     lockstep = [_Lockstep(run, kind, rules, search, i) for i, run in enumerate(runs)]
-    return play_lockstep(NetworkEvaluator(from_bytes(weights), device), lockstep)
+    evaluator = NetworkEvaluator(from_bytes(weights), device)
+    records = play_lockstep(evaluator, lockstep)
+    evaluator.release()
+    return records
 
 
 def _chunks(items: Sequence, parts: int) -> list[Sequence]:
@@ -561,6 +566,9 @@ def assess(
         "simulations": search.simulations,
         "moves_unit": search.moves_unit,
         "relative_unit": search.relative_unit,
+        "win_unit": search.win_unit,
+        "confident": search.confident,
+        "careful_fill": search.careful_fill,
     }
     reference = T1_REFERENCES.get((width, height))
     exact = width * height <= 36 and canonical_envelope(width, height) is not None

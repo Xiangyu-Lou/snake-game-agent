@@ -360,3 +360,84 @@ def test_a_relative_unit_is_a_share_of_the_moves_scale(exact):
             b = run_search(evaluator, state, TRAINING_RULES, absolute)
             assert a.action == b.action and np.allclose(a.policy, b.policy)
     assert compared
+
+
+def confident_evaluator(action=RelativeAction.STRAIGHT, margin=10.0, calls=None):
+    """Uniform values with a prior that puts nearly all its mass on ``action``."""
+
+    def evaluate(queries):
+        if calls is not None:
+            calls.append(len(queries))
+        n = len(queries)
+        logits = np.zeros((n, 3))
+        logits[:, action] = margin
+        return Prediction(logits, np.full(n, 0.5), np.ones(n))
+
+    return evaluate
+
+
+def test_a_confident_prior_skips_the_search_only_when_nothing_is_at_stake(exact):
+    config = SearchConfig(gumbel_scale=0.0, confident=0.9)
+    probe = SearchConfig(simulations=0)
+
+    def first_valid(state):
+        result = run_search(uniform_evaluator(), state, TRAINING_RULES, probe)
+        return [a for a in RelativeAction if result.valid[a]], result.mode
+
+    # Inside the envelope every move is a certain win: a confident prior decides alone, with one evaluation.
+    state = SnakeGame(GameConfig(6, 6), seed=3).state()
+    valid, mode = first_valid(state)
+    assert len(valid) >= 2 and mode is Mode.ENVELOPE
+    calls = []
+    result = run_search(confident_evaluator(valid[-1], calls=calls), state, TRAINING_RULES, config)
+    assert result.skipped and result.action == valid[-1] and result.policy is None and calls == [1]
+    unlimited = dataclasses.replace(config, confident=None)
+    assert not run_search(confident_evaluator(valid[-1]), state, TRAINING_RULES, unlimited).skipped
+    assert not run_search(uniform_evaluator(), state, TRAINING_RULES, config).skipped  # an unsure prior
+    # In free mode, only when every move left is certified and the board is less than careful_fill full.
+    certified = (MoveClass.CERTIFIED, MoveClass.WON)
+    seen = set()
+    for state in free_states(exact["free"], stride=37):
+        valid, mode = first_valid(state)
+        if len(valid) < 2 or mode is not Mode.FREE:
+            continue
+        classes = classify_moves(state)
+        expected = all(classes[a] in certified for a in valid) and state.length < 0.7 * state.num_cells
+        result = run_search(confident_evaluator(valid[0]), state, TRAINING_RULES, config)
+        assert result.skipped == expected and (result.policy is None) == expected
+        seen.add(expected)
+    assert seen == {True, False}
+
+
+def test_a_win_unit_keeps_small_win_differences_from_overriding_the_prior(exact):
+    def slightly_different(queries):
+        n = len(queries)
+        heads = np.array([q.state.snake[0][0] + 4 * q.state.snake[0][1] for q in queries])
+        return Prediction(np.zeros((n, 3)), 0.5 + 0.002 * heads, np.ones(n))  # differences of 0.002-0.03
+
+    spread = {}
+    for unit in (None, 1.0):
+        spreads = []
+        for state in free_states(exact["free"], stride=97):
+            probe = run_search(uniform_evaluator(), state, TRAINING_RULES, SearchConfig(simulations=0))
+            if sum(probe.valid) < 2 or probe.mode is not Mode.FREE:
+                continue
+            config = SearchConfig(simulations=sum(probe.valid), gumbel_scale=0.0, win_unit=unit)
+            policy = run_search(slightly_different, state, TRAINING_RULES, config).policy
+            valid = [a for a in RelativeAction if probe.valid[a]]
+            spreads.append(policy[valid].max() - policy[valid].min())
+        spread[unit] = float(np.mean(spreads))
+    assert spread[None] > 0.5 and spread[1.0] < 0.1
+
+
+def test_a_zero_confidence_trusts_the_prior_in_the_envelope_and_searches_free_play(exact):
+    config = SearchConfig(gumbel_scale=0.0, confident=0.0, careful_fill=0.0)
+    envelope = SnakeGame(GameConfig(6, 6), seed=3).state()
+    assert run_search(uniform_evaluator(), envelope, TRAINING_RULES, config).skipped
+    searched = 0
+    for state in free_states(exact["free"], stride=61):
+        result = run_search(uniform_evaluator(), state, TRAINING_RULES, config)
+        if result.mode is Mode.FREE and not result.forced:
+            assert not result.skipped and result.policy is not None
+            searched += 1
+    assert searched > 10

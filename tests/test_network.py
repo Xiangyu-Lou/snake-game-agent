@@ -103,3 +103,15 @@ def test_a_few_steps_fit_a_batch_of_self_play():
     after = {name: value.item() for name, value in losses(model, examples, "cpu").items()}
     assert after["win"] < before["win"] and after["moves"] < before["moves"]
     assert after["policy"] < before["policy"]
+
+
+def test_the_evaluator_answers_large_batches_in_chunks():
+    model = SnakeNet(NetworkConfig(channels=8, blocks=1, hidden=16))
+    states = [s.state for s in standard_starts(6, 6, range(4)) + free_starts(6, 6, range(10, 20))]
+    queries = [Query(s, TRAINING_RULES) for s in states]
+    whole = NetworkEvaluator(model, max_batch=1000)(queries)
+    chunked = NetworkEvaluator(model, max_batch=3)(queries)
+    assert len(chunked) == len(queries)
+    for name in ("logits", "win", "moves"):
+        assert np.allclose(getattr(chunked, name), getattr(whole, name), atol=1e-5)
+    NetworkEvaluator(model).release()  # a no-op on the CPU

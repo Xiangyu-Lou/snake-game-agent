@@ -132,6 +132,11 @@ class SearchConfig:
     """``sigma(q) = (c_visit + max visits) * c_scale * q`` for ``q`` rescaled to [0, 1], as in the paper."""
     tie_weight: float = 0.25
     """Free mode: share of the rescaled Q given to moves among the moves tied on the best win value."""
+    win_unit: float | None = None
+    """Free mode: if set, win values are compared as ``(win - best win) / win_unit``, so that differences
+    much smaller than the unit count for little against the prior, and certain wins tied at 1 by their
+    moves with the envelope's unit. None rescales the win values to [0, 1] at each node, which on a board
+    the win head knows little turns its noise into full-size differences."""
     moves_unit: float | None = 1.0
     """Envelope mode: ``q = -moves / moves_unit``, so that moves differing by much less than a unit count
     for little against the prior. None rescales the moves to [0, 1] at each node, as the paper does with
@@ -146,6 +151,12 @@ class SearchConfig:
     """States :func:`~snake_agent.survival.prove_lost` may visit per root move of a free search."""
     search_forced: bool = False
     """Also search when only one move is left (otherwise it is played without a network call)."""
+    confident: float | None = None
+    """Adaptive budget (review §2.4): if set, the root is not searched when the prior gives its likeliest
+    move at least this probability and nothing is at stake beyond moves: in envelope mode always, in
+    free mode only when every move left is certified and the board is less than ``careful_fill`` full.
+    The move is then the prior's (with the root's Gumbel noise), and there is no policy target."""
+    careful_fill: float = 0.7
 
 
 SELF_PLAY = SearchConfig()
@@ -183,6 +194,8 @@ class SearchResult:
     prior_win: float | None
     """The evaluator's values for the root itself; None if forced."""
     prior_moves: float | None
+    skipped: bool = False
+    """The root was evaluated but not searched (a confident prior or a fast move): no policy target."""
 
 
 # ----------------------------------------------------------------- envelope
@@ -420,13 +433,16 @@ class _Stats:
                 mixed_moves = moves_mass / win_mass
         self.win = np.where(visited, q_win, mixed_win)
         self.moves = np.where(visited, q_moves, mixed_moves)
+        unit = config.moves_unit
+        if config.relative_unit is not None:
+            unit = config.relative_unit * moves_scale(node.state.free_cells)
+        moves_q = _rescale(-self.moves) if unit is None else (self.moves.min() - self.moves) / unit
         if mode is Mode.ENVELOPE:
-            unit = config.moves_unit
-            if config.relative_unit is not None:
-                unit = config.relative_unit * moves_scale(node.state.free_cells)
-            q = _rescale(-self.moves) if unit is None else (self.moves.min() - self.moves) / unit
-        else:
+            q = moves_q
+        elif config.win_unit is None:
             q = _lexicographic(self.win, self.moves, config.tie_weight)
+        else:
+            q = _absolute(self.win, moves_q, config.tie_weight, config.win_unit)
         self.sigma = (config.c_visit + visits.max()) * config.c_scale * q
         self.visits = visits
         self.logits = logits - logits.max()
@@ -445,6 +461,16 @@ def _lexicographic(win: np.ndarray, moves: np.ndarray, tie_weight: float) -> np.
     if tied.sum() > 1:
         order[tied] = _rescale(-moves[tied])
     return (1.0 - tie_weight) * _rescale(win) + tie_weight * order
+
+
+def _absolute(win: np.ndarray, moves_q: np.ndarray, tie_weight: float, unit: float) -> np.ndarray:
+    """Win values in steps of ``unit`` below the best; moves (already in their unit) order exact ties."""
+    best = win.max()
+    tied = win == best
+    if tied.all():
+        return moves_q
+    order = np.where(tied & (tied.sum() > 1), moves_q - moves_q[tied].max(), 0.0)
+    return (1.0 - tie_weight) * (win - best) / unit + tie_weight * order
 
 
 # ------------------------------------------------------------------- search
@@ -522,6 +548,26 @@ def search(
     prior_win, prior_moves = root.raw_win, root.raw_moves
     root.visits, root.win_sum, root.moves_sum = 1, root.raw_win, root.raw_win * root.raw_moves
     gumbel = config.gumbel_scale * rng.gumbel(size=len(actions))
+    if _confident(root, state, mode, config):
+        logits = root.logits[[int(a) for a in actions]]
+        action = actions[int(np.argmax(gumbel + logits))]
+        return SearchResult(
+            action,
+            mode,
+            valid,
+            False,
+            lost,
+            0,
+            np.zeros(3),
+            None,
+            nan,
+            nan,
+            None,
+            None,
+            prior_win,
+            prior_moves,
+            skipped=True,
+        )
     schedule = considered_visits(len(actions), config.simulations)
     for simulation in range(config.simulations):
         stats = _Stats(root, mode, config)
@@ -584,6 +630,21 @@ def search(
         value_moves,
         prior_win,
         prior_moves,
+    )
+
+
+def _confident(root: _Decision, state: GameState, mode: Mode, config: SearchConfig) -> bool:
+    """Whether the adaptive budget lets the root go unsearched (see :attr:`SearchConfig.confident`)."""
+    if config.confident is None:
+        return False
+    prior = _softmax(root.logits[[int(a) for a in root.actions]])
+    if prior.max() < config.confident:
+        return False
+    if mode is Mode.ENVELOPE:
+        return True
+    certified = (MoveClass.CERTIFIED, MoveClass.WON)
+    return state.length < config.careful_fill * state.num_cells and all(
+        root.classes[a] in certified for a in root.actions
     )
 
 

@@ -153,6 +153,38 @@ def _plain(envelope: CycleEnvelope):
     return policy
 
 
+def waits(text: str) -> tuple[int, ...]:
+    """Comma-separated moves along the certificate's loop, for example ``2,4,8,16,32`` (empty: none)."""
+    try:
+        return tuple(int(part) for part in text.split(",") if part)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"waits must look like 2,4,8,16,32, got {text!r}") from None
+
+
+def shares(text: str) -> tuple[float, ...]:
+    """Comma-separated shares of the free cells, for example ``0.05,0.25,1`` (empty: none)."""
+    try:
+        return tuple(float(part) for part in text.split(",") if part)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"shares must look like 0.05,0.25,1, got {text!r}") from None
+
+
+def plan_config(args: argparse.Namespace, explore: float = 0.0):
+    from .plans import PlanConfig
+
+    return PlanConfig(
+        paths=args.paths,
+        waits=args.waits,
+        sweeps=args.sweeps,
+        tolerance=args.tolerance,
+        moves_trust=args.moves_trust,
+        explore=explore,
+        certify=args.certify,
+        trees=args.trees,
+        shortcut_budget=args.shortcut_budget,
+    )
+
+
 def train_network(args: argparse.Namespace) -> int:
     from .network import NetworkConfig  # needs PyTorch
     from .train import TrainConfig, train
@@ -160,6 +192,8 @@ def train_network(args: argparse.Namespace) -> int:
     boards = tuple((width, height, games or args.games) for width, height, games in args.board or [(6, 6, 0)])
     config = TrainConfig(
         boards=boards,
+        agent=args.agent,
+        plans=plan_config(args, args.explore),
         generations=args.generations,
         free_share=args.free_share,
         prefix_share=args.prefix_share,
@@ -185,7 +219,13 @@ def train_network(args: argparse.Namespace) -> int:
         lr_floor=args.lr_floor,
         warmup=args.warmup,
         min_replay=args.min_replay,
-        network=NetworkConfig(args.channels, args.blocks, args.hidden),
+        network=NetworkConfig(
+            args.channels,
+            args.blocks,
+            args.hidden,
+            cycle=args.agent != "plans",
+            arrival=args.agent == "plans",
+        ),
         workers=args.workers,
         seed=args.seed,
         eval_every=args.eval_every,
@@ -205,7 +245,7 @@ def assess_network(args: argparse.Namespace) -> int:
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
 
-    from .assess import assess  # needs PyTorch
+    from .assess import assess, assess_free  # needs PyTorch
     from .network import load, to_bytes
     from .search import SearchConfig
     from .train import _init_worker
@@ -215,6 +255,27 @@ def assess_network(args: argparse.Namespace) -> int:
     trained = config.get("boards") or [(config.get("width", 6), config.get("height", 6), 0)]
     width, height = args.board or max(((w, h) for w, h, _ in trained), key=lambda b: (b[0] * b[1], b[0]))
     context = multiprocessing.get_context("spawn")
+    if args.agents == ["plans"]:
+        with ProcessPoolExecutor(args.workers, mp_context=context, initializer=_init_worker) as pool:
+            report = assess_free(
+                pool,
+                to_bytes(model),
+                width,
+                height,
+                games=args.games,
+                sources=args.sources,
+                split=SPLITS[args.split],
+                workers=args.workers,
+                plans=plan_config(args),
+                device=args.device or _default_device(),
+            )
+        text = json.dumps(report, indent=2)
+        print(text)
+        if args.json:
+            Path(args.json).write_text(text + "\n")
+        return 0
+    if "plans" in args.agents:
+        raise ValueError("assess the plan agent on its own: --agents plans")
     with ProcessPoolExecutor(args.workers, mp_context=context, initializer=_init_worker) as pool:
         report = assess(
             pool,
@@ -334,6 +395,13 @@ def build_parser() -> argparse.ArgumentParser:
         "(repeatable; default: 6x6)",
     )
     tr.add_argument("--out", required=True, help="output directory for the log and checkpoints")
+    tr.add_argument(
+        "--agent",
+        choices=["search", "plans"],
+        default="search",
+        help="search: self-play with the Gumbel search (default); plans: the plan agent's free play, "
+        "with a network that does not see the canonical cycle",
+    )
     tr.add_argument("--generations", type=int, default=50)
     tr.add_argument(
         "--games", type=int, default=256, help="self-play games per generation of a board (default: 256)"
@@ -400,6 +468,10 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--eval-relative-unit", type=float, help="instead, its relative unit")
     tr.add_argument("--eval-confident", type=float, help="the assessed search's adaptive budget")
     tr.add_argument("--eval-win-unit", type=float, help="the assessed search's free-mode win unit")
+    _plan_arguments(tr)
+    tr.add_argument(
+        "--explore", type=float, default=0.1, help="plans: chance of a random acceptable plan (default: 0.1)"
+    )
     tr.add_argument("--device", help="torch device for training (default: cuda if available, else cpu)")
     tr.add_argument("--init", help="start from this checkpoint's weights (a model.pt written by train)")
     tr.set_defaults(run=train_network)
@@ -433,10 +505,11 @@ def build_parser() -> argparse.ArgumentParser:
     asm.add_argument(
         "--agents",
         nargs="+",
-        choices=["search", "policy"],
+        choices=["search", "policy", "plans"],
         default=["search", "policy"],
-        help="the agents to assess (default: both)",
+        help="the agents to assess (default: search and policy; plans: the plan agent, on its own)",
     )
+    _plan_arguments(asm)
     asm.add_argument("--device", help="torch device for the games (default: cuda if available, else cpu)")
     asm.add_argument("--json", help="write the report to this JSON file")
     asm.set_defaults(run=assess_network)
@@ -478,6 +551,61 @@ def build_parser() -> argparse.ArgumentParser:
     hb.add_argument("--device", help="torch device for distillation (default: cuda if available, else cpu)")
     hb.set_defaults(run=improve_network_habits)
     return parser
+
+
+def _plan_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--paths", type=int, default=16, help="plans: shortest paths drawn per decision")
+    parser.add_argument(
+        "--waits",
+        type=waits,
+        default=(2, 4, 8, 16, 32),
+        help="plans: moves along the certificate's loop before a waiting plan (default: 2,4,8,16,32)",
+    )
+    parser.add_argument(
+        "--sweeps",
+        type=shares,
+        default=(0.25, 1.0),
+        help="plans: sweeping plans lengthen a shortest path by up to these shares of the free cells "
+        "(default: 0.25,1)",
+    )
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=0.02,
+        help="plans: extra risk accepted for a faster plan (default: 0.02)",
+    )
+    parser.add_argument(
+        "--moves-trust",
+        type=float,
+        default=1000.0,
+        help="plans: moves scale up to which the moves head's differences are trusted (default: 1000)",
+    )
+    parser.add_argument(
+        "--certify",
+        type=certify_share,
+        default=0.3,
+        help="plans: share of the board filled from which the agent finishes on a Hamiltonian-cycle "
+        "certificate, or 'none' to play free to the end (default: 0.3)",
+    )
+    parser.add_argument(
+        "--trees", type=int, default=64, help="plans: random spanning trees tried per certified decision"
+    )
+    parser.add_argument(
+        "--shortcut-budget",
+        type=int,
+        default=20_000,
+        help="plans: steps of search for certified shortcuts per decision (default: 20000)",
+    )
+
+
+def certify_share(text: str) -> float | None:
+    """A share of the board in [0, 1], or ``none``."""
+    if text.lower() == "none":
+        return None
+    share = float(text)
+    if not 0.0 <= share <= 1.0:
+        raise argparse.ArgumentTypeError(f"a share of the board must be in [0, 1], got {text}")
+    return share
 
 
 def main(argv: Sequence[str] | None = None) -> int:

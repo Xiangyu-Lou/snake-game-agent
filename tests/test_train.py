@@ -10,6 +10,7 @@ torch = pytest.importorskip("torch")
 from snake_agent.encoding import mirror  # noqa: E402
 from snake_agent.habits import BANDS, Habit  # noqa: E402
 from snake_agent.network import NetworkConfig, SnakeNet, load, save  # noqa: E402
+from snake_agent.plans import PlanConfig  # noqa: E402
 from snake_agent.search import Prediction  # noqa: E402
 from snake_agent.seeds import check_training_seed  # noqa: E402
 from snake_agent.selfplay import play, standard_starts  # noqa: E402
@@ -165,6 +166,37 @@ def test_a_short_run_writes_its_log_checkpoints_and_assessment(tmp_path):
             tmp_path / "x",
             init=tmp_path / "model-002.pt",
         )
+
+
+def test_a_short_run_of_the_plan_agent_widens_its_network_and_assesses_free_play(tmp_path):
+    small = NetworkConfig(channels=8, blocks=1, hidden=16, cycle=False)
+    torch.manual_seed(0)
+    save(SnakeNet(small), tmp_path / "start.pt")  # without the arrival planes
+    config = TrainConfig(
+        boards=((6, 6, 6),),
+        agent="plans",
+        plans=PlanConfig(paths=4, explore=0.1),
+        generations=1,
+        free_share=0.0,
+        steps=2,
+        batch=16,
+        replay=4000,
+        network=dataclasses.replace(small, arrival=True),
+        workers=2,
+        eval_every=1,
+        eval_games=2,
+        eval_sources=3,
+    )
+    lines = []
+    train(config, tmp_path / "run", log=lines.append, init=tmp_path / "start.pt")
+    record = json.loads((tmp_path / "run" / "log.jsonl").read_text())
+    assert record["games"]["6x6"]["standard"]["games"] == 6 and record["examples"] > 0
+    report = record["assessment"]
+    assert report["t1_plans"]["summary"]["games"] == 2 and report["t1_shortcut"]["summary"]["games"] == 2
+    assert report["t1_plans"]["summary"]["envelope_exits"] == 0  # free play is not held to the envelope
+    assert "t2_plans" in report and report["plans"]["explore"] == 0.0
+    model, _ = load(tmp_path / "run" / "model.pt")
+    assert model.config.arrival and not model.config.cycle
 
 
 def test_workers_get_starts_of_similar_total_cost():

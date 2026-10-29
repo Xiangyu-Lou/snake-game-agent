@@ -10,6 +10,7 @@ from snake_agent.encoding import (
     ACTION_FEATURES,
     GLOBALS,
     PLANES,
+    SATURATION,
     canonical_cycle,
     encode,
     mirror,
@@ -252,3 +253,22 @@ def test_moves_ceiling_bounds_every_win():
             assert finite.max() <= moves_ceiling(16, free) * moves_scale(free)
             ratios[free] = finite.max() / moves_scale(free)
     assert ratios[2] > 12
+
+
+def test_arrival_planes_hold_the_earliest_moves_through_cells_vacated_in_time():
+    # Heading up along the left column of a 4x4 board, the tail at (3, 3) (as in the plan agent's tests).
+    snake = ((0, 0), (0, 1), (0, 2), (0, 3), (1, 3), (2, 3), (3, 3))
+    state = GameState(4, 4, snake, Direction.UP, (3, 0))
+    bare = encode(state, TRAINING_RULES)
+    assert not bare.planes[[PLANES.index(n) for n in ("arrival", "arrival_cells", "unreached")]].any()
+    e = encode(state, TRAINING_RULES, arrival=True)
+    k = int(state.direction)  # the planes are turned so that the head points up
+    arrival = np.rot90(e.planes[PLANES.index("arrival")][:4, :4], -k) * 16
+    cells = np.rot90(e.planes[PLANES.index("arrival_cells")][:4, :4], -k) * SATURATION
+    assert (
+        arrival[0, 3] == pytest.approx(3)
+        and arrival[3, 2] == pytest.approx(5)
+        and arrival[1, 0] == pytest.approx(7)
+    )
+    assert cells[3, 2] == pytest.approx(5) and arrival[0, 0] == 0  # the head itself
+    assert not e.planes[PLANES.index("unreached")].any()  # every free cell is reached on time here

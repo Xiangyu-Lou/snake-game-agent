@@ -16,7 +16,11 @@ paired games and distilled into the network
 20×20**, adds adaptive search budgets, a win unit for free play and bounded GPU
 memory, and meets its gate: on the test seeds the agent wins every T1 game,
 faster than the shortcut cycle, and beats the reference policies on T2
-([below](#m3-2020)).
+([below](#m3-2020)). After M3, the **plan agent** clears the board far
+faster: it plays free while the snake is short, then finishes on a
+Hamiltonian-cycle certificate that it rebuilds at every fruit. On the test
+seeds of 20×20 it wins 298 of 299 games in 11,047 moves on average, 46% fewer
+than M3's agent ([below](#free-play-and-a-certified-finish-the-plan-agent)).
 
 M0's gate is met: the tests pass, and the harness reproduces the reference
 numbers of the [Architecture B probe](../analysis/architecture_b_probe.py):
@@ -32,6 +36,7 @@ analytic network cost model ([below](#reproducing-the-probe)).
 - [M2: 8×8 and 10×10, recovery](#m2-88-and-1010-recovery)
 - [Habits: faster than the shortcut cycle on 10×10](#habits-faster-than-the-shortcut-cycle-on-1010)
 - [M3: 20×20](#m3-2020)
+- [Free play and a certified finish: the plan agent](#free-play-and-a-certified-finish-the-plan-agent)
 - [Reproducing the probe](#reproducing-the-probe)
 - [Package layout](#package-layout)
 
@@ -57,6 +62,8 @@ python -m snake_agent habits runs/habits/model-h02.pt --board 20x20 --seeds 120 
     --out runs/m3-habits --device cuda                                         # 20x20 habits (M3)
 python -m snake_agent assess runs/m3-habits/model-h01.pt --board 20x20 --games 299 --sources 500 \
     --relative-unit 0.3 --win-unit 0.3 --confident 0 --careful-fill 0 --split test  # the M3 gate
+python -m snake_agent train --agent plans --board 10x10:128 --board 8x8:64 --out runs/plans  # plan agent
+python -m snake_agent assess runs/plans/model.pt --agents plans --games 100 --sources 100      # free T1, T2
 ```
 
 ```python
@@ -95,7 +102,11 @@ counts as success. Training, search and evaluation all follow it.
    the board. Fewer moves only decide between equally safe moves:
    `choose_safely(win_values, moves, allowed)` breaks only exact ties. On
    standard starts every move stays inside the cycle-order envelope, where
-   every move keeps the win certain (below), so there speed decides.
+   every move keeps the win certain (below), so there speed decides. The plan
+   agent follows later decisions of the owner: it plays free on standard
+   starts, accepting a slightly lower clear rate for fewer moves, and finishes
+   on a Hamiltonian-cycle certificate of its own, rebuilt at every fruit
+   ([below](#free-play-and-a-certified-finish-the-plan-agent)).
 4. **Fruit timeout as a loss.** Under `TRAINING_RULES` a game is lost after
    `N + L` consecutive moves without fruit (`N` cells, `L` the current length):
    `Rules.timeout`, `Rules.timed_out`. The budget features of decision 3 are
@@ -1088,6 +1099,330 @@ time with another session's jobs), and MPS:
   minutes on 22 workers, the adaptive budget playing T1 at the raw policy's
   cost.
 
+## Free play and a certified finish: the plan agent
+
+After M3 the owner asked for a much faster clear of the 20×20 board: a slightly
+lower clear rate is acceptable, and approaches like the shortcut cycle should be
+avoided as much as possible. The plan agent ([`plans.py`](plans.py)) decides
+once per fruit between exact paths to it. Asked during the work whether it could
+keep a Hamiltonian path as a safety certificate late in the game, the owner
+first chose pure free play, with no Hamiltonian cycle anywhere. Pure free play
+proved far faster than the cycle while the snake is short and far slower once
+it is long, slower than M3 overall on 20×20
+([below](#the-late-game-of-pure-free-play)), and the owner then agreed to try
+the certificate late in the game. The agent now plays free until 30% of the
+board is filled, then finishes on a certificate ([below](#the-certified-finish)):
+a Hamiltonian cycle around a spanning tree of 2×2 blocks that holds its body,
+rebuilt at every fruit, so it never follows a fixed cycle. Its network does not
+see the canonical cycle, and it learns from its own games only (track T3). T1's
+envelope rule does not apply to it, so its standard-start games are reported as
+*free T1* (`assess --agents plans`): clear rate first, then the moves of the
+games won, against the shortcut cycle on the same games.
+
+**Status:** with the certified finish the agent clears the board in far
+fewer moves and still wins nearly every game. On the test seeds it wins 298 of
+299 T1 games of 20×20 in 11,046.7 moves on average, 46% fewer than M3's agent
+at its gate (20,581.4) and 9,835 fewer than the shortcut cycle on the same
+games, and 999 of 1,000 games of 10×10 in 925.3 moves, 34% fewer than the
+habits network M3 started from (1,406.2); it passes the T2 gate on both boards
+([results](#results)). On validation it won every game on both boards.
+
+### Where the moves go
+
+Inside the envelope the cycle sets the pace. The shortcut cycle on 20×20, by
+band of fill (4 games; M3's agent plays within 1.5% of it):
+
+| Fill | 0–10% | 10–20% | 20–30% | 30–40% | 40–50% | 50–60% | 60–70% | 70–80% | 80–90% | 90–100% |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Moves per fruit | 25.6 | 31.6 | 47.3 | 61.1 | 95.8 | 103.5 | 73.6 | 47.6 | 30.9 | 10.3 |
+| Share of the moves | 4.9% | 6.0% | 9.0% | 11.6% | 18.2% | 19.6% | 14.0% | 9.0% | 5.9% | 2.0% |
+
+Between 30% and 70% fill it follows the cycle with up to 280 cells free and
+spends 63% of its moves there, about half the free cells per fruit. A free
+player goes to the fruit: the guarded-greedy reference eats at 13.9 and 21.3
+moves per fruit in the first two bands, but it loops until the fruit timeout in
+all six 20×20 games it played.
+
+The M-series agents cannot leave the envelope on a standard start, and their
+search would not go far outside it: it decides one move at a time and sees a
+few moves ahead, so on a large board it cannot see the fruit, and its moves head
+errs by about a hundredth of `moves_scale`, hundreds of moves early on 20×20,
+while a move toward the fruit and one away from it differ by two.
+
+### The plan agent
+
+It decides once per fruit, between exact paths to it, by the body each path
+leaves:
+
+- **Plans** (`candidates`): shortest paths with their ties broken at random;
+  *sweeping* paths, shortest paths lengthened through the free cells beside them
+  (`extend`, two cells at a time), which lay the body down compactly; and
+  *waiting* plans, which first follow the survival certificate's loop. Paths run
+  through free cells and through body cells already vacated when the head
+  arrives (`survival.arrival_times`), so every plan is safe move by move and its
+  length is exact.
+- **Afterstates.** A plan ends by eating, at its afterstate. Nothing random
+  happens on the way, so a plan's future is its afterstate's, and the network
+  values afterstates: the probability of filling the board, and the expected
+  moves until it is full if it is.
+- **Waiting moves** (`waits`). Each move that neither collides, eats nor times
+  out is an option too, valued by the network as the state it leads to, the
+  fruit still in place. After one the agent decides again.
+- **Choice** (`choose`). A plan is played unless waiting is safer by more than
+  the tolerance (0.02). Among the plans whose risk (one minus the win value) is
+  within the tolerance of the least risky one's, the agent takes the fewest
+  moves in all: the plan's own, the trip to the next fruit as far as it is known
+  exactly (`next_trip`: the mean, over the free cells where the next fruit can
+  appear, of when the head can first reach them, `survival.opening_times`), and
+  the rest of the afterstate's moves value, weighted by how far the moves head
+  can be trusted (`trust`: `1 / (1 + (moves_scale(F) / 1000)^2)`, 0.0006 at the
+  start of a 20×20 game, 0.13 with 100 cells free, nearly 1 with 20). The
+  tolerance is the price of speed; it also keeps the win head's noise from
+  choosing between equally safe plans.
+- **The guard.** Exact code decides survival where it can (review §2.3): while
+  the fruit timeout leaves room to wait, only the options that keep a survival
+  certificate are compared, if any does.
+- **The certified finish** (`PlanConfig.certify`, 0.3). From 30% of the board
+  filled the agent heads for a certified body, then keeps one to the end,
+  taking at each fruit the fastest path that keeps it; the network is not asked
+  then ([below](#the-certified-finish)). With `--certify none` the agent plays
+  free to the end.
+- **Inputs.** The network does not see the canonical cycle
+  (`NetworkConfig.cycle`), and it sees three more planes
+  (`NetworkConfig.arrival`): when the head can first enter each cell, through
+  cells vacated in time, in moves and in cells, and the free cells it cannot
+  reach that way yet. A checkpoint without them is widened with zero weights
+  (`network.widen`), so it computes what it did.
+- **Self-play** (`plans.play`, `train --agent plans`): every state where the
+  agent compared options and every afterstate it reached is an example, except
+  the certified ones, which the network is never asked about. Win
+  targets blend the outcome with the chosen option's value (`0.5 z + 0.5 w`);
+  moves targets are TD(0.5) returns over the fruits, as for the search. The
+  agent decides once per fruit, so a 20×20 game takes about a tenth of the
+  network evaluations of an M3 self-play game.
+
+### The certified finish
+
+Pure free play loses its lead late in the game because it leaves holes
+([below](#the-late-game-of-pure-free-play)), and keeping the free cells in one
+run behind the tail is the same as keeping the body on a Hamiltonian cycle. So
+the agent finishes on a cycle ([`certify.py`](certify.py)), but not a fixed
+one: it rebuilds the certificate at every fruit, which is where its speed comes
+from.
+
+- **The cycles.** Cut a board with even sides into 2×2 blocks. Any spanning
+  tree of the blocks' grid gives a Hamiltonian cycle, the walk around the tree:
+  inside a block the walk runs along a side unless the tree crosses it, and
+  then it crosses into the next block and comes back along the parallel lane.
+  All these cycles run the same way along every row and column (left along even
+  rows, right along odd rows, down even columns and up odd columns, or all
+  backwards), so each cell has two possible moves, and one edge of the blocks'
+  grid, the cell's *gate*, decides between them: the walk crosses into the next
+  block if the gate is in the tree and moves along its block's side if not.
+- **The certificate** (`certify`). A body is certified when the walk around
+  some spanning tree holds it in order. That is exactly when every move of the
+  body is one of its cell's two moves, the gates its crossings need form a
+  forest, no gate is needed both in and out, and the gates its side moves keep
+  out leave the blocks connected (checked against every tree of a 6×4 board in
+  the tests). A snake on such a walk wins for certain, the fruit timeout
+  included: every cell from just ahead of the head round to the tail is free, so
+  the next fruit is at most that far, and eating it on the way leaves the body
+  on the same walk. The check is one pass over the body and one union-find over
+  the blocks.
+- **Certified plans** (`certified_paths`). Any path to the fruit whose
+  afterstate is certified keeps the win certain, so in a certified state the
+  agent takes the fastest of them (the fewest moves with the exact next trip)
+  and asks the network nothing. The candidates are the walk around the best of
+  64 random spanning trees that hold the body, a walk built gate by gate toward
+  the fruit (`greedy_walk`), and the shortest certified shortcuts below both
+  (`shortcuts`): an iterative-deepening search over the cells' two moves, through
+  cells vacated in time. A path of a given length leaves a known part of the
+  body in place, so the search keeps the gates decided by that part and by the
+  path, and cuts a branch as soon as they contradict each other, close a loop of
+  crossings, cut the blocks apart, or split the cells that will be free after
+  eating into pieces the rest of the path cannot finish; it stops after 8 paths
+  or 20,000 steps.
+- **The transition** (`transition_paths`). From 30% of the board filled (`certify`
+  in `PlanConfig`, `--certify`), the agent heads for a certified body. A path
+  whose afterstate is certified must outlast the free-play part of the body;
+  among walks around random trees that hold the body's recent certifiable run,
+  and shortest paths by the cells' two moves, the agent takes such a path if
+  there is one (*exact*). Otherwise it plays the paths that lengthen the
+  certifiable run (*partial*) if any keeps a survival certificate, judged by the
+  network as in free play, and free plans if none does. Once the free-play part
+  has gone, the body is certified.
+
+In development the shortcuts' pruning mattered most. The fruit often sits where
+any short path would cut the free cells in two (on the board's edge, beyond a
+pocket the body walls in), so the shortest certified path sweeps one side
+first, and an unpruned search spends its whole budget on the shorter lengths.
+
+### What the certificate took
+
+Network-free play, the first 10 validation games of 20×20 (the shortcut cycle
+plays 20,907.1 moves on them, M3's agents about 20,500 on all 100):
+
+| Version | Won | Mean moves |
+| --- | ---: | ---: |
+| Certified from the start; the best walk of 4 random trees, shortcuts pruned by gates only | 10 | 14,224.0 |
+| Shortcuts pruned exactly for each length | 10 | 13,306.2 |
+| The best walk of 200 random trees | 10 | 11,465.4 |
+| Free play to 30%, the transition, then 64 trees, the greedy walk and pruned shortcuts | 10 | 10,830.8 |
+
+Where to switch, same games (free play to the fill shown, then the transition):
+
+| Switch at | 20% | 30% | 40% | 50% | 60% |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Won | 10 | 10 | 10 | 10 | 6 |
+| Mean moves of the games won | 11,478.0 | 10,830.8 | 11,055.6 | 11,459.6 | 12,607.7 |
+
+Free play is faster than certified play while the snake is short (14.0, 17.3
+and 25.5 moves per fruit in the first three bands, against 16.7, 25.2 and 34.1
+certified), and certified play is faster from about 30% on. Late transitions
+fail: by 60% fill free play has left holes that the transition cannot outlast.
+
+By band of fill, switching at 30%, against the shortcut cycle and pure free
+play:
+
+| Fill | 0–10% | 10–20% | 20–30% | 30–40% | 40–50% | 50–60% | 60–70% | 70–80% | 80–90% | 90–100% |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Plan agent, certified finish | 14.0 | 17.3 | 25.5 | 44.6 | 40.4 | 40.3 | 33.2 | 27.4 | 20.9 | 8.1 |
+| Pure free play | 14.4 | 17.6 | 24.8 | 40.8 | 51.4 | 65.4 | 77.3 | 89.9 | 116.9 | 134.2 |
+| Shortcut cycle | 25.6 | 31.6 | 47.3 | 61.1 | 95.8 | 103.5 | 73.6 | 47.6 | 30.9 | 10.3 |
+
+### What free play took
+
+Each row adds to the one before. Validation seeds; 10×10 assessments of 100
+games, 20×20 of 24 unless marked; the shortcut cycle plays 1,447 moves on those
+10×10 games and about 20,800 on 20×20:
+
+| Version | 10×10 | 20×20 |
+| --- | --- | --- |
+| Plans only; waiting only when no path reaches the fruit | every game lost by collision, 0 of 129 T2 starts | |
+| Waiting moves as options, and the guard | 86 won, 1,923 moves | |
+| Sweeping plans (60 generations) | 89 to 96 won, 1,374 to 1,471 moves, from generation 15 on | 1 of 12 won zero-shot, 27,461 moves |
+| Trusting the moves head by its precision | | first band 22.3 → 14.1 moves per fruit |
+| Arrival planes (30 generations on 20×20) | | 18 won, 24,757 moves |
+| The exact next trip (same network, 6 games) | | 5 won, 23,533 moves, against 2 won, 24,923 |
+| Tried and dropped: keep the free cells in one piece (`tidy`) | | worse from the start (21 moves per fruit in the first band), 0 of 4 won |
+| Tried and dropped: a Hamiltonian-path certificate searched in free play's late boards | | found only at 99% fill; the certified finish steers toward one instead |
+
+The first version lost every game: plans are safe move by move, but they end in
+bodies the snake cannot get out of, and with untrained values it takes them.
+Waiting moves and the guard made it win, slowly; sweeps brought it to the
+shortcut cycle's pace on 10×10. On 20×20 the moves head's noise first chose long sweeps early on (its
+differences of hundreds of moves are noise next to a sweep's extra length);
+trusting it by its precision fixed that. Counting the next trip exactly
+helped late in the game: in 6 games of the same network, 5 won against 2, and
+fewer moves per fruit in every band from 60% fill.
+
+### Results
+
+The network is the arrival-plane run's at generation 30
+(`runs/plans/p6/model-030.pt`, local and git-ignored), trained in pure free
+play and played with the exact next trip, tolerance 0.02 and the certified
+finish from 30% fill (64 trees, 8 shortcuts and 20,000 steps of search per
+decision). Validation seeds; on 20×20, the 100 T1 games and the T2 starts of
+100 source games (62, 16 and 6 by band) of M3's development run, whose numbers
+are repeated here:
+
+| 20×20 | Won | Mean moves of the games won (95% interval) | Against the shortcut cycle, same games | T2 won by band |
+| --- | ---: | ---: | ---: | --- |
+| Plan agent | 100 | **11,112.7** (10,981.2–11,244.2) | **−9,753.7** (−9,938.8 to −9,568.6) | 62, 16, 6 |
+| Plan agent, pure free play | 67 | 23,984.4 (23,647.7–24,321.1) | +3,161 (+2,786 to +3,536) | 35, 12, 4 |
+| M3's raw policy | 100 | 20,547.4 | −319.0 | 43, 1, 2 |
+| M3's search | 100 | 20,791.2 | −75.2 | 44, 6, 4 |
+| Shortcut cycle | 100 | 20,866.4 | | |
+| Best reference policy | | | | 32%, 6%, 33% |
+
+| 10×10 | Won | Mean moves of the games won (95% interval) | Against the shortcut cycle, same games | T2 won by band |
+| --- | ---: | ---: | ---: | --- |
+| Plan agent | 300 of 300 | **923.5** (916.7–930.3) | **−518.7** (−530.2 to −507.3) | 98, 73, 46 of 98, 73, 46 |
+| Plan agent, pure free play | 289 of 300 | 1,438.6 (1,416.1–1,461.1) | −3.5 (−28.0 to +21.1) | 92, 69, 44 |
+| Shortcut cycle | 300 of 300 | 1,442.2 | | |
+| Best reference policy | | | | 63%, 36%, 24% |
+
+On 10×10 the habits network that M3 started from plays 1,410.6 moves on 1,000
+validation games and wins them all. Pure free play lost 33 of the 100 20×20
+games (32 collisions, one timeout), after 376 of the 397 fruits on average;
+with the certified finish no validation game is lost on either board. An assessment of
+20×20 takes about three minutes on the server's 22 workers.
+
+**Test seeds.** The same network and settings, run once on the test seeds as
+the M2 and M3 gates were: on 20×20, 299 T1 games and the T2 starts of 500
+source games (327, 113 and 38 by band); on 10×10, 1,000 T1 games and the T2
+starts of 300 source games (290, 217 and 138 by band). The other rows are the
+M3 gate's and the habits gate's, on the same seeds:
+
+| 20×20, test | T1 won | Mean moves of the games won (95% interval) | Against the shortcut cycle, same games | T2 won by band | T2 gate |
+| --- | ---: | ---: | ---: | --- | --- |
+| Plan agent | 298 of 299 | **11,046.7** (10,976.5–11,116.9) | **−9,835.3** (−9,938.2 to −9,732.5) | 327, 113, 35 | passed |
+| M3's search with the adaptive budget | 299 | 20,581.4 | −301.1 | 252, 63, 30 | passed |
+| Shortcut cycle | 299 | 20,882.5 | | | |
+| Best reference policy | | | | 42.5%, 11.5%, 26.3% | |
+
+| 10×10, test | T1 won | Mean moves of the games won (95% interval) | Against the shortcut cycle, same games | T2 won by band | T2 gate |
+| --- | ---: | ---: | ---: | --- | --- |
+| Plan agent | 999 of 1,000 | **925.3** (921.6–929.0) | **−509.8** (−516.3 to −503.2) | 290, 217, 135 | passed |
+| The habits network's raw policy (M3 started from it) | 1,000 | 1,406.2 | −28.9 | 285, 190, 128 | passed |
+| Shortcut cycle | 1,000 | 1,435.1 | | | |
+| Best reference policy | | | | 67.6%, 46.5%, 31.9% | |
+
+No certified body was lost. Replayed with the same batches, the lost T1 game
+of each board died in free play, before the certificate is sought: at 18% fill
+on 20×20 and at 25% on 10×10, both collisions with the body. The lost T2
+starts (3 of the 38 at 70% fill on 20×20, 3 of the 138 on 10×10) never
+reached a certified body: from boards that dense, with the holes of the
+reference policies' games, the transition did not complete, and the agent
+played free to the end. Five of the six died at 97% to 100% fill; the sixth
+died during the transition, 77 moves after its start.
+
+### The late game of pure free play
+
+The same network on 12 games of 20×20, moves per fruit by band of fill, with the
+shortcut cycle's for comparison:
+
+| Fill | 0–10% | 10–20% | 20–30% | 30–40% | 40–50% | 50–60% | 60–70% | 70–80% | 80–90% | 90–100% |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Plan agent | 14.4 | 17.6 | 24.8 | 40.8 | 51.4 | 65.4 | 77.3 | 89.9 | 116.9 | 134.2 |
+| Shortcut cycle | 25.6 | 31.6 | 47.3 | 61.1 | 95.8 | 103.5 | 73.6 | 47.6 | 30.9 | 10.3 |
+| Share of the agent's moves spent waiting | 0% | 0% | 0.1% | 0.1% | 0.2% | 1.6% | 2.6% | 3.0% | 6.9% | 17.1% |
+
+Over the first 60% of the board the agent spends 8,600 moves where the cycle
+spends 14,600; over the last 40%, 16,700 where the cycle spends 6,500. Its
+boards show why. It lays its body down in compact blocks (the sweeps), but
+small holes stay between them, scattered along the body's age. A fruit that
+falls in a hole beside young segments waits for most of the body to move past
+before the head can get there, so late fruits cost about a hundred moves. The
+cycle keeps every free cell just behind its tail, so a fruit costs at most the
+number of free cells, half of them on average. Keeping the free cells in one run
+behind the tail is the same as keeping the body and the free cells on one
+Hamiltonian cycle; pure free play has to find that structure by itself, and the
+agent's values have not found it: forcing the free cells to stay in one piece
+(`tidy`) made the early game slower and did not save the late one.
+
+The losses follow from the same structure. In the lost games the network
+already rates the position as nearly lost (win values of 0.03 to 0.2) between
+94% and 99% fill: the agent waits along certified moves until the fruit timeout
+forces a plan into a pocket. Over the last few hundred decisions of a 20×20
+game even a small risk per decision adds up, where the cycle's envelope carries
+none. What changes this is a certified way to finish
+([above](#the-certified-finish)).
+
+```bash
+python -m snake_agent train --agent plans --board 10x10:128 --board 8x8:64 --board 6x6:64 \
+    --free-share 0 --midgame-share 0.3 --recovery-share 0.1 --midgame-samples 4 \
+    --steps 400 --replay 400000 --workers 20 --out runs/plans-small --device cuda   # small boards
+python -m snake_agent train --agent plans --init runs/plans-small/model.pt --board 20x20:32 \
+    --board 14x14:16 --board 10x10:32 --free-share 0 --midgame-share 0.4 --recovery-share 0.05 \
+    --midgame-samples 6 --sweeps 0.05,0.25,1 --steps 400 --replay 500000 --workers 20 \
+    --out runs/plans-20 --device cuda                                                 # 20x20
+python -m snake_agent assess runs/plans-20/model-030.pt --agents plans --board 20x20 --games 100 \
+    --sources 100 --workers 20                                     # free T1 and T2, certified finish
+python -m snake_agent assess runs/plans-20/model-030.pt --agents plans --board 20x20 --games 100 \
+    --sources 100 --workers 20 --certify none                                         # pure free play
+```
+
 ## Reproducing the probe
 
 `python -m snake_agent reproduce` (about 20 seconds) replays the probe's
@@ -1118,7 +1453,7 @@ survivable.
 | Module | Contents |
 | --- | --- |
 | [`contract.py`](contract.py) | `Rules`, `TRAINING_RULES`, `NO_LIMIT`, `Outcome`, action conversion, `planning_game`, `choose_safely` |
-| [`survival.py`](survival.py) | `Board`, the survival certificate, `prove_lost`, `classify_moves` |
+| [`survival.py`](survival.py) | `Board`, the survival certificate, `prove_lost`, `classify_moves`; `arrival_times`, `opening_times` (free play) |
 | [`cycles.py`](cycles.py) | cycle order, `CycleEnvelope`, `ShortcutCyclePolicy` |
 | [`references.py`](references.py) | `GuardedGreedyPolicy`, the `REFERENCES` registry |
 | [`recovery.py`](recovery.py) | recovery starts for T2 |
@@ -1126,11 +1461,13 @@ survivable.
 | [`exact.py`](exact.py) | `solve`, `solve_envelope`, `ExactSolution`, `evaluate_policy` |
 | [`seeds.py`](seeds.py), [`stats.py`](stats.py) | held-out seed ranges; binomial and mean intervals |
 | [`reproduce.py`](reproduce.py) | the probe's reference numbers |
-| [`encoding.py`](encoding.py) | M1: the network inputs, `mirror`, `moves_scale`, `canonical_envelope` |
+| [`encoding.py`](encoding.py) | M1: the network inputs, `mirror`, `moves_scale`, `canonical_envelope`; free play: inputs without the cycle, arrival planes |
 | [`search.py`](search.py) | M1: Gumbel root search, `SearchAgent`, `PolicyAgent`, `policy_move`; M2: the relative unit; M3: the win unit and adaptive budgets |
-| [`network.py`](network.py) | M1: `SnakeNet`, `NetworkEvaluator` (M3: bounded batches, `release`), checkpoints (PyTorch) |
+| [`network.py`](network.py) | M1: `SnakeNet`, `NetworkEvaluator` (M3: bounded batches, `release`), checkpoints; free play: `NetworkConfig.cycle`, `arrival`, `widen` (PyTorch) |
 | [`selfplay.py`](selfplay.py) | M1 to M3: batched self-play, the kinds of start, training examples, playout caps |
-| [`train.py`](train.py) | M1 to M3: the training loop over board mixtures, worker balancing; `distill`, `improve_habits` (PyTorch) |
-| [`assess.py`](assess.py) | M1 and M2: batched assessment against the gates, the shortcut cycle on the same seeds (PyTorch) |
+| [`train.py`](train.py) | M1 to M3: the training loop over board mixtures, worker balancing; `distill`, `improve_habits`; free play: `TrainConfig.agent` (PyTorch) |
+| [`assess.py`](assess.py) | M1 and M2: batched assessment against the gates, the shortcut cycle on the same seeds; free play: `assess_free` (PyTorch) |
 | [`habits.py`](habits.py) | `Habit`, `HabitEvaluator`, paired windows (`compare`), `improve`, distillation examples |
+| [`plans.py`](plans.py) | Free play: the plan agent's `candidates`, `waits`, `choose`, `decide`, `PlanAgent`, self-play (`play`); the certified finish (`PlanConfig.certify`, `seeks_certificate`) |
+| [`certify.py`](certify.py) | The plan agent's certified finish: Hamiltonian cycles around spanning trees of 2×2 blocks (`layout`, `spanning`, `walk`), the exact check (`certify`, `certified`), certified paths and shortcuts (`certified_paths`, `shortcuts`, `greedy_walk`), the transition (`transition_paths`) |
 | [`__main__.py`](__main__.py) | `python -m snake_agent evaluate | solve | reproduce | train | assess | habits` |

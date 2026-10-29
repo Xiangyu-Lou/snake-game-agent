@@ -115,6 +115,10 @@ class Prediction:
     def row(self, i: int) -> LeafValue:
         return LeafValue(self.logits[i], float(self.win[i]), float(self.moves[i]))
 
+    def part(self, start: int, stop: int) -> Prediction:
+        """The evaluations of queries ``start`` to ``stop`` (excluded)."""
+        return Prediction(self.logits[start:stop], self.win[start:stop], self.moves[start:stop])
+
 
 Evaluator = Callable[[Sequence[Query]], Prediction]
 """Evaluates a batch of queries, for example with the network."""

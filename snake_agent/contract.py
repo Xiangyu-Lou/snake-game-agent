@@ -17,6 +17,11 @@ the reasons.
    On standard starts the agent stays inside the cycle-order envelope
    (:class:`snake_agent.cycles.CycleEnvelope`): every move there keeps the win
    certain, so the moves are all equally safe and speed decides between them.
+   The plan agent (:mod:`snake_agent.plans`) follows later decisions of the
+   owner: it plays free on standard starts for far fewer moves, accepting a
+   slightly lower clear rate, and finishes on a Hamiltonian-cycle certificate
+   that it rebuilds at every fruit (:mod:`snake_agent.certify`), not on the
+   canonical cycle's envelope.
 4. **Fruit timeout.** Under the training rules a game is lost after ``N + L``
    consecutive moves without fruit, ``N`` being the number of cells and ``L``
    the snake's current length (:class:`Rules`). Evaluations also run without

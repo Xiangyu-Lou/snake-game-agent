@@ -173,6 +173,68 @@ class Board:
         return None
 
 
+def arrival_times(board: Board, avoid: int = -1) -> list[int]:
+    """The earliest move at which the head can enter each cell, without eating; -1 if never.
+
+    A breadth-first search from the head through free cells and through body
+    cells that have moved away by the time the head arrives: a cell entered at
+    move ``t`` must have ``release <= t``. The head cannot wait, so a cell that
+    is reached only by circling first counts as never. ``avoid`` (for example
+    the fruit, on a path that must not eat) is never entered.
+    """
+    entered, neighbours, head = board.entered, board.neighbours, board.head
+    free_before = board.t - board.length  # release(c) == entered[c] - free_before
+    arrival = [-1] * board.cells
+    arrival[head] = 0
+    reverse = (board.heading + 2) % 4
+    frontier, t = [head], 1
+    while frontier:
+        layer = []
+        for cell in frontier:
+            for d, nxt in enumerate(neighbours[cell]):
+                if nxt < 0 or arrival[nxt] >= 0 or nxt == avoid or (cell == head and d == reverse):
+                    continue
+                if entered[nxt] - free_before <= t:
+                    arrival[nxt] = t
+                    layer.append(nxt)
+        frontier = layer
+        t += 1
+    return arrival
+
+
+def opening_times(board: Board) -> list[int]:
+    """When the head can first enter each cell, without eating, if it could wait where it stands.
+
+    As :func:`arrival_times`, but a body cell is entered at ``max(t, release)``: a lower bound on the
+    moves to any cell, reached or not, that counts a hole by when the body around it moves away. The
+    head cannot really wait, so a cell is no sooner reachable than this. Off-board cells are skipped;
+    the head's own cell is 0.
+    """
+    entered, neighbours, head = board.entered, board.neighbours, board.head
+    free_before = board.t - board.length
+    cells = board.cells
+    time = [-1] * cells
+    time[head] = 0
+    reverse = (board.heading + 2) % 4
+    buckets: list[list[int]] = [[head]]
+    t = 0
+    while t < len(buckets):
+        for cell in buckets[t]:
+            if time[cell] != t:
+                continue
+            for d, nxt in enumerate(neighbours[cell]):
+                if nxt < 0 or (cell == head and d == reverse):
+                    continue
+                when = max(t + 1, entered[nxt] - free_before)
+                if time[nxt] < 0 or when < time[nxt]:
+                    time[nxt] = when
+                    while len(buckets) <= when:
+                        buckets.append([])
+                    buckets[when].append(nxt)
+        t += 1
+    return time
+
+
 @dataclass(frozen=True)
 class LostProof:
     """The verdict of :func:`prove_lost`."""

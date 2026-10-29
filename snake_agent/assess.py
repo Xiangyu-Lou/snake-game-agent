@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import random
 import statistics
 from collections.abc import Generator, Sequence
 from concurrent.futures import Executor
@@ -53,12 +54,12 @@ from .evaluation import (
 )
 from .exact import ExactSolution, evaluate_policy, solve, solve_envelope
 from .network import NetworkEvaluator, from_bytes
+from .plans import PlanAgent, PlanConfig, Planner, decide
 from .recovery import RecoveryStart, recovery_starts
 from .references import REFERENCES
 from .search import (
     EVALUATION,
     Evaluator,
-    LeafValue,
     PolicyAgent,
     Query,
     SearchAgent,
@@ -76,21 +77,30 @@ T1_REFERENCES = {(4, 4): 43.89, (6, 6): 214.0, (10, 10): 1445.0, (20, 20): 20737
 (43.888); 6x6, 10x10 and 20x20 are the probe's means (exact on 6x6: 212.78)."""
 
 AGENTS = ("search", "policy")
+FREE_AGENTS = ("plans",)
+"""Agents that play standard starts freely, outside the envelope (:mod:`snake_agent.plans`)."""
 T2_REFERENCES = ("hamiltonian", "guarded-greedy", "greedy")
 """The reference policies of track T2 (the shortcut cycle needs an aligned start)."""
 
 
 def agent_spec(
-    weights: bytes, kind: str, rules: Rules = TRAINING_RULES, search: SearchConfig = EVALUATION
+    weights: bytes,
+    kind: str,
+    rules: Rules = TRAINING_RULES,
+    search: SearchConfig | PlanConfig = EVALUATION,
 ) -> AgentSpec:
-    """The network as a harness agent: ``"search"`` (with the ``search`` settings) or ``"policy"`` (raw)."""
+    """The network as a harness agent: ``"search"`` (with the ``search`` settings), ``"policy"`` (raw) or
+    ``"plans"`` (:class:`~snake_agent.plans.PlanAgent`, ``search`` then holding its
+    :class:`~snake_agent.plans.PlanConfig`)."""
     evaluator = NetworkEvaluator(from_bytes(weights))
     if kind == "search":
         factory = lambda seed: SearchAgent(evaluator, rules, search, seed)  # noqa: E731
     elif kind == "policy":
         factory = lambda seed: PolicyAgent(evaluator, rules)  # noqa: E731
+    elif kind == "plans":
+        factory = lambda seed: PlanAgent(evaluator, rules, search, seed)  # noqa: E731
     else:
-        raise ValueError(f"unknown agent {kind!r}: use {' or '.join(AGENTS)}")
+        raise ValueError(f"unknown agent {kind!r}: use {', '.join(AGENTS + FREE_AGENTS)}")
     return AgentSpec(f"network-{kind}", factory, Provenance.SELF_PLAY)
 
 
@@ -107,57 +117,89 @@ class _Lockstep:
         run: GameRun,
         kind: str,
         rules: Rules,
-        search: SearchConfig,
+        search: SearchConfig | PlanConfig,
         seed: int,
         decisions: list[tuple[GameState, RelativeAction]] | None = None,
     ) -> None:
-        if kind not in AGENTS:
-            raise ValueError(f"unknown agent {kind!r}: use {' or '.join(AGENTS)}")
+        if kind not in AGENTS + FREE_AGENTS:
+            raise ValueError(f"unknown agent {kind!r}: use {', '.join(AGENTS + FREE_AGENTS)}")
         self.run, self.kind, self.rules, self.config = run, kind, rules, search
         self.rng = np.random.default_rng(seed)
+        self.plan_rng = random.Random(seed)  # PlanAgent's generator for the same seed
+        self.planner = Planner()
         self.epoch = _Epoch()
         self.decisions = decisions
-        self.moving: Generator[Query, LeafValue, Any] | None = None
+        self.moving: Generator[Any, Any, Any] | None = None
         self.state: GameState | None = None
-        self.value: LeafValue | None = None
+        self.value: Any = None
 
-    def advance(self) -> Query | None:
-        """Play until the agent needs an evaluation (returned) or the game is over (None)."""
+    def advance(self) -> Query | list[Query] | None:
+        """Play until the agent needs evaluations (returned: one query, or a plan agent's list) or the game
+        is over (None)."""
         while True:
             if self.moving is None:
                 self.state = self.run.next_state()
                 if self.state is None:
                     return None
-                history = self.epoch.observe(self.state)
-                if self.kind == "search":
-                    self.moving = root_search(self.state, self.rules, self.config, self.rng, history)
+                if self.kind == "plans":
+                    action = self.planner.next_action(self.state)
+                    if action is not None:
+                        self._play(action)
+                        continue
+                    self.moving = decide(self.state, self.rules, self.config, self.plan_rng)
                 else:
-                    self.moving = policy_move(self.state, self.rules, history)
+                    history = self.epoch.observe(self.state)
+                    if self.kind == "search":
+                        self.moving = root_search(self.state, self.rules, self.config, self.rng, history)
+                    else:
+                        self.moving = policy_move(self.state, self.rules, history)
             value, self.value = self.value, None
             try:
                 return self.moving.send(value)
             except StopIteration as stop:
                 self.moving = None
-                action = stop.value.action if self.kind == "search" else stop.value
-                if self.decisions is not None:
-                    self.decisions.append((self.state, action))
-                self.run.play(action)
+                if self.kind == "plans":
+                    decision = stop.value
+                    if decision.plan is None:
+                        action = decision.wait
+                    else:
+                        self.planner.follow(decision.plan)
+                        action = self.planner.next_action(self.state)
+                else:
+                    action = stop.value.action if self.kind == "search" else stop.value
+                self._play(action)
+
+    def _play(self, action: RelativeAction) -> None:
+        if self.decisions is not None:
+            self.decisions.append((self.state, action))
+        self.run.play(action)
 
 
 def play_lockstep(evaluator: Evaluator, games: Sequence[_Lockstep]) -> list[GameRecord]:
     """Play ``games`` to the end at once, evaluating all their pending leaves in one batch per round."""
     waiting = list(games)
     while waiting:
-        asking, queries = [], []
+        asking, queries, counts = [], [], []
         for game in waiting:
             query = game.advance()
             if query is not None:
                 asking.append(game)
-                queries.append(query)
+                if isinstance(query, list):
+                    queries += query
+                    counts.append(len(query))
+                else:
+                    queries.append(query)
+                    counts.append(None)
         if queries:
             prediction = evaluator(queries)
-            for i, game in enumerate(asking):
-                game.value = prediction.row(i)
+            offset = 0
+            for game, count in zip(asking, counts, strict=True):
+                if count is None:
+                    game.value = prediction.row(offset)
+                    offset += 1
+                else:
+                    game.value = prediction.part(offset, offset + count)
+                    offset += count
         waiting = asking
     return [game.run.result for game in games]
 
@@ -183,7 +225,8 @@ def _t1_task(args: tuple) -> tuple[list[GameRecord], list[tuple[GameState, Relat
     torch.set_num_threads(1)
     decisions: list[tuple[GameState, RelativeAction]] | None = [] if record else None
     games = [SnakeGame(GameConfig(width, height), seed=seed) for seed in seeds]
-    runs = _runs(kind, games, rules, [{"seed": seed} for seed in seeds], envelope=True)
+    envelope = kind not in FREE_AGENTS  # free agents are not held to the envelope
+    runs = _runs(kind, games, rules, [{"seed": seed} for seed in seeds], envelope=envelope)
     lockstep = [_Lockstep(run, kind, rules, search, i, decisions) for i, run in enumerate(runs)]
     evaluator = NetworkEvaluator(from_bytes(weights), device)
     records = play_lockstep(evaluator, lockstep)
@@ -221,7 +264,7 @@ def t1(
     split: SeedRange = VALIDATION,
     rules: Rules = TRAINING_RULES,
     workers: int = 8,
-    search: SearchConfig = EVALUATION,
+    search: SearchConfig | PlanConfig = EVALUATION,
     decisions: list[tuple[GameState, RelativeAction]] | None = None,
     device: str = "cpu",
 ) -> Evaluation:
@@ -229,7 +272,8 @@ def t1(
 
     Each worker plays its games at once, evaluating their leaves in batches on ``device``
     (:func:`play_lockstep`). The agent's moves, with the states they were played in, are appended to
-    ``decisions`` if given.
+    ``decisions`` if given. A free agent (:data:`FREE_AGENTS`, ``search`` then holding its
+    :class:`~snake_agent.plans.PlanConfig`) is not held to the envelope.
     """
     seeds = list(standard_seeds(split, games))
     record = decisions is not None
@@ -387,11 +431,11 @@ def t2(
     split: SeedRange = VALIDATION,
     rules: Rules = TRAINING_RULES,
     workers: int = 8,
-    search: SearchConfig = EVALUATION,
+    search: SearchConfig | PlanConfig = EVALUATION,
     device: str = "cpu",
 ) -> Evaluation:
-    """Track T2 on ``starts`` for the network (``"search"``, ``"policy"``; batched on ``device`` as in
-    :func:`t1`) or a reference policy."""
+    """Track T2 on ``starts`` for the network (``"search"``, ``"policy"``, ``"plans"``; batched on
+    ``device`` as in :func:`t1`) or a reference policy."""
     fruit_seeds = list(recovery_fruit_seeds(split, len(starts)))
     pairs = list(zip(starts, fruit_seeds, strict=True))
     tasks = [
@@ -613,6 +657,62 @@ def assess(
             report["exact"] = exact_4x4(
                 pool, weights, starts, split, rules, workers, games=games, search=search, device=device
             )
+    return report
+
+
+def assess_free(
+    pool: Executor,
+    weights: bytes,
+    width: int,
+    height: int,
+    *,
+    games: int = 100,
+    sources: int = 60,
+    split: SeedRange = VALIDATION,
+    rules: Rules = TRAINING_RULES,
+    workers: int = 8,
+    references: dict[float, float] | None = None,
+    plans: PlanConfig | None = None,
+    device: str = "cpu",
+) -> dict[str, Any]:
+    """The plan agent on standard and recovery starts, as a JSON-ready report.
+
+    T1 is free here: the agent is not held to the envelope, so it can lose. The report gives the clear
+    rate with its 95% interval (``summary``), the moves of the games won, and their paired difference
+    from the shortcut cycle on the same fruit seeds (``versus_shortcut``). T2 and its gate are as in
+    :func:`assess`.
+    """
+    plans = PlanConfig() if plans is None else plans
+    report: dict[str, Any] = {
+        "board": [width, height],
+        "split": split.name,
+        "games": games,
+        "plans": dataclasses.asdict(plans),
+    }
+    shortcut = None
+    if canonical_envelope(width, height) is not None:
+        shortcut = shortcut_t1(pool, width, height, games, split, rules, workers)
+        report["t1_shortcut"] = {"summary": shortcut.summary().to_dict()}
+    evaluation = t1(pool, weights, "plans", width, height, games, split, rules, workers, plans, None, device)
+    entry: dict[str, Any] = {"summary": evaluation.summary().to_dict()}
+    if shortcut is not None:
+        entry["versus_shortcut"] = versus(evaluation, shortcut)
+    report["t1_plans"] = entry
+    starts = recovery_starts_parallel(pool, width, height, sources, split, workers)
+    if starts:
+        if references is None:
+            references = best_rates(
+                t2(pool, None, name, starts, split, rules, workers) for name in T2_REFERENCES
+            )
+        report["t2_references"] = {str(band): rate for band, rate in sorted(references.items())}
+        evaluation = t2(pool, weights, "plans", starts, split, rules, workers, plans, device)
+        gate = recovery_gate(evaluation, references)
+        report["t2_plans"] = {
+            str(band): evaluation.summary(band).to_dict() for band in evaluation.bands()
+        } | {
+            "all": evaluation.summary().to_dict(),
+            "gate": {"passed": gate.passed, "reasons": list(gate.reasons)},
+        }
     return report
 
 

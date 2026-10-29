@@ -33,6 +33,13 @@ generation, with the throughput), ``model.pt`` (the latest network) and
 from a checkpoint and runs rounds of :func:`compare_habits` (paired windows for
 each band of fill, across worker processes) and :func:`distill` (the network
 trained to play the improved habit with its raw policy).
+
+**Free play** (after M3, :mod:`snake_agent.plans`): with ``agent="plans"`` the
+games are the plan agent's (:func:`snake_agent.plans.play`), its examples the
+states where it decided and the afterstates it reached, except the certified
+ones that it never asks the network about, and the assessments free T1 and T2
+(:func:`~snake_agent.assess.assess_free`). A checkpoint whose
+network lacks the arrival planes is widened to read them (``init``).
 """
 
 from __future__ import annotations
@@ -56,11 +63,23 @@ import torch.nn.functional as F
 
 from snake_game import GameState
 
-from .assess import assess, shortcut_t1, t1, versus
+from . import plans as plan_agent
+from .assess import assess, assess_free, shortcut_t1, t1, versus
 from .contract import TRAINING_RULES, Outcome
 from .encoding import GLOBALS, mirror
 from .habits import BANDS, CANDIDATES, Comparison, Habit, compare, distillation_examples, improve
-from .network import NetworkConfig, NetworkEvaluator, SnakeNet, from_bytes, load, save, tensors, to_bytes
+from .network import (
+    NetworkConfig,
+    NetworkEvaluator,
+    SnakeNet,
+    from_bytes,
+    load,
+    save,
+    tensors,
+    to_bytes,
+    widen,
+)
+from .plans import PlanConfig
 from .search import SELF_PLAY, SearchConfig
 from .selfplay import KINDS, Examples, GameSummary, Label, make_start, play
 
@@ -74,6 +93,12 @@ class TrainConfig:
 
     boards: tuple[tuple[int, int, int], ...] = ((6, 6, 256),)
     """The mixture of boards: ``(width, height, games per generation)`` for each."""
+    agent: str = "search"
+    """``"search"``: self-play with the Gumbel search (M1 to M3); ``"plans"``: the plan agent's free play
+    (:mod:`snake_agent.plans`), whose examples are the states where it decided and the afterstates it
+    reached."""
+    plans: PlanConfig = field(default_factory=lambda: plan_agent.SELF_PLAY)
+    """The plan agent's self-play settings; its assessments use the same without exploration."""
     generations: int = 50
     free_share: float = 0.5
     """Share of each board's games from free starts."""
@@ -157,6 +182,8 @@ class TrainConfig:
             raise ValueError("the start shares must be non-negative and add up to at most 1")
         if not 0 <= self.seed < 500:
             raise ValueError("the run seed must be in [0, 500)")
+        if self.agent not in ("search", "plans"):
+            raise ValueError(f"unknown agent {self.agent!r}: use search or plans")
 
     @property
     def games(self) -> int:
@@ -301,7 +328,21 @@ def _self_play_task(args: tuple) -> tuple[list[GameSummary], Examples | None, fl
     if not starts:
         return [], None, time.perf_counter() - began
     evaluator = NetworkEvaluator(from_bytes(weights), device)
-    summaries, examples = play(evaluator, starts, TRAINING_RULES, search, seed=seed, size=size, **options)
+    if isinstance(search, PlanConfig):
+        inputs = evaluator.model.config
+        summaries, examples = plan_agent.play(
+            evaluator,
+            starts,
+            TRAINING_RULES,
+            search,
+            seed=seed,
+            size=size,
+            cycle=inputs.cycle,
+            arrival=inputs.arrival,
+            **options,
+        )
+    else:
+        summaries, examples = play(evaluator, starts, TRAINING_RULES, search, seed=seed, size=size, **options)
     evaluator.release()
     return summaries, examples, time.perf_counter() - began
 
@@ -409,9 +450,12 @@ def train(
     model = SnakeNet(config.network).to(device)
     if init is not None:
         start, _ = load(init, device)
-        if start.config != config.network:
+        inputs = {"cycle": config.network.cycle, "arrival": config.network.arrival}
+        if dataclasses.replace(start.config, **inputs) != config.network or (
+            start.config.arrival and not config.network.arrival
+        ):
             raise ValueError(f"the checkpoint's network {start.config} is not {config.network}")
-        model.load_state_dict(start.state_dict())
+        widen(model, start.state_dict())  # its inputs may differ: the cycle, or new arrival planes
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     replay = Replay(config.replay)
     pools: dict[tuple[int, int], deque[GameState]] = {}
@@ -445,6 +489,13 @@ def train(
         "fast_simulations": config.fast_simulations,
         "max_examples": config.max_examples,
     }
+    if config.agent == "plans":
+        self_play = config.plans
+        options = {
+            "beta": config.beta,
+            "moves_lambda": config.moves_lambda,
+            "samples": config.midgame_samples,
+        }
     games_played = 0
     summaries: list[GameSummary] = []  # the last generation's games, which price the next one's starts
     with ProcessPoolExecutor(config.workers, mp_context=context, initializer=_init_worker) as pool:
@@ -504,18 +555,32 @@ def train(
             last = generation + 1 == config.generations
             if (generation + 1) % config.eval_every == 0 or last:
                 width, height = config.eval_board
-                report = assess(
-                    pool,
-                    to_bytes(model),
-                    width,
-                    height,
-                    games=config.eval_games,
-                    sources=config.eval_sources,
-                    workers=config.workers,
-                    references=references,
-                    search=search,
-                    device=inference,
-                )
+                if config.agent == "plans":
+                    report = assess_free(
+                        pool,
+                        to_bytes(model),
+                        width,
+                        height,
+                        games=config.eval_games,
+                        sources=config.eval_sources,
+                        workers=config.workers,
+                        references=references,
+                        plans=dataclasses.replace(config.plans, explore=0.0),
+                        device=inference,
+                    )
+                else:
+                    report = assess(
+                        pool,
+                        to_bytes(model),
+                        width,
+                        height,
+                        games=config.eval_games,
+                        sources=config.eval_sources,
+                        workers=config.workers,
+                        references=references,
+                        search=search,
+                        device=inference,
+                    )
                 references = {float(k): v for k, v in report.get("t2_references", {}).items()} or None
                 record["assessment"] = report
                 record["seconds"]["assessment"] = round(time.perf_counter() - trained, 1)
@@ -552,7 +617,7 @@ def _line(record: dict[str, Any]) -> str:
     parts.append(f"{seconds['self_play']:.0f}+{seconds['train']:.0f}s")
     if "assessment" in record:
         report = record["assessment"]
-        for kind in ("search", "policy"):
+        for kind in ("search", "policy", "plans"):
             if f"t1_{kind}" in report:
                 t1 = report[f"t1_{kind}"]["summary"]
                 parts.append(f"T1 {kind} {t1['won']}/{t1['games']} {t1['mean_moves']}")

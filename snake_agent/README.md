@@ -918,6 +918,11 @@ network is the habits' 10×10 network after one round of habits on 20×20; the
 agent plays its prior inside the envelope and searches free play with a win
 unit.
 
+A two-minute video, [`media/m3-20x20.mp4`](../media/m3-20x20.mp4), shows the
+agent and the shortcut cycle side by side on one validation game with the same
+fruit seed (seed 1,000,000,005, the closest of the first eight to the test
+mean: the agent fills the board 318 moves sooner), then the gate's results.
+
 ### What M3 adds
 
 - **Adaptive budgets** (review §2.4):

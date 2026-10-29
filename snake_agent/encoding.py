@@ -43,7 +43,7 @@ from snake_game import Direction, GameState, RelativeAction
 from .contract import Rules
 from .cycles import CycleEnvelope
 from .exact import standard_starts
-from .survival import Board, MoveClass, classify_moves, neighbour_table
+from .survival import Board, MoveClass, arrival_times, classify_moves, neighbour_table
 
 PLANES = (
     "valid",
@@ -71,7 +71,13 @@ PLANES = (
     "wall_right",
     "wall_down",
     "wall_left",
+    "arrival",  # the earliest move the head can enter each cell, through cells vacated in time, / N
+    "arrival_cells",  # the same in cells, saturating at 16
+    "unreached",  # free cells it cannot reach that way (they wait for the body to move away)
 )
+ARRIVAL_PLANES = 3
+"""The last planes, the arrival times: networks without :attr:`~snake_agent.network.NetworkConfig.arrival`
+do not read them."""
 GLOBALS = (
     "occupancy",
     "free",
@@ -193,12 +199,18 @@ def encode(
     *,
     afterstate: bool = False,
     classes: tuple[MoveClass, MoveClass, MoveClass] | None = None,
+    cycle: bool = True,
+    arrival: bool = False,
 ) -> Encoded:
     """Encode a running ``state``; with ``afterstate`` its fruit is ignored (not yet placed).
 
     ``classes`` overrides the move classes, for instance with ``LOST`` moves
     found by a proof search at the root; by default they come from
-    :func:`classify_moves` without one.
+    :func:`classify_moves` without one. Without ``cycle`` the canonical cycle's
+    inputs stay zero, as on a board that has no cycle: for an agent that must
+    not lean on it (:mod:`snake_agent.plans`). With ``arrival`` the arrival
+    planes hold :func:`~snake_agent.survival.arrival_times`; otherwise they stay
+    zero.
     """
     width, height = state.width, state.height
     cells = width * height
@@ -231,7 +243,7 @@ def encode(
     unseen = -(1 << 30)
     distance, slack = [-1] * cells, [unseen] * cells
     distance[head] = 0
-    frontier, arrival = [head], 1
+    frontier, step = [head], 1
     reverse = (int(state.direction) + 2) % 4
     while frontier:
         layer = []
@@ -240,15 +252,21 @@ def encode(
                 if nxt < 0 or (cell == head and direction == reverse):
                     continue
                 if release_of[nxt]:
-                    if arrival - release_of[nxt] > slack[nxt]:
-                        slack[nxt] = arrival - release_of[nxt]
+                    if step - release_of[nxt] > slack[nxt]:
+                        slack[nxt] = step - release_of[nxt]
                 elif distance[nxt] < 0:
-                    distance[nxt] = arrival
+                    distance[nxt] = step
                     layer.append(nxt)
         frontier = layer
-        arrival += 1
+        step += 1
     occupied = np.zeros(cells, dtype=bool)
     occupied[flat] = True
+    if arrival:
+        times = np.array(arrival_times(board))
+        reached = times > 0
+        planes[_P["arrival"]] = np.where(reached, times, 0) / cells
+        planes[_P["arrival_cells"]] = np.where(reached, np.minimum(times, SATURATION), 0) / SATURATION
+        planes[_P["unreached"]] = ~reached & ~occupied
     distance_ = np.array(distance)
     reach = (distance_ > 0) & ~occupied
     planes[_P["reach"]] = reach
@@ -265,7 +283,7 @@ def encode(
         planes[_P["toward_up"] + (d - k) % 4] = toward == d
 
     globals_ = np.zeros(len(GLOBALS), dtype=np.float32)
-    position = canonical_cycle(width, height)
+    position = canonical_cycle(width, height) if cycle else None
     in_order = False
     jumps: dict[Direction, int] = {}
     if position is not None:

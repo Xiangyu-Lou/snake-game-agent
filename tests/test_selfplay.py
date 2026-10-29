@@ -5,7 +5,7 @@ import pytest
 
 from snake_agent.contract import NO_LIMIT, TRAINING_RULES, Outcome
 from snake_agent.cycles import aligned_cycles
-from snake_agent.encoding import canonical_envelope, moves_scale
+from snake_agent.encoding import PLANES, canonical_envelope, moves_scale
 from snake_agent.recovery import recovery_starts
 from snake_agent.search import Prediction, envelope_certain
 from snake_agent.seeds import VALIDATION
@@ -38,7 +38,7 @@ def test_standard_games_are_won_inside_the_envelope():
     # An example per move, and one per eating move that does not fill the board.
     assert len(examples) == sum(s.moves + s.fruits - 1 for s in summaries)
     assert examples.has_moves.all() and (examples.moves > 0).all()
-    assert examples.planes.shape[1:] == (25, 4, 4) and examples.planes.dtype == np.float16
+    assert examples.planes.shape[1:] == (len(PLANES), 4, 4) and examples.planes.dtype == np.float16
 
 
 def test_policy_targets_cover_the_moves_the_search_considered():

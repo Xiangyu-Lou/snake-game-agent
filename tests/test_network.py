@@ -1,3 +1,4 @@
+import dataclasses
 import io
 
 import numpy as np
@@ -6,7 +7,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from snake_agent.contract import TRAINING_RULES  # noqa: E402
-from snake_agent.encoding import encode, stack  # noqa: E402
+from snake_agent.encoding import ARRIVAL_PLANES, encode, stack  # noqa: E402
 from snake_agent.network import (  # noqa: E402
     NetworkConfig,
     NetworkEvaluator,
@@ -16,6 +17,7 @@ from snake_agent.network import (  # noqa: E402
     save,
     tensors,
     to_bytes,
+    widen,
 )
 from snake_agent.search import Query, run_search  # noqa: E402
 from snake_agent.selfplay import free_starts, play, standard_starts  # noqa: E402
@@ -115,3 +117,29 @@ def test_the_evaluator_answers_large_batches_in_chunks():
     for name in ("logits", "win", "moves"):
         assert np.allclose(getattr(chunked, name), getattr(whole, name), atol=1e-5)
     NetworkEvaluator(model).release()  # a no-op on the CPU
+
+
+def test_networks_without_the_arrival_planes_do_not_read_them():
+    model = network(1)
+    encoded = [encode(s, TRAINING_RULES) for s in states(6, 6, 6)]
+    planes, actions, globals_, head = stack(encoded)
+    noisy = planes.copy()
+    noisy[:, -ARRIVAL_PLANES:] = np.random.default_rng(0).random(noisy[:, -ARRIVAL_PLANES:].shape)
+    with torch.no_grad():
+        clean = model(*tensors((planes, actions, globals_, head)))
+        other = model(*tensors((noisy, actions, globals_, head)))
+    for a, b in zip(clean, other, strict=True):
+        assert torch.equal(a, b)
+
+
+def test_widening_a_network_for_the_arrival_planes_keeps_its_outputs():
+    model = network(2)
+    wide = SnakeNet(dataclasses.replace(SMALL, arrival=True)).eval()
+    widen(wide, model.state_dict())
+    assert wide.stem.weight.shape[1] == model.stem.weight.shape[1] + ARRIVAL_PLANES
+    encoded = [encode(s, TRAINING_RULES, arrival=True) for s in states(6, 6, 6, seed=3)]
+    batch = tensors(stack(encoded))
+    assert batch[0][:, -ARRIVAL_PLANES:].any()
+    with torch.no_grad():
+        for a, b in zip(model(*batch), wide(*batch), strict=True):
+            assert torch.allclose(a, b, atol=1e-6)

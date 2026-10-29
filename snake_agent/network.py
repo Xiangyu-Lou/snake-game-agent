@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .encoding import ACTION_FEATURES, GLOBALS, PLANES, encode, stack
+from .encoding import ACTION_FEATURES, ARRIVAL_PLANES, GLOBALS, PLANES, encode, stack
 from .search import Prediction, Query
 
 _VALID = PLANES.index("valid")
@@ -47,6 +47,15 @@ class NetworkConfig:
     channels: int = 64
     blocks: int = 6
     hidden: int = 128
+    cycle: bool = True
+    """Whether the inputs include the canonical cycle (see :func:`~snake_agent.encoding.encode`)."""
+    arrival: bool = False
+    """Whether the inputs include the arrival planes (see :func:`~snake_agent.encoding.encode`)."""
+
+    @property
+    def planes(self) -> int:
+        """The input planes the network reads: the first ones of :data:`~snake_agent.encoding.PLANES`."""
+        return len(PLANES) if self.arrival else len(PLANES) - ARRIVAL_PLANES
 
 
 class _Block(nn.Module):
@@ -78,7 +87,7 @@ class SnakeNet(nn.Module):
         super().__init__()
         self.config = config = NetworkConfig() if config is None else config
         c, h = config.channels, config.hidden
-        self.stem = nn.Conv2d(len(PLANES), c, 3, padding=1)
+        self.stem = nn.Conv2d(config.planes, c, 3, padding=1)
         self.stem_globals = nn.Linear(len(GLOBALS), c)
         self.blocks = nn.ModuleList(_Block(c) for _ in range(config.blocks))
         self.summary = nn.Sequential(nn.Linear(3 * c + len(GLOBALS), h), nn.ReLU())
@@ -93,6 +102,7 @@ class SnakeNet(nn.Module):
         self, planes: torch.Tensor, actions: torch.Tensor, globals_: torch.Tensor, head: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Policy logits ``(n, 3)``, win logits ``(n,)`` and moves ``(n,)`` of a batch of encodings."""
+        planes = planes[:, : self.config.planes]
         mask = planes[:, _VALID : _VALID + 1]
         cells = mask.sum((2, 3)).clamp(min=1.0)
         x = (self.stem(planes) + self.stem_globals(globals_)[:, :, None, None]) * mask
@@ -153,8 +163,17 @@ class NetworkEvaluator:
         size = max(max(q.state.width, q.state.height) for q in queries)
         parts = []
         for i in range(0, len(queries), self.max_batch):
+            config = self.model.config
             encoded = [
-                encode(q.state, q.rules, size, afterstate=q.afterstate, classes=q.classes)
+                encode(
+                    q.state,
+                    q.rules,
+                    size,
+                    afterstate=q.afterstate,
+                    classes=q.classes,
+                    cycle=config.cycle,
+                    arrival=config.arrival,
+                )
                 for q in queries[i : i + self.max_batch]
             ]
             logits, win, moves = self.model(*tensors(stack(encoded), self.device))
@@ -172,6 +191,19 @@ def save(model: SnakeNet, path: str | io.BytesIO, **meta: Any) -> None:
     """Save the weights, the network's size and ``meta`` (for example the training settings)."""
     weights = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
     torch.save({"config": asdict(model.config), "state_dict": weights, "meta": meta}, path)
+
+
+def widen(model: SnakeNet, weights: dict[str, torch.Tensor]) -> None:
+    """Load ``weights`` into ``model``, whose stem may read more input planes: the extra planes start with
+    zero weights, so the network computes what it did and training can learn to use them."""
+    weights = dict(weights)
+    stem = weights["stem.weight"]
+    width = model.stem.weight.shape[1]
+    if stem.shape[1] < width:
+        wider = torch.zeros(stem.shape[0], width, *stem.shape[2:], dtype=stem.dtype, device=stem.device)
+        wider[:, : stem.shape[1]] = stem
+        weights["stem.weight"] = wider
+    model.load_state_dict(weights)
 
 
 def load(path: str | io.BytesIO, device: torch.device | str = "cpu") -> tuple[SnakeNet, dict[str, Any]]:

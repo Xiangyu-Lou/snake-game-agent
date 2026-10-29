@@ -5,7 +5,6 @@ import zlib
 import numpy as np
 import pytest
 
-from snake_agent.assess import _Lockstep, _runs, play_lockstep
 from snake_agent.contract import TRAINING_RULES, Outcome
 from snake_agent.encoding import GLOBALS, PLANES, encode, moves_scale
 from snake_agent.evaluation import run_game
@@ -151,6 +150,9 @@ def hashed(queries):
 
 
 def test_batched_games_play_as_the_plan_agent_does_one_at_a_time():
+    pytest.importorskip("torch")  # the lockstep driver lives in assess, which imports PyTorch
+    from snake_agent.assess import _Lockstep, _runs, play_lockstep
+
     config = PlanConfig(paths=4, tolerance=0.05)
     expected = [
         run_game(SnakeGame(GameConfig(6, 6), seed=s), PlanAgent(hashed, TRAINING_RULES, config, i), seed=s)

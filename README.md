@@ -22,7 +22,17 @@ screen either; it reads the exact positions of the snake and the fruit.
    solution of 4×4. It reproduces the reference numbers of the plan's probe.
    Milestone M1 adds the network, the Gumbel search, self-play and training,
    learned from scratch on 4×4 and 6×6 (`pip install -e ".[train]"` for PyTorch).
+   Milestones M2 and M3 take it to 10×10 and 20×20, where it wins every test
+   game. After M3 the **plan agent** clears the board far faster: it plays free
+   while the snake is short, then finishes on a Hamiltonian-cycle certificate
+   that it rebuilds at every fruit. With its current network (a residual CNN of
+   0.6 M parameters trained by its own self-play; an interim result, training
+   continues) it wins 298 of 299 test games of 20×20 in 11,047 moves on
+   average, 46% fewer than M3's agent.
    **Documentation: [`snake_agent/README.md`](snake_agent/README.md)**
+
+<p align="center"><a href="snake_agent/docs/plan-agent-20x20.mp4"><img src="snake_agent/docs/plan-agent-20x20.png" alt="The plan agent on 20×20" width="320"></a><br>
+<a href="snake_agent/docs/plan-agent-20x20.mp4">Watch the plan agent fill a 20×20 board</a> (100 s video)</p>
 
 ## Quick start
 

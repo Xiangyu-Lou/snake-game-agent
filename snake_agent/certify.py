@@ -25,6 +25,10 @@ Following one walk is a fixed cycle's pace. Speed comes from changing the walk
 from fruit to fruit: a path to the fruit is as safe as the walk when its
 afterstate is certified too, and :func:`shortcuts` searches such paths,
 shortest first.
+
+The searches run in the compiled kernels of :mod:`snake_agent.fast`, over the
+layout's tables (:func:`tables`); the functions here take and return plain
+lists.
 """
 
 from __future__ import annotations
@@ -33,10 +37,13 @@ import functools
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import NamedTuple
+
+import numpy as np
 
 from snake_game import GameState
 
-from .survival import neighbour_table
+from . import fast
 
 
 @dataclass(frozen=True)
@@ -143,6 +150,70 @@ def layout(width: int, height: int, orientation: int) -> Layout:
     )
 
 
+class Tables(NamedTuple):
+    """A layout as arrays, for the kernels (:mod:`snake_agent.fast`)."""
+
+    gate: np.ndarray
+    cross: np.ndarray
+    side: np.ndarray
+    block: np.ndarray
+    ends: np.ndarray
+    """``(edges, 2)``."""
+    bnbr: np.ndarray
+    """``(blocks, 4)``: each block's neighbouring blocks, -1 where there are fewer."""
+    bedge: np.ndarray
+    """``(blocks, 4)``: the edge to each of them."""
+    entries: np.ndarray
+    """``(cells, 2)``: the cells whose moves can enter each cell, -1 where there are fewer."""
+    ring: np.ndarray
+    """``(cells, 8)``: each cell's eight neighbours round the ring from the one above (:func:`_ring`)."""
+    nbr: np.ndarray
+    blocks: int
+
+
+@functools.cache
+def _tables(width: int, height: int, orientation: int) -> Tables:
+    lay = layout(width, height, orientation)
+
+    def padded(rows, size):
+        return np.array([list(row) + [-1] * (size - len(row)) for row in rows], dtype=np.int64)
+
+    return Tables(
+        np.array(lay.gate, dtype=np.int64),
+        np.array(lay.cross, dtype=np.int64),
+        np.array(lay.side, dtype=np.int64),
+        np.array(lay.block, dtype=np.int64),
+        np.array(lay.ends, dtype=np.int64).reshape(len(lay.ends), 2),
+        padded([[b for b, _ in n] for n in lay.neighbours], 4),
+        padded([[e for _, e in n] for n in lay.neighbours], 4),
+        padded(lay.entries, 2),
+        np.array(_ring(width, height), dtype=np.int64).reshape(width * height, 8),
+        fast.grid(width, height),
+        lay.blocks,
+    )
+
+
+def tables(lay: Layout) -> Tables:
+    """The layout's tables (cached)."""
+    return _tables(lay.width, lay.height, lay.orientation)
+
+
+def _cells(cells: Sequence[int]) -> np.ndarray:
+    return np.asarray(cells, dtype=np.int64)
+
+
+def _need(lay: Layout, need: dict[int, bool]) -> np.ndarray:
+    """``need`` as the kernels' decisions per gate."""
+    array = np.full(len(lay.ends), -1, dtype=np.int8)
+    for e, inside in need.items():
+        array[e] = inside
+    return array
+
+
+def _generator(rng: random.Random) -> np.ndarray:
+    return fast.generator(rng.getrandbits(32))
+
+
 def flat_body(state: GameState) -> list[int]:
     """The body's cells as flat indices, head first."""
     width = state.width
@@ -154,61 +225,25 @@ def requirements(lay: Layout, body: Sequence[int]) -> dict[int, bool] | None:
 
     None if a move is not one of its cell's two moves, or two moves disagree about a gate.
     """
-    gate, cross, side = lay.gate, lay.cross, lay.side
-    need: dict[int, bool] = {}
-    for k in range(len(body) - 1, 0, -1):
-        cell, nxt = body[k], body[k - 1]
-        if nxt == side[cell]:
-            inside = False
-        elif nxt == cross[cell]:
-            inside = True
-        else:
-            return None
-        e = gate[cell]
-        if e >= 0 and need.setdefault(e, inside) != inside:
-            return None
-    return need
+    t = tables(lay)
+    ok, need = fast.requirements(t.gate, t.cross, t.side, _cells(body), len(lay.ends))
+    return {int(e): bool(need[e]) for e in np.flatnonzero(need >= 0)} if ok else None
 
 
 def spanning(lay: Layout, need: dict[int, bool], rng: random.Random | None = None) -> list[bool] | None:
     """A spanning tree of the blocks, as membership per edge, with the gates ``need`` puts in and without
     the ones it keeps out; None if there is none. The other edges join in order, or at random with
     ``rng``."""
-    parent = list(range(lay.blocks))
-
-    def find(a: int) -> int:
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    ends = lay.ends
-    tree = [False] * len(ends)
-    joined = 0
-    for e, inside in need.items():
-        if inside:
-            a, b = find(ends[e][0]), find(ends[e][1])
-            if a == b:
-                return None
-            parent[a] = b
-            tree[e] = True
-            joined += 1
-    rest = [e for e in range(len(ends)) if e not in need]
-    if rng is not None:
-        rng.shuffle(rest)
-    for e in rest:
-        a, b = find(ends[e][0]), find(ends[e][1])
-        if a != b:
-            parent[a] = b
-            tree[e] = True
-            joined += 1
-    return tree if joined == lay.blocks - 1 else None
+    t = tables(lay)
+    state = fast.generator(1) if rng is None else _generator(rng)
+    ok, tree = fast.spanning(t.ends, t.blocks, _need(lay, need), rng is not None, state)
+    return tree.tolist() if ok else None
 
 
 def certified(lay: Layout, body: Sequence[int]) -> bool:
     """Whether the walk around some spanning tree of ``lay`` holds ``body`` (flat cells, head first)."""
-    need = requirements(lay, body)
-    return need is not None and spanning(lay, need) is not None
+    t = tables(lay)
+    return bool(fast.certified(t.gate, t.cross, t.side, t.ends, t.blocks, _cells(body)))
 
 
 def certify(state: GameState) -> Layout | None:
@@ -219,10 +254,11 @@ def certify(state: GameState) -> Layout | None:
     """
     if state.width % 2 or state.height % 2:
         return None
-    body = flat_body(state)
+    body = fast.flat(state)
     for orientation in (0, 1):
         lay = layout(state.width, state.height, orientation)
-        if certified(lay, body):
+        t = tables(lay)
+        if fast.certified(t.gate, t.cross, t.side, t.ends, t.blocks, body):
             return lay
     return None
 
@@ -235,14 +271,11 @@ def successor(lay: Layout, tree: Sequence[bool], cell: int) -> int:
 
 def walk(lay: Layout, tree: Sequence[bool], start: int, stop: int) -> list[int]:
     """The cells the walk around ``tree`` enters from ``start`` until it enters ``stop``."""
-    path = []
-    cell = start
-    for _ in range(lay.width * lay.height):
-        cell = successor(lay, tree, cell)
-        path.append(cell)
-        if cell == stop:
-            return path
-    raise ValueError("the walk does not reach the stop: the tree does not span the blocks")
+    t = tables(lay)
+    path = fast.walk(t.gate, t.cross, t.side, np.asarray(tree, dtype=np.bool_), start, stop)
+    if not len(path):
+        raise ValueError("the walk does not reach the stop: the tree does not span the blocks")
+    return path.tolist()
 
 
 def after_body(body: Sequence[int], path: Sequence[int]) -> list[int]:
@@ -268,25 +301,9 @@ def field_arrival(state: GameState, lay: Layout) -> list[int]:
 
     As :func:`~snake_agent.survival.arrival_times`, but each cell offers only its two moves.
     """
-    body = flat_body(state)
-    length = len(body)
-    release = [0] * (lay.width * lay.height)
-    for k, cell in enumerate(body):
-        release[cell] = length - k
-    cross, side = lay.cross, lay.side
-    arrival = [-1] * len(release)
-    arrival[body[0]] = 0
-    frontier, t = [body[0]], 1
-    while frontier:
-        layer = []
-        for cell in frontier:
-            for nxt in (cross[cell], side[cell]):
-                if nxt >= 0 and arrival[nxt] < 0 and release[nxt] <= t:
-                    arrival[nxt] = t
-                    layer.append(nxt)
-        frontier = layer
-        t += 1
-    return arrival
+    t = tables(lay)
+    body = fast.flat(state)
+    return fast.field_arrival(fast.release_of(body, state.num_cells), t.cross, t.side, body[0]).tolist()
 
 
 @functools.cache
@@ -321,230 +338,30 @@ def shortcuts(
     body leaves them in one run). Each complete path is checked exactly. The search stops after ``count``
     paths or ``budget`` steps.
     """
+    t = tables(lay)
     width = state.width
-    fruit = state.fruit[1] * width + state.fruit[0]
-    body = flat_body(state)
-    length = len(body)
-    cells = width * state.height
-    gate, cross, side, ends = lay.gate, lay.cross, lay.side, lay.ends
-    release = [0] * cells
-    for k, cell in enumerate(body):
-        release[cell] = length - k
-    far = cells + 1
-    dist = [far] * cells
-    entries = lay.entries
-
-    def distances(limit: int) -> None:
-        """Moves from each cell to the fruit for a path of ``limit`` moves, a bound for the search: a cell
-        counts only if it is free by the latest move at which such a path can enter it, and a move only if
-        the gates decided by the body that stays allow it."""
-        for c in range(cells):
-            dist[c] = far
-        dist[fruit] = 0
-        frontier, d = [fruit], 1
-        while frontier:
-            layer = []
-            for cell in frontier:
-                for prev in entries[cell]:
-                    if dist[prev] != far or release[prev] > limit - d:
-                        continue
-                    e = gate[prev]
-                    if e >= 0:
-                        if cell == side[prev]:
-                            if inside[e]:
-                                continue
-                        elif outside[e] or (not inside[e] and find(ends[e][0]) == find(ends[e][1])):
-                            continue
-                    dist[prev] = d
-                    layer.append(prev)
-            frontier = layer
-            d += 1
-
-    start = field_arrival(state, lay)[fruit]
-    if start < 0 or start >= bound:
-        return []
-
-    edges = len(ends)
-    inside = [0] * edges  # decisions per gate, from the moves kept so far
-    outside = [0] * edges
-    parent = list(range(lay.blocks))
-    size = [1] * lay.blocks
-
-    def find(a: int) -> int:
-        while parent[a] != a:
-            a = parent[a]
-        return a
-
-    def connected() -> bool:
-        seen = bytearray(lay.blocks)
-        seen[0] = 1
-        stack, reached = [0], 1
-        while stack:
-            a = stack.pop()
-            for b, e in lay.neighbours[a]:
-                if not seen[b] and not outside[e]:
-                    seen[b] = 1
-                    reached += 1
-                    stack.append(b)
-        return reached == lay.blocks
-
-    def decide(e: int, want: bool):
-        """Record a gate decision; returns its undo record, or None (and records nothing) if it fails."""
-        if want:
-            if outside[e]:
-                return None
-            if inside[e]:
-                inside[e] += 1
-                return (e, True, -1)
-            a, b = find(ends[e][0]), find(ends[e][1])
-            if a == b:
-                return None
-            if size[a] > size[b]:
-                a, b = b, a
-            parent[a] = b
-            size[b] += size[a]
-            inside[e] = 1
-            return (e, True, a)
-        if inside[e]:
-            return None
-        outside[e] += 1
-        if outside[e] == 1 and find(ends[e][0]) != find(ends[e][1]) and not connected():
-            outside[e] -= 1
-            return None
-        return (e, False, -1)
-
-    def undo(record) -> None:
-        e, want, root = record
-        if want:
-            inside[e] -= 1
-            if root >= 0:
-                b = parent[root]
-                parent[root] = root
-                size[b] -= size[root]
-        else:
-            outside[e] -= 1
-
-    found: list[list[int]] = []
-    path: list[int] = []
-    on = bytearray(cells)  # the cells that stay out of the free cells after eating: the body kept, the path
-    steps = 0
-    ring = _ring(width, state.height)
-    grid = neighbour_table(width, state.height)
-
-    def split(cell: int, left: int) -> bool:
-        """Whether taking ``cell`` out of the free cells after eating leaves them unable to be one region:
-        the rest of the path, at most ``left`` cells ending at the fruit, stays in the fruit's region, so
-        any other region stays apart, and a second one, or one beside an unfinished fruit region, is
-        fatal to the certificate. A cell whose free neighbours stay linked around it splits nothing."""
-        around = [c >= 0 and not on[c] for c in ring[cell]]
-        runs = 0
-        for k in (0, 2, 4, 6):  # the four neighbours; neighbours linked through a corner form one run
-            if around[k] and not (around[(k + 7) % 8] and around[(k + 6) % 8]):
-                runs += 1
-        if runs <= 1:
-            return False
-        seen = bytearray(cells)
-        seen[cell] = 1
-        regions = []
-        for start_cell in grid[cell]:
-            if start_cell < 0 or on[start_cell] or seen[start_cell]:
-                continue
-            seen[start_cell] = 1
-            stack, size_, fruity = [start_cell], 1, start_cell == fruit
-            while stack:
-                c = stack.pop()
-                for n in grid[c]:
-                    if n >= 0 and not on[n] and not seen[n]:
-                        seen[n] = 1
-                        size_ += 1
-                        fruity |= n == fruit
-                        stack.append(n)
-            regions.append((fruity, size_))
-        fruit_region = sum(s for fruity, s in regions if fruity)
-        others = sum(1 for fruity, _ in regions if not fruity)
-        if not fruit_region:
-            return True  # the fruit is out of reach
-        return others >= 2 or (others == 1 and fruit_region > left)
-
-    def separate(limit: int) -> bool:
-        """Whether the free cells after eating are split before the path starts, as in :func:`split`."""
-        seen = bytearray(cells)
-        regions = []
-        for first in range(cells):
-            if on[first] or seen[first]:
-                continue
-            seen[first] = 1
-            stack, size_, fruity = [first], 1, first == fruit
-            while stack:
-                c = stack.pop()
-                for n in grid[c]:
-                    if n >= 0 and not on[n] and not seen[n]:
-                        seen[n] = 1
-                        size_ += 1
-                        fruity |= n == fruit
-                        stack.append(n)
-            regions.append((fruity, size_))
-        fruit_region = sum(s for fruity, s in regions if fruity)
-        others = sum(1 for fruity, _ in regions if not fruity)
-        return others >= 2 or (others == 1 and fruit_region > limit)
-
-    def search(cell: int, t: int, limit: int) -> None:
-        nonlocal steps
-        options = []
-        for nxt, want in ((cross[cell], True), (side[cell], False)):
-            if nxt < 0 or on[nxt] or release[nxt] > t + 1:
-                continue
-            if nxt == fruit:
-                if t + 1 == limit:
-                    full = path + [fruit]
-                    if certified(lay, after_body(body, full)):
-                        found.append(full)
-                continue
-            if t + 1 + dist[nxt] > limit:
-                continue
-            options.append((dist[nxt], rng.random(), nxt, want))
-        options.sort()
-        for _, _, nxt, want in options:
-            if len(found) >= count or steps >= budget:
-                return
-            steps += 1
-            e = gate[cell]
-            record = decide(e, want) if e >= 0 else (-1, False, -1)
-            if record is None:
-                continue
-            if not split(nxt, limit - t - 1):
-                path.append(nxt)
-                on[nxt] = 1
-                search(nxt, t + 1, limit)
-                on[nxt] = 0
-                path.pop()
-            if e >= 0:
-                undo(record)
-
-    # A path of exactly ``limit`` moves leaves body cells 0 .. length - limit in place, with the moves of
-    # cells 1 .. length - limit. They are decided from the head back, so the longer limits undo the last.
-    kept: list = []
-    for k in range(1, length - start + 1):
-        cell = body[k]
-        e = gate[cell]
-        record = decide(e, body[k - 1] == cross[cell]) if e >= 0 else (-1, False, -1)
-        if record is None:
-            return found  # not certified to begin with
-        kept.append(record)
-    for limit in range(start, bound, 2):
-        while len(kept) > max(length - limit, 0):
-            record = kept.pop()
-            if record[0] >= 0:
-                undo(record)
-        for k, cell in enumerate(body):
-            on[cell] = k <= length - limit
-        if separate(limit):
-            continue
-        distances(limit)
-        search(body[0], 0, limit)
-        if len(found) >= count or steps >= budget:
-            break
-    return found
+    body = fast.flat(state)
+    paths, lengths, _, found = fast.shortcuts(
+        t.gate,
+        t.cross,
+        t.side,
+        t.ends,
+        t.bnbr,
+        t.bedge,
+        t.entries,
+        t.ring,
+        t.nbr,
+        t.blocks,
+        body,
+        state.fruit[1] * width + state.fruit[0],
+        bound,
+        count,
+        budget,
+        len(body),
+        False,
+        _generator(rng),
+    )
+    return [paths[i, : lengths[i]].tolist() for i in range(found)]
 
 
 def greedy_walk(
@@ -558,133 +375,58 @@ def greedy_walk(
     gate out would cut the blocks apart. With ``rng``, distances between blocks are blurred at random,
     so repeated calls try other routes.
     """
-    gate, cross, side, ends, neighbours = lay.gate, lay.cross, lay.side, lay.ends, lay.neighbours
-    decided = dict(need)
-    blocks = lay.blocks
-    parent = list(range(blocks))
-
-    def find(a: int) -> int:
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    for e, inside in decided.items():
-        if inside:
-            a, b = find(ends[e][0]), find(ends[e][1])
-            if a == b:
-                return None
-            parent[a] = b
-    # Distances between blocks to the stop's block, over the edges that may join the tree.
-    goal = lay.block[stop]
-    far = 1 << 30
-    toward = [far] * blocks
-    toward[goal] = 0
-    frontier = [goal]
-    while frontier:
-        layer = []
-        for a in frontier:
-            for b, e in neighbours[a]:
-                if toward[b] == far and decided.get(e) is not False:
-                    toward[b] = toward[a] + 1
-                    layer.append(b)
-        frontier = layer
-    blur = [rng.random() for _ in range(blocks)] if rng is not None else [0.0] * blocks
-
-    def joined_without(e: int) -> bool:
-        """Whether the blocks stay connected when ``e`` is kept out too."""
-        seen = bytearray(blocks)
-        seen[0] = 1
-        stack, reached = [0], 1
-        while stack:
-            a = stack.pop()
-            for b, f in neighbours[a]:
-                if not seen[b] and f != e and decided.get(f) is not False:
-                    seen[b] = 1
-                    reached += 1
-                    stack.append(b)
-        return reached == blocks
-
-    path = []
-    cell = start
-    for _ in range(lay.width * lay.height):
-        e = gate[cell]
-        if e >= 0 and e not in decided:
-            here, there = lay.block[cell], lay.block[cross[cell]]
-            loops = find(here) == find(there)
-            if not loops and toward[there] + blur[there] < toward[here] + blur[here]:
-                decided[e] = True
-            elif joined_without(e):
-                decided[e] = False
-            elif not loops:
-                decided[e] = True
-            else:
-                return None
-            if decided[e]:
-                a, b = find(here), find(there)
-                parent[a] = b
-        cell = cross[cell] if e >= 0 and decided[e] else side[cell]
-        path.append(cell)
-        if cell == stop:
-            return path
-    return None
+    t = tables(lay)
+    state = fast.generator(1) if rng is None else _generator(rng)
+    path = fast.greedy_walk(
+        t.gate,
+        t.cross,
+        t.side,
+        t.ends,
+        t.bnbr,
+        t.bedge,
+        t.block,
+        t.blocks,
+        _need(lay, need),
+        start,
+        stop,
+        rng is not None,
+        state,
+    )
+    return path.tolist() if len(path) else None
 
 
 def distance(lay: Layout, tree: Sequence[bool], start: int, stop: int, cap: int) -> int:
     """The moves of the walk around ``tree`` from ``start`` to ``stop``, or ``cap`` if that is no fewer."""
-    gate, cross, side = lay.gate, lay.cross, lay.side
-    cell = start
-    for moves in range(1, cap):
-        e = gate[cell]
-        cell = cross[cell] if e >= 0 and tree[e] else side[cell]
-        if cell == stop:
-            return moves
-    return cap
+    t = tables(lay)
+    return int(fast.distance(t.gate, t.cross, t.side, np.asarray(tree, dtype=np.bool_), start, stop, cap))
 
 
 def prefix(lay: Layout, body: Sequence[int]) -> int:
     """How many cells at the head end of ``body`` (flat, head first) moved by the layout's moves."""
-    cross, side = lay.cross, lay.side
-    m = 1
-    while m < len(body) and body[m - 1] in (cross[body[m]], side[body[m]]):
-        m += 1
-    return m
+    t = tables(lay)
+    return int(fast.prefix(t.cross, t.side, _cells(body)))
 
 
 def field_paths(state: GameState, lay: Layout, rng: random.Random, count: int) -> list[list[int]]:
     """Up to ``count`` shortest paths to the fruit by the layout's moves (:func:`field_arrival`), their
     ties broken at random; none if the fruit cannot be reached that way."""
-    arrival = field_arrival(state, lay)
+    t = tables(lay)
+    body = fast.flat(state)
+    arrival = fast.field_arrival(fast.release_of(body, state.num_cells), t.cross, t.side, body[0])
     width = state.width
     fruit = state.fruit[1] * width + state.fruit[0]
     if arrival[fruit] <= 0:
         return []
-    paths = []
-    for _ in range(count):
-        cell, path = fruit, [fruit]
-        while arrival[cell] > 1:
-            cell = rng.choice([c for c in lay.entries[cell] if arrival[c] == arrival[cell] - 1])
-            path.append(cell)
-        paths.append(path[::-1])
-    return paths
+    return fast.field_paths(arrival, t.entries, fruit, count, _generator(rng)).tolist()
 
 
 def timely(state: GameState, path: Sequence[int]) -> bool:
     """Whether following ``path`` is safe: each cell is free when the head enters it, the first move is no
     reversal, and the fruit comes last."""
-    body = flat_body(state)
-    length = len(body)
-    if length > 1 and path and path[0] == body[1]:
-        return False  # the engine would go straight on
-    release = {cell: length - k for k, cell in enumerate(body)}
+    body = fast.flat(state)
     width = state.width
     fruit = state.fruit[1] * width + state.fruit[0]
-    seen = set()
-    for t, cell in enumerate(path, 1):
-        if release.get(cell, 0) > t or cell in seen or (cell == fruit) != (t == len(path)):
-            return False
-        seen.add(cell)
-    return True
+    return bool(fast.timely(fast.release_of(body, state.num_cells), body, _cells(path), fruit))
 
 
 def certified_paths(
@@ -698,60 +440,132 @@ def certified_paths(
     """Paths to the fruit that keep a certified body certified: the shortest walk around ``trees`` random
     spanning trees that hold the body, the greedy walk (:func:`greedy_walk`), and up to ``count``
     shortcuts shorter than both (:func:`shortcuts`, at most ``budget`` steps of search)."""
-    body = flat_body(state)
-    need = requirements(lay, body)
-    if need is None:
+    t = tables(lay)
+    body = fast.flat(state)
+    ok, need = fast.requirements(t.gate, t.cross, t.side, body, len(lay.ends))
+    if not ok:
         raise ValueError("the body is not certified for this layout")
     width = state.width
     fruit = state.fruit[1] * width + state.fruit[0]
-    best, cap = None, state.num_cells + 1
-    for _ in range(max(trees, 1)):
-        tree = spanning(lay, need, rng)
-        if tree is None:
-            raise ValueError("the body is not certified for this layout")
-        moves = distance(lay, tree, body[0], fruit, cap)
-        if moves < cap:
-            best, cap = tree, moves
-    paths = [walk(lay, best, body[0], fruit)]
-    greedy = greedy_walk(lay, need, body[0], fruit)
-    if greedy is not None:
-        paths.append(greedy)
-    return paths + shortcuts(state, lay, min(len(p) for p in paths), rng, count, budget)
+    head = int(body[0])
+    ok, best = fast.best_tree(
+        t.gate, t.cross, t.side, t.ends, t.blocks, need, head, fruit, trees, _generator(rng)
+    )
+    if not ok:
+        raise ValueError("the body is not certified for this layout")
+    paths = [fast.walk(t.gate, t.cross, t.side, best, head, fruit).tolist()]
+    greedy = fast.greedy_walk(
+        t.gate,
+        t.cross,
+        t.side,
+        t.ends,
+        t.bnbr,
+        t.bedge,
+        t.block,
+        t.blocks,
+        need,
+        head,
+        fruit,
+        False,
+        _generator(rng),
+    )
+    if len(greedy):
+        paths.append(greedy.tolist())
+    found, lengths, _, n = fast.shortcuts(
+        t.gate,
+        t.cross,
+        t.side,
+        t.ends,
+        t.bnbr,
+        t.bedge,
+        t.entries,
+        t.ring,
+        t.nbr,
+        t.blocks,
+        body,
+        fruit,
+        min(len(p) for p in paths),
+        count,
+        budget,
+        len(body),
+        False,
+        _generator(rng),
+    )
+    return paths + [found[i, : lengths[i]].tolist() for i in range(n)]
 
 
 def transition_paths(
-    state: GameState, rng: random.Random, trees: int = 64, count: int = 8
+    state: GameState,
+    rng: random.Random,
+    trees: int = 64,
+    count: int = 8,
+    searched: int = 8,
+    budget: int = 20_000,
 ) -> tuple[list[list[int]], list[list[int]]]:
     """Safe paths to the fruit toward a certified body, from a body that is not: ``(exact, partial)``.
 
     The orientation is the one that the most recent moves followed. The paths are walks around ``trees``
-    random spanning trees that hold those moves, and ``count`` shortest paths by the layout's moves
-    (:func:`field_paths`). A path is *exact* when its afterstate is certified, which needs it to outlast
-    the rest of the body; it is *partial* when it only lengthens the run of recent moves that a spanning
-    tree can hold, so that the body is certified once the older part has gone.
+    random spanning trees that hold those moves, ``count`` shortest paths by the layout's moves
+    (:func:`field_paths`), and up to ``searched`` of the shortest paths by the layout's moves that keep
+    the gates of those moves (the search of :func:`shortcuts`, at most ``budget`` steps, for paths up to
+    twice as long as the shortest). A path is *exact* when its afterstate is certified, which needs it to
+    outlast the rest of the body; it is *partial* when it only lengthens the run of recent moves that a
+    spanning tree can hold, so that the body is certified once the older part has gone.
     """
     if state.width % 2 or state.height % 2:
         return [], []
-    body = flat_body(state)
-    lay = max((layout(state.width, state.height, o) for o in (0, 1)), key=lambda lay: prefix(lay, body))
-    need = requirements(lay, body[: prefix(lay, body)])
+    body = fast.flat(state)
+    runs = []  # the run of recent moves that each orientation's gates can hold
+    for orientation in (0, 1):
+        t = tables(layout(state.width, state.height, orientation))
+        runs.append(int(fast.consistent(t.gate, t.cross, t.side, body, len(t.ends))))
+    lay = layout(state.width, state.height, int(runs[1] > runs[0]))
+    t = tables(lay)
+    _, need = fast.requirements(t.gate, t.cross, t.side, body[: max(runs)], len(lay.ends))
     width = state.width
     fruit = state.fruit[1] * width + state.fruit[0]
+    head = int(body[0])
+    release = fast.release_of(body, state.num_cells)
+    generator = _generator(rng)
     tried = []
     for _ in range(trees):
-        tree = spanning(lay, need, rng)
-        if tree is None:
+        ok, tree = fast.spanning(t.ends, t.blocks, need, True, generator)
+        if not ok:
             break
-        tried.append(walk(lay, tree, body[0], fruit))
-    tried += field_paths(state, lay, rng, count)
+        tried.append(fast.walk(t.gate, t.cross, t.side, tree, head, fruit))
+    arrival = fast.field_arrival(release, t.cross, t.side, head)
+    if arrival[fruit] > 0:
+        tried += list(fast.field_paths(arrival, t.entries, fruit, count, generator))
+        if searched:
+            found, lengths, _, n = fast.shortcuts(
+                t.gate,
+                t.cross,
+                t.side,
+                t.ends,
+                t.bnbr,
+                t.bedge,
+                t.entries,
+                t.ring,
+                t.nbr,
+                t.blocks,
+                body,
+                fruit,
+                2 * int(arrival[fruit]) + 2,
+                searched,
+                budget,
+                max(runs),
+                True,
+                generator,
+            )
+            tried += [found[i, : lengths[i]] for i in range(n)]
     exact, partial, seen = [], [], set()
     for path in tried:
-        key = tuple(path)
-        if key in seen or not timely(state, path):
+        key = path.tobytes()
+        if key in seen or not fast.timely(release, body, path, fruit):
             continue
         seen.add(key)
-        after = after_body(body, path)
-        kept = prefix(lay, after)
-        if certified(lay, after[:kept]):
-            (exact if kept == len(after) else partial).append(path)
+        after = fast.after_body(body, path)
+        kept = int(fast.prefix(t.cross, t.side, after))
+        if fast.certified(t.gate, t.cross, t.side, t.ends, t.blocks, after[:kept]):
+            (exact if kept == len(after) else partial).append(path.tolist())
     return exact, partial

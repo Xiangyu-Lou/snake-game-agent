@@ -18,6 +18,7 @@ from snake_agent.train import (  # noqa: E402
     DistillConfig,
     HabitConfig,
     Replay,
+    Replays,
     TrainConfig,
     _starts,
     balanced,
@@ -52,6 +53,26 @@ def test_the_replay_keeps_the_most_recent_examples(examples):
     big = Replay(10)
     big.add(examples)
     assert big.size == 10 and np.array_equal(big.data["win"], examples.win[-10:])
+
+
+def test_each_board_keeps_its_own_canvas_and_share_of_the_minibatches(examples):
+    from snake_agent.plans import PlanConfig
+    from snake_agent.plans import play as play_plans
+
+    config = PlanConfig(paths=2, certify=None)
+    _, larger = play_plans(uniform, standard_starts(6, 6, range(2)), config=config, arrival=True)
+    replays = Replays(10_000, cells=6 * 6 * 40)  # at most 40 examples of 6x6, 90 of 4x4
+    replays.add(examples)
+    replays.add(larger)
+    assert sorted(replays.sides) == [4, 6] and (replays.sides[4].capacity, replays.sides[6].capacity) == (
+        90,
+        40,
+    )
+    assert replays.size == min(len(examples), 90) + min(len(larger), 40)
+    rng = np.random.default_rng(0)
+    sides = Counter(replays.sample(8, rng).planes.shape[-1] for _ in range(400))
+    share = replays.sides[4].size / replays.size
+    assert abs(sides[4] / 400 - share) < 0.1  # minibatches by the examples each board holds
 
 
 def test_mirrored_flips_only_the_chosen_examples(examples):
@@ -197,6 +218,42 @@ def test_a_short_run_of_the_plan_agent_widens_its_network_and_assesses_free_play
     assert "t2_plans" in report and report["plans"]["explore"] == 0.0
     model, _ = load(tmp_path / "run" / "model.pt")
     assert model.config.arrival and not model.config.cycle
+
+
+def test_a_short_run_trains_a_transformer_on_two_boards(tmp_path):
+    network = NetworkConfig(
+        channels=8,
+        blocks=1,
+        hidden=16,
+        cycle=False,
+        arrival=True,
+        kind="transformer",
+        width=16,
+        heads=2,
+        layers=1,
+    )
+    config = TrainConfig(
+        boards=((6, 6, 3), (8, 8, 2)),
+        agent="plans",
+        plans=PlanConfig(paths=2, explore=0.1, certify=None),
+        generations=1,
+        free_share=0.0,
+        steps=3,
+        batch=16,
+        replay=4000,
+        max_examples=30,
+        network=network,
+        workers=2,
+        eval_every=5,
+    )
+    train(config, tmp_path, log=lambda line: None)
+    record = json.loads((tmp_path / "log.jsonl").read_text())
+    assert (
+        record["games"]["6x6"]["standard"]["games"] == 3 and record["games"]["8x8"]["standard"]["games"] == 2
+    )
+    assert 0 < record["examples"] <= 5 * 30 and set(record["losses"]) == {"policy", "win", "moves"}
+    model, _ = load(tmp_path / "model.pt")
+    assert model.config.kind == "transformer"
 
 
 def test_workers_get_starts_of_similar_total_cost():

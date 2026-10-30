@@ -12,6 +12,8 @@ from snake_agent.network import (  # noqa: E402
     NetworkConfig,
     NetworkEvaluator,
     SnakeNet,
+    SnakeTransformer,
+    build,
     from_bytes,
     load,
     save,
@@ -143,3 +145,102 @@ def test_widening_a_network_for_the_arrival_planes_keeps_its_outputs():
     with torch.no_grad():
         for a, b in zip(model(*batch), wide(*batch), strict=True):
             assert torch.allclose(a, b, atol=1e-6)
+
+
+TRANSFORMER = NetworkConfig(
+    channels=16,
+    blocks=1,
+    hidden=32,
+    kind="transformer",
+    width=32,
+    layers=2,
+    heads=2,
+    cycle=False,
+    arrival=True,
+)
+
+
+def transformer(seed=0, config=TRANSFORMER):
+    torch.manual_seed(seed)
+    model = build(config)
+    # Break the identity start of the attention layers and blocks so that every layer matters.
+    with torch.no_grad():
+        for layer in model.layers:
+            layer.out.weight.normal_(0.0, 0.1)
+            layer.mlp[-1].weight.normal_(0.0, 0.1)
+        for block in model.blocks:
+            block.conv2.weight.normal_(0.0, 0.1)
+    return model.eval()
+
+
+def test_the_transformer_does_not_see_the_canvas_around_a_board():
+    model = transformer()
+    assert isinstance(model, SnakeTransformer)
+    boards = states(6, 6, 8)
+    outputs = []
+    for size in (6, 7, 8, 11):  # odd canvases are padded to whole patches
+        encoded = [encode(s, TRAINING_RULES, size, cycle=False, arrival=True) for s in boards]
+        with torch.no_grad():
+            outputs.append(model(*tensors(stack(encoded))))
+    for other in outputs[1:]:
+        for a, b in zip(outputs[0], other, strict=True):
+            assert torch.allclose(a, b, atol=1e-5)
+
+
+def test_the_transformer_sees_far_cells_at_once():
+    # Changing one cell far from the head changes the head's summary after a single attention layer.
+    model = transformer(config=dataclasses.replace(TRANSFORMER, layers=1))
+    state = states(12, 12, 1)[0]
+    encoded = encode(state, TRAINING_RULES, cycle=False, arrival=True)
+    batch = list(tensors(stack([encoded, encoded])))
+    batch[0][1, :, 11, 11] += 1.0  # the far corner of the second copy
+    with torch.no_grad():
+        _, win, moves = model(*batch)
+    assert win[0] != win[1] and moves[0] != moves[1]
+
+
+def test_the_evaluator_groups_boards_and_keeps_the_order():
+    model = transformer(1)
+    mixed = [s.state for s in standard_starts(6, 6, range(3)) + standard_starts(10, 10, range(3))]
+    mixed = [mixed[i] for i in (0, 3, 1, 4, 2, 5)]
+    queries = [Query(s, TRAINING_RULES) for s in mixed]
+    together = NetworkEvaluator(model, max_batch=2)(queries)
+    for i, query in enumerate(queries):
+        alone = NetworkEvaluator(model)([query])
+        assert np.allclose(alone.win, together.win[i], atol=1e-6)
+        assert np.allclose(alone.moves, together.moves[i], atol=1e-6)
+
+
+def test_transformer_checkpoints_keep_their_kind():
+    model = transformer(2)
+    buffer = io.BytesIO()
+    save(model, buffer, note="t")
+    buffer.seek(0)
+    loaded, meta = load(buffer)
+    assert isinstance(loaded, SnakeTransformer) and loaded.config == model.config and meta == {"note": "t"}
+    for name, value in model.state_dict().items():
+        assert torch.equal(value, loaded.state_dict()[name])
+    assert NetworkConfig().kind == "cnn"  # checkpoints from before the Transformer load as CNNs
+    with pytest.raises(ValueError, match="heads"):
+        NetworkConfig(kind="transformer", width=30, heads=4)
+
+
+def test_a_few_steps_fit_the_transformer_to_the_plan_agents_examples():
+    from snake_agent.plans import PlanConfig
+    from snake_agent.plans import play as play_plans
+    from snake_agent.train import losses
+
+    model = transformer(3)
+    starts = standard_starts(6, 6, range(6))
+    config = PlanConfig(paths=2, certify=None)
+    _, examples = play_plans(NetworkEvaluator(model), starts, seed=0, config=config, arrival=True)
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
+    before = {name: value.item() for name, value in losses(model, examples, "cpu").items()}
+    for _ in range(40):
+        terms = losses(model, examples, "cpu")
+        optimizer.zero_grad()
+        (terms["win"] + terms["moves"]).backward()
+        optimizer.step()
+    after = {name: value.item() for name, value in losses(model, examples, "cpu").items()}
+    assert after["win"] < before["win"] and after["moves"] < before["moves"]

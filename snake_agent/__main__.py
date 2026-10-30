@@ -213,6 +213,7 @@ def train_network(args: argparse.Namespace) -> int:
         moves_lambda=args.moves_lambda,
         sibling_visits=args.sibling_visits,
         replay=args.replay,
+        replay_cells=args.replay_cells,
         steps=args.steps,
         batch=args.batch,
         lr=args.lr,
@@ -225,6 +226,12 @@ def train_network(args: argparse.Namespace) -> int:
             args.hidden,
             cycle=args.agent != "plans",
             arrival=args.agent == "plans",
+            kind=args.network,
+            width=args.width,
+            layers=args.layers,
+            heads=args.heads,
+            patch=args.patch,
+            horizon=args.horizon,
         ),
         workers=args.workers,
         seed=args.seed,
@@ -447,6 +454,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="envelope moves the search visited this often but did not play give examples (0: none)",
     )
     tr.add_argument("--replay", type=int, default=300_000, help="examples kept for training")
+    tr.add_argument(
+        "--replay-cells",
+        type=int,
+        default=0,
+        help="plans: cap each board's examples at this many canvas cells (0: none)",
+    )
     tr.add_argument("--steps", type=int, default=200, help="optimizer steps per generation")
     tr.add_argument("--batch", type=int, default=512)
     tr.add_argument("--lr", type=float, default=1e-3)
@@ -455,9 +468,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tr.add_argument("--warmup", type=int, default=0, help="generations of linear learning-rate warm-up")
     tr.add_argument("--min-replay", type=int, default=0, help="no updates before the buffer holds this")
+    tr.add_argument("--network", choices=["cnn", "transformer"], default="cnn", help="the network's kind")
     tr.add_argument("--channels", type=int, default=64)
-    tr.add_argument("--blocks", type=int, default=6)
+    tr.add_argument("--blocks", type=int, default=6, help="residual blocks (the Transformer's stem)")
     tr.add_argument("--hidden", type=int, default=128)
+    tr.add_argument("--width", type=int, default=128, help="the Transformer's token width")
+    tr.add_argument("--layers", type=int, default=6, help="the Transformer's attention layers")
+    tr.add_argument("--heads", type=int, default=4, help="the Transformer's attention heads")
+    tr.add_argument("--patch", type=int, default=2, help="the side of the Transformer's tokens, in cells")
+    tr.add_argument(
+        "--horizon",
+        type=int,
+        default=0,
+        help="plans: the moves head counts the moves to eat this many more fruits (0: to the end)",
+    )
     tr.add_argument("--workers", type=int, default=8, help="self-play and evaluation processes")
     tr.add_argument("--seed", type=int, default=0, help="run seed (selects the training seeds)")
     tr.add_argument("--eval-every", type=int, default=10, help="assess every this many generations")
@@ -583,9 +607,9 @@ def _plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--certify",
         type=certify_share,
-        default=0.3,
+        default=0.4,
         help="plans: share of the board filled from which the agent finishes on a Hamiltonian-cycle "
-        "certificate, or 'none' to play free to the end (default: 0.3)",
+        "certificate, or 'none' to play free to the end (default: 0.4)",
     )
     parser.add_argument(
         "--trees", type=int, default=64, help="plans: random spanning trees tried per certified decision"

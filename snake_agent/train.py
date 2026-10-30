@@ -12,11 +12,12 @@ Each generation:
    rest from the standard start. The workers build the starts. Seeds are
    training seeds, a block per generation (:meth:`TrainConfig.seeds`).
 2. **Replay.** The examples join a buffer that keeps the most recent ``replay``,
-   encoded on the canvas of the largest board. Each game also leaves a few of
+   encoded on the canvas of the largest board (the search's) or each on its own
+   board's (the plan agent's, :class:`Replays`). Each game also leaves a few of
    its states for later mid-game starts.
 3. **Updates.** ``steps`` optimizer steps on minibatches drawn uniformly from the
-   buffer, each example mirrored left to right with probability 1/2, once it
-   holds ``min_replay`` examples. The policy head learns the search's improved
+   buffer (one canvas size per minibatch), each example mirrored left to right
+   with probability 1/2, once it holds ``min_replay`` examples. The policy head learns the search's improved
    policy (cross-entropy over the moves the search considered), the win head
    the win target (binary cross-entropy), and the moves head the moves target of
    won games (Huber loss). The learning rate warms up linearly over ``warmup``
@@ -69,9 +70,10 @@ from .contract import TRAINING_RULES, Outcome
 from .encoding import GLOBALS, mirror
 from .habits import BANDS, CANDIDATES, Comparison, Habit, compare, distillation_examples, improve
 from .network import (
+    Network,
     NetworkConfig,
     NetworkEvaluator,
-    SnakeNet,
+    build,
     from_bytes,
     load,
     save,
@@ -140,6 +142,10 @@ class TrainConfig:
     sibling_visits: int = 0
     """Envelope moves the search visited this often but did not play give examples (0: none)."""
     replay: int = 300_000
+    replay_cells: int = 0
+    """The plan agent's examples are kept per canvas side, each side up to ``replay`` of them, or fewer if
+    they would hold more than this many cells of canvas (0: no cap): a 100x100 example takes 25 times the
+    memory of a 20x20 one."""
     steps: int = 200
     """Optimizer steps per generation."""
     batch: int = 512
@@ -250,13 +256,47 @@ class Replay:
         return Examples(**{name: array[index] for name, array in self.data.items()})
 
 
+class Replays:
+    """A :class:`Replay` per canvas side, so that each board's examples keep a canvas of its own size.
+
+    A side keeps its most recent ``capacity`` examples, or fewer if ``cells`` caps the canvas cells it may
+    hold (0: no cap). A minibatch comes from one side, drawn with probability proportional to the examples
+    it holds, so that sampling stays uniform over all the examples."""
+
+    def __init__(self, capacity: int, cells: int = 0) -> None:
+        self.capacity, self.cells = capacity, cells
+        self.sides: dict[int, Replay] = {}
+
+    @property
+    def size(self) -> int:
+        return sum(replay.size for replay in self.sides.values())
+
+    def add(self, examples: Examples) -> None:
+        side = examples.planes.shape[-1]
+        if side not in self.sides:
+            capacity = self.capacity if not self.cells else max(1, min(self.capacity, self.cells // side**2))
+            self.sides[side] = Replay(capacity)
+        self.sides[side].add(examples)
+
+    def sample(self, count: int, rng: np.random.Generator) -> Examples:
+        sides = sorted(self.sides)
+        if len(sides) > 1:
+            sizes = np.array([self.sides[side].size for side in sides], dtype=float)
+            sides = [sides[int(rng.choice(len(sides), p=sizes / sizes.sum()))]]
+        return self.sides[sides[0]].sample(count, rng)
+
+
 # --------------------------------------------------------------------- losses
-def losses(model: SnakeNet, batch: Examples, device: torch.device | str) -> dict[str, torch.Tensor]:
-    """The three heads' losses on a batch of examples."""
+def losses(model: Network, batch: Examples, device: torch.device | str) -> dict[str, torch.Tensor]:
+    """The three heads' losses on a batch of examples (the Transformer's forward pass in bfloat16 on a
+    GPU)."""
     planes, actions, globals_, head = tensors(
         (batch.planes, batch.actions, batch.globals, batch.head), device
     )
-    logits, win_logit, moves = model(planes, actions, globals_, head)
+    half = str(device).startswith("cuda") and model.config.kind == "transformer"
+    with torch.autocast("cuda", torch.bfloat16, enabled=half):
+        logits, win_logit, moves = model(planes, actions, globals_, head)
+    logits, win_logit, moves = logits.float(), win_logit.float(), moves.float()
     valid = torch.as_tensor(batch.valid, device=device)
     has_policy = torch.as_tensor(batch.has_policy, dtype=torch.float32, device=device)
     has_moves = torch.as_tensor(batch.has_moves, dtype=torch.float32, device=device)
@@ -291,9 +331,9 @@ def mirrored(batch: Examples, flip: np.ndarray) -> Examples:
 
 
 def optimize(
-    model: SnakeNet,
+    model: Network,
     optimizer: torch.optim.Optimizer,
-    replay: Replay,
+    replay: Replay | Replays,
     steps: int,
     batch: int,
     rng: np.random.Generator,
@@ -321,30 +361,42 @@ def _init_worker() -> None:
     torch.set_num_threads(1)
 
 
-def _self_play_task(args: tuple) -> tuple[list[GameSummary], Examples | None, float]:
+def _self_play_task(args: tuple) -> tuple[list[GameSummary], list[Examples], float]:
+    """A worker's games: the search's all at once on the canvas ``size``; the plan agent's board by board,
+    each board's examples on its own canvas."""
     weights, specs, search, options, size, seed, device = args
     began = time.perf_counter()
     starts = [start for spec in specs if (start := make_start(*spec)) is not None]
     if not starts:
-        return [], None, time.perf_counter() - began
+        return [], [], time.perf_counter() - began
     evaluator = NetworkEvaluator(from_bytes(weights), device)
+    parts = []
     if isinstance(search, PlanConfig):
         inputs = evaluator.model.config
-        summaries, examples = plan_agent.play(
-            evaluator,
-            starts,
-            TRAINING_RULES,
-            search,
-            seed=seed,
-            size=size,
-            cycle=inputs.cycle,
-            arrival=inputs.arrival,
-            **options,
-        )
+        boards: dict[tuple[int, int], list] = {}
+        for start in starts:
+            boards.setdefault((start.state.width, start.state.height), []).append(start)
+        summaries = []
+        for k, (board, group) in enumerate(sorted(boards.items())):
+            board_summaries, examples = plan_agent.play(
+                evaluator,
+                group,
+                TRAINING_RULES,
+                search,
+                seed=(*seed, k),
+                size=max(board),
+                cycle=inputs.cycle,
+                arrival=inputs.arrival,
+                horizon=inputs.horizon,
+                **options,
+            )
+            summaries += board_summaries
+            parts += [examples] if examples is not None else []
     else:
         summaries, examples = play(evaluator, starts, TRAINING_RULES, search, seed=seed, size=size, **options)
+        parts += [examples] if examples is not None else []
     evaluator.release()
-    return summaries, examples, time.perf_counter() - began
+    return summaries, parts, time.perf_counter() - began
 
 
 def balanced(costs: list[float], parts: int) -> list[list[int]]:
@@ -432,14 +484,15 @@ def train(
     device: str = "cpu",
     log: Callable[[str], None] = print,
     init: str | Path | None = None,
-) -> SnakeNet:
+) -> Network:
     """Run ``config`` and write its log and checkpoints to ``out``; returns the trained network.
 
     With a CUDA ``device`` the self-play workers evaluate their leaves on it too: batched across their
     games, the network then costs little next to the search's own work. (With many workers on one GPU,
     run NVIDIA's Multi-Process Service, which lets their small batches share the GPU.) ``init`` starts
-    from a checkpoint's weights (its network size must match ``config``); the replay buffer and the
-    optimizer start empty, and a new run ``seed`` gives new games.
+    from a checkpoint's weights (its network size must match ``config``, but not its inputs or its moves
+    head's horizon); the replay buffer and the optimizer start empty, and a new run ``seed`` gives new
+    games.
     """
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -447,17 +500,20 @@ def train(
     (out / "config.json").write_text(json.dumps(settings, indent=2) + "\n")
     rng = np.random.default_rng(config.seed)
     torch.manual_seed(config.seed)
-    model = SnakeNet(config.network).to(device)
+    model = build(config.network).to(device)
     if init is not None:
         start, _ = load(init, device)
-        inputs = {"cycle": config.network.cycle, "arrival": config.network.arrival}
-        if dataclasses.replace(start.config, **inputs) != config.network or (
-            start.config.arrival and not config.network.arrival
+        network = config.network
+        inputs = {"cycle": network.cycle, "arrival": network.arrival, "horizon": network.horizon}
+        if dataclasses.replace(start.config, **inputs) != network or (
+            start.config.arrival and not network.arrival
         ):
-            raise ValueError(f"the checkpoint's network {start.config} is not {config.network}")
-        widen(model, start.state_dict())  # its inputs may differ: the cycle, or new arrival planes
+            raise ValueError(f"the checkpoint's network {start.config} is not {network}")
+        widen(
+            model, start.state_dict()
+        )  # its inputs may differ (the cycle, new arrival planes), or its horizon
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    replay = Replay(config.replay)
+    replay = Replays(config.replay, config.replay_cells) if config.agent == "plans" else Replay(config.replay)
     pools: dict[tuple[int, int], deque[GameState]] = {}
     inference = "cuda" if str(device).startswith("cuda") else "cpu"
     if inference == "cuda":
@@ -495,6 +551,7 @@ def train(
             "beta": config.beta,
             "moves_lambda": config.moves_lambda,
             "samples": config.midgame_samples,
+            "max_examples": config.max_examples,
         }
     games_played = 0
     summaries: list[GameSummary] = []  # the last generation's games, which price the next one's starts
@@ -516,13 +573,15 @@ def train(
                 for k, group in enumerate(balanced(_costs(specs, summaries), config.workers))
             ]
             summaries, parts, busy = [], [], []
-            for task_summaries, examples, seconds in pool.map(_self_play_task, tasks):
+            for task_summaries, task_parts, seconds in pool.map(_self_play_task, tasks):
                 summaries += task_summaries
                 busy.append(seconds)
-                if examples is not None:
-                    parts.append(examples)
-            examples = Examples.concatenate(parts)
-            replay.add(examples)
+                parts += task_parts
+            sides: dict[int, list[Examples]] = {}
+            for part in parts:
+                sides.setdefault(part.planes.shape[-1], []).append(part)
+            for side in sorted(sides):
+                replay.add(Examples.concatenate(sides[side]))
             for summary in summaries:
                 pools.setdefault(summary.board, deque(maxlen=config.midgame_pool)).extend(summary.samples)
             games_played += len(summaries)
@@ -540,7 +599,7 @@ def train(
                 "generation": generation,
                 "games": _game_stats(summaries),
                 "games_played": games_played,
-                "examples": len(examples),
+                "examples": sum(len(part) for part in parts),
                 "replay": replay.size,
                 "lr": rate,
                 "losses": terms,
@@ -722,7 +781,7 @@ def _distill_task(args: tuple) -> tuple[Examples | None, dict[str, Any]]:
 
 
 def agreement(
-    model: SnakeNet, examples: Examples, habit: Habit, device: torch.device | str, limit: int = 20_000
+    model: Network, examples: Examples, habit: Habit, device: torch.device | str, limit: int = 20_000
 ) -> dict[str, float | None]:
     """Share of the envelope decisions among ``examples`` (at most ``limit``) where the network's most likely
     valid move is the target's: in the bands where ``habit`` has a bias (``"habit"``) and elsewhere."""
@@ -750,14 +809,14 @@ def agreement(
 
 def distill(
     pool: ProcessPoolExecutor,
-    teacher: SnakeNet,
+    teacher: Network,
     habit: Habit,
     config: DistillConfig | None = None,
     workers: int = 8,
     device: torch.device | str = "cpu",
     inference: str = "cpu",
-    anchor: SnakeNet | None = None,
-) -> tuple[SnakeNet, dict[str, Any]]:
+    anchor: Network | None = None,
+) -> tuple[Network, dict[str, Any]]:
     """A copy of ``teacher`` trained to play ``habit`` with its raw policy, and a report.
 
     The examples come from :func:`~snake_agent.habits.distillation_examples`, played across ``pool``
@@ -784,7 +843,7 @@ def distill(
     examples = Examples.concatenate(parts)
     replay = Replay(len(examples))
     replay.add(examples)
-    student = SnakeNet(teacher.config).to(device)
+    student = build(teacher.config).to(device)
     student.load_state_dict(teacher.state_dict())
     before = agreement(student, examples, habit, device)
     optimizer = torch.optim.AdamW(student.parameters(), lr=config.lr, weight_decay=config.weight_decay)
@@ -856,7 +915,7 @@ def improve_habits(
     device: str = "cpu",
     log: Callable[[str], None] = print,
     anchor: str | Path | None = None,
-) -> SnakeNet:
+) -> Network:
     """Rounds of habit improvement from the checkpoint ``init``, written to ``out``; returns the network.
 
     Each round compares the habits of every band by paired windows (:func:`compare_habits`), keeps the

@@ -6,7 +6,15 @@ import numpy as np
 import pytest
 
 from snake_agent.contract import TRAINING_RULES, Outcome
-from snake_agent.encoding import GLOBALS, PLANES, encode, moves_scale
+from snake_agent.encoding import (
+    GLOBALS,
+    PLANES,
+    encode,
+    horizon_ceiling,
+    horizon_scale,
+    moves_ceiling,
+    moves_scale,
+)
 from snake_agent.evaluation import run_game
 from snake_agent.plans import (
     PlanAgent,
@@ -14,18 +22,19 @@ from snake_agent.plans import (
     Planner,
     _direction,
     afterstate,
-    arrival_times,
     candidates,
     choose,
     decide,
     extend,
+    horizon_returns,
     next_trip,
     play,
+    trust,
     waits,
 )
 from snake_agent.search import Prediction
 from snake_agent.selfplay import Label, moves_returns, standard_starts
-from snake_agent.survival import Board, opening_times
+from snake_agent.survival import Board, arrival_times, opening_times
 from snake_game import Direction, GameConfig, GameState, RelativeAction, SnakeGame
 
 
@@ -201,6 +210,26 @@ def test_self_play_examples_are_decision_states_and_afterstates_with_blended_tar
     assert any(s.outcome is Outcome.WON for s in summaries)
 
 
+def test_long_games_keep_a_uniform_sample_of_their_examples_and_states():
+    config = PlanConfig(paths=2, tolerance=0.0, certify=None)
+
+    def constant(queries):
+        n = len(queries)
+        return Prediction(np.zeros((n, 3)), np.full(n, 0.8), np.full(n, 0.5))
+
+    starts = standard_starts(8, 8, range(4))
+    full, every = play(constant, starts, TRAINING_RULES, config, seed=0, samples=3)
+    capped, sample = play(constant, starts, TRAINING_RULES, config, seed=0, samples=3, max_examples=7)
+    assert [s.moves for s in full] == [s.moves for s in capped]  # sampling does not change the games
+    assert len(sample) == sum(min(7, s.searched + s.fruits - (s.outcome is Outcome.WON)) for s in full)
+    assert len(every) > len(sample)
+    rows = {bytes(p) for p in every.planes.reshape(len(every), -1)}
+    assert all(bytes(p) in rows for p in sample.planes.reshape(len(sample), -1))  # a subset of the examples
+    for summary in capped:
+        assert len(summary.samples) == min(3, summary.moves)
+        assert [s.steps for s in summary.samples] == sorted(s.steps for s in summary.samples)
+
+
 @pytest.mark.parametrize("certify", [None, 0.3])
 def test_self_play_moves_targets_match_the_td_returns(certify):
     # Replay one won game by hand: the moves targets are moves_returns over its fruits. Certified
@@ -299,3 +328,34 @@ def test_the_next_trip_is_the_earliest_arrival_at_the_fruit_or_its_mean_over_fre
     arrival, opening = arrival_times(board), opening_times(board)
     assert all(0 < o <= a for a, o in zip(arrival, opening, strict=True) if a > 0)
     assert arrival[4] == 7 and opening[4] == 6  # (0, 1), the neck, released after 6 moves
+
+
+def test_a_horizon_counts_the_moves_to_eat_that_many_more_fruits():
+    # Ten moves; fruits eaten at moves 2 and 5, and the board filled at move 9.
+    moves, afters = horizon_returns(10, [2, 5], True, 2)
+    assert moves[0] == 6 and moves[3] == 7 and moves[6] == 4  # 0..5, 3..9, then to the full board
+    assert afters == [7, 4]
+    lost_moves, lost_afters = horizon_returns(10, [2, 5], False, 2)
+    assert lost_moves[0] == 6 and lost_moves[3] is None and lost_afters == [None, None]
+    assert horizon_returns(10, [2, 5], True, 1) == ([3, 2, 1, 3, 2, 1, 4, 3, 2, 1], [3, 4])
+    for free in (1, 7, 100):
+        assert horizon_scale(free) == moves_scale(free) == horizon_scale(free, free + 3)
+        assert horizon_ceiling(400, free) == pytest.approx(moves_ceiling(400, free))
+    assert horizon_scale(100, 8) == 8 * (200 - 8 + 3) / 4
+    assert trust(300, PlanConfig(), 8) > 0.3 > 0.01 > trust(300, PlanConfig())
+
+
+def test_self_play_with_a_horizon_targets_the_moves_to_the_next_fruits():
+    config = PlanConfig(paths=2, tolerance=0.0, certify=None)
+
+    def constant(queries):
+        n = len(queries)
+        return Prediction(np.zeros((n, 3)), np.full(n, 0.8), np.full(n, 0.5), horizon=1)
+
+    summaries, examples = play(constant, standard_starts(6, 6, range(4)), TRAINING_RULES, config, horizon=1)
+    rows = examples.has_moves
+    assert rows.any() and any(s.outcome is not Outcome.WON for s in summaries) or rows.all()
+    moves = examples.moves[rows] * np.array([horizon_scale(f, 1) for f in examples.free[rows]])
+    assert np.allclose(moves, np.round(moves), atol=1e-3) and (moves >= 1 - 1e-6).all()
+    after = examples.globals[rows, GLOBALS.index("afterstate")] == 1.0
+    assert moves[after].min() > 1 - 1e-6  # from an afterstate the next fruit is at least a move away

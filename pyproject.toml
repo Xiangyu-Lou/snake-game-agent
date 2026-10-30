@@ -17,8 +17,9 @@ dependencies = [
 
 [project.optional-dependencies]
 ui = ["pygame-ce>=2.5"]
-train = ["torch>=2.1"]
-dev = ["pytest>=7", "pygame-ce>=2.5"]
+fast = ["numba>=0.57"]
+train = ["torch>=2.1", "numba>=0.57"]
+dev = ["pytest>=7", "pygame-ce>=2.5", "numba>=0.57"]
 
 [project.scripts]
 snake-game = "snake_game.__main__:main"

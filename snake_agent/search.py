@@ -108,6 +108,9 @@ class Prediction:
     logits: np.ndarray
     win: np.ndarray
     moves: np.ndarray
+    horizon: int = 0
+    """What ``moves`` counts: the moves until the board is full (0), or until this many more fruits are
+    eaten (the network's :attr:`~snake_agent.network.NetworkConfig.horizon`, for the plan agent)."""
 
     def __len__(self) -> int:
         return len(self.win)
@@ -117,7 +120,7 @@ class Prediction:
 
     def part(self, start: int, stop: int) -> Prediction:
         """The evaluations of queries ``start`` to ``stop`` (excluded)."""
-        return Prediction(self.logits[start:stop], self.win[start:stop], self.moves[start:stop])
+        return Prediction(self.logits[start:stop], self.win[start:stop], self.moves[start:stop], self.horizon)
 
 
 Evaluator = Callable[[Sequence[Query]], Prediction]

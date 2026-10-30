@@ -54,6 +54,9 @@ the canonical cycle's envelope. It sees the arrival planes instead
 (:attr:`~snake_agent.network.NetworkConfig.arrival`). Self-play (:func:`play`)
 trains the values by temporal differences over fruits, as the search's moves
 head is trained.
+
+The searches over the board (paths, waits, certificates, next trips) run in the
+compiled kernels of :mod:`snake_agent.fast`, on the body as flat arrays.
 """
 
 from __future__ import annotations
@@ -67,12 +70,13 @@ import numpy as np
 
 from snake_game import Direction, GameState, RelativeAction, Status
 
+from . import fast
 from .certify import certified_paths, certify, transition_paths
 from .contract import TRAINING_RULES, Outcome, Rules, to_relative
-from .encoding import encode, moves_ceiling, moves_scale
+from .encoding import encode, horizon_ceiling, horizon_scale
 from .search import Evaluator, Prediction, Query
 from .selfplay import Examples, GameSummary, Label, Start, _frame_width, _to_examples, moves_returns
-from .survival import Board, arrival_times, opening_times
+from .survival import Board
 
 
 @dataclass(frozen=True)
@@ -101,11 +105,12 @@ class PlanConfig:
     """Only plans whose afterstate has a survival certificate are compared, if there are any; if there
     are none, the agent waits along the certificate's loop while the fruit timeout leaves room, and plans
     again at the next move."""
-    certify: float | None = 0.3
+    certify: float | None = 0.4
     """From this share of the board filled, on a board with even sides, the agent finishes on a
     Hamiltonian-cycle certificate (:mod:`snake_agent.certify`): it heads for a body that the walk around a
     spanning tree of 2x2 blocks holds in order, then keeps such a body to the end, taking the fastest
-    path to each fruit that keeps it. None plays free to the end."""
+    path to each fruit that keeps it. None plays free to the end. 0.4 is fastest on 20x20 and ties with
+    0.3 on 100x100 (``snake_agent/README.md``, where to switch); the plan agent first used 0.3."""
     trees: int = 64
     """Random spanning trees tried per decision once the certificate is sought."""
     shortcuts: int = 8
@@ -119,22 +124,43 @@ EVALUATION = PlanConfig()
 
 
 # ---------------------------------------------------------------- paths
-def shortest_path(board: Board, arrival: Sequence[int], goal: int, rng: random.Random) -> list[int]:
-    """A shortest path from the head to ``goal`` (reached in ``arrival``): the cells entered, in order.
+class _View:
+    """A state's body as the flat arrays of the compiled kernels (:mod:`snake_agent.fast`)."""
 
-    Ties between predecessors are broken at random, so repeated calls draw
-    different paths.
-    """
-    neighbours = board.neighbours
-    path = [goal]
-    cell = goal
-    while arrival[cell] > 1:
-        t = arrival[cell] - 1
-        options = [n for n in neighbours[cell] if n >= 0 and arrival[n] == t]
-        cell = options[0] if len(options) == 1 else rng.choice(options)
-        path.append(cell)
-    path.reverse()
-    return path
+    __slots__ = ("width", "nbr", "body", "release", "head", "heading", "length")
+
+    def __init__(self, state: GameState) -> None:
+        self.width = state.width
+        self.nbr = fast.grid(state.width, state.height)
+        self.body = fast.flat(state)
+        self.release = fast.release_of(self.body, state.num_cells)
+        self.head, self.heading = int(self.body[0]), int(state.direction)
+        self.length = len(self.body)
+
+    def key(self, cells: np.ndarray) -> bytes:
+        """The body after following ``cells`` and eating at the last, as bytes: one key per afterstate."""
+        return fast.after_body(self.body, cells).tobytes()
+
+    def after(self, cells: Sequence[int]) -> tuple[np.ndarray, int, int]:
+        """``release``, the head and the heading after following ``cells`` and eating at the last."""
+        path = np.asarray(cells, dtype=np.int64)
+        head = int(path[-1])
+        before = int(path[-2]) if len(path) > 1 else self.head
+        return fast.after_release(self.release, path, self.length), head, _direction(self.width, before, head)
+
+    def certified(self, cells: Sequence[int]) -> bool:
+        """Whether the afterstate of ``cells`` has a survival certificate."""
+        release, head, heading = self.after(cells)
+        return bool(fast.certificate(release, self.nbr, head, heading))
+
+    def trip(self, cells: Sequence[int]) -> float:
+        """:func:`next_trip` of the afterstate of ``cells``."""
+        release, head, heading = self.after(cells)
+        return _trip(release, self.nbr, head, heading)
+
+    def moved(self, cell: int) -> np.ndarray:
+        """``release`` after one move into ``cell`` without eating."""
+        return fast.moved_release(self.release, np.array([cell], dtype=np.int64), self.length)
 
 
 def extend(board: Board, path: list[int], fruit: int, extra: int, rng: random.Random) -> list[int]:
@@ -146,43 +172,19 @@ def extend(board: Board, path: list[int], fruit: int, extra: int, rng: random.Ra
     down compactly. Free cells stay free until the head enters them, so the path stays safe, and its body
     cells are entered no sooner than before.
     """
-    neighbours, head = board.neighbours, board.head
-    width = board.width
-    free_before = board.t - board.length
-    entered = board.entered
-    full = [head] + path
-    on = set(full)
-    reverse = (board.heading + 2) % 4
-    added, changed = 0, True
-    while changed and added + 2 <= extra:
-        changed = False
-        i = 0
-        while i < len(full) - 1 and added + 2 <= extra:
-            u, v = full[i], full[i + 1]
-            d = _direction(width, u, v)
-            sides = [(d + 1) % 4, (d + 3) % 4]
-            rng.shuffle(sides)
-            for side in sides:
-                if u == head and side == reverse:
-                    continue
-                a, b = neighbours[u][side], neighbours[v][side]
-                if (
-                    a >= 0
-                    and b >= 0
-                    and a not in on
-                    and b not in on
-                    and a != fruit
-                    and b != fruit
-                    and entered[a] <= free_before
-                    and entered[b] <= free_before
-                ):
-                    full[i + 1 : i + 1] = [a, b]
-                    on.update((a, b))
-                    added += 2
-                    changed = True
-                    break
-            i += 1
-    return full[1:]
+    release = np.maximum(np.array(board.entered, dtype=np.int64) - (board.t - board.length), 0)
+    longer = fast.extend(
+        np.array(path, dtype=np.int64),
+        release,
+        fast.grid(board.width, board.height),
+        board.width,
+        board.head,
+        board.heading,
+        fruit,
+        extra,
+        fast.generator(rng.getrandbits(32)),
+    )
+    return longer.tolist()
 
 
 def _direction(width: int, cell: int, nxt: int) -> int:
@@ -252,49 +254,57 @@ def candidates(
     if state.done or state.fruit is None:
         raise ValueError("plans need a running game with a visible fruit")
     rng = random.Random(0) if rng is None else rng
+    view = _View(state)
+    return _candidates(state, view, rules, config, fast.generator(rng.getrandbits(32)))
+
+
+def _candidates(
+    state: GameState, view: _View, rules: Rules, config: PlanConfig, generator: np.ndarray
+) -> list[Plan]:
     width = state.width
     fruit = state.fruit[1] * width + state.fruit[0]
     budget = rules.moves_left(state)
-    board = Board(state)
-    plans: dict[tuple, Plan] = {}
+    nbr, release, head = view.nbr, view.release, view.head
+    plans: dict[bytes, Plan] = {}
 
-    def add(cells: list[int], wait: int) -> None:
+    def add(cells: np.ndarray, wait: int) -> None:
         if budget is not None and len(cells) > budget:
             return
-        after = afterstate(state, cells)
-        if after.snake not in plans:
-            plans[after.snake] = Plan(tuple(cells), after, wait)
+        key = view.key(cells)
+        if key not in plans:
+            path = cells.tolist()
+            plans[key] = Plan(tuple(path), afterstate(state, path), wait)
 
-    arrival = arrival_times(board)
+    arrival = fast.arrival(release, nbr, head, view.heading, -1)
     if arrival[fruit] > 0:
-        shortest = [shortest_path(board, arrival, fruit, rng) for _ in range(config.paths)]
+        shortest = fast.shortest_paths(arrival, nbr, fruit, config.paths, generator)
         for path in shortest:
             add(path, 0)
         free = state.free_cells
         for k, share in enumerate(config.sweeps):
             extra = int(share * free)
             if budget is not None:
-                extra = min(extra, budget - arrival[fruit])
+                extra = min(extra, budget - int(arrival[fruit]))
             if extra >= 2:
-                add(extend(board, list(shortest[k % len(shortest)]), fruit, extra, rng), 0)
-    loop = board.certificate_loop() if config.waits else None
-    if loop:
-        if fruit in loop:
-            loop = loop[: loop.index(fruit) + 1]  # following the loop eats the fruit on the way
-            if loop[-1] == fruit:
-                add(list(loop), len(loop))
-                loop = loop[:-1]
+                path = shortest[k % len(shortest)]
+                add(fast.extend(path, release, nbr, width, head, view.heading, fruit, extra, generator), 0)
+    loop = fast.certificate_loop(release, view.body, nbr, head, view.heading) if config.waits else []
+    if len(loop):
+        hits = np.flatnonzero(loop == fruit)
+        if len(hits):  # following the loop eats the fruit on the way
+            loop = loop[: hits[0] + 1]
+            add(loop, len(loop))
+            loop = loop[:-1]
         for wait in config.waits:
             if wait > len(loop) or (budget is not None and wait >= budget):
                 break
-            undo = []
-            for cell in loop[:wait]:
-                undo.append((cell, board.move(_direction(width, board.head, cell), cell)))
-            later = arrival_times(board)
+            moved = fast.moved_release(release, loop[:wait], view.length)
+            before = int(loop[wait - 2]) if wait > 1 else head
+            cell = int(loop[wait - 1])
+            later = fast.arrival(moved, nbr, cell, _direction(width, before, cell), -1)
             if later[fruit] > 0:
-                add(list(loop[:wait]) + shortest_path(board, later, fruit, rng), wait)
-            for cell, record in reversed(undo):
-                board.unmove(cell, record)
+                rest = fast.shortest_paths(later, nbr, fruit, 1, generator)[0]
+                add(np.concatenate([loop[:wait], rest]), wait)
     return list(plans.values())
 
 
@@ -311,15 +321,19 @@ class Wait:
 
 def waits(state: GameState, rules: Rules = TRAINING_RULES) -> list[Wait]:
     """The waiting moves of ``state``, in ``LEFT``, ``STRAIGHT``, ``RIGHT`` order."""
-    board = Board(state)
+    return [wait for wait, _ in _waits(state, _View(state), rules)]
+
+
+def _waits(state: GameState, view: _View, rules: Rules) -> list[tuple[Wait, np.ndarray]]:
+    """The waiting moves, each with ``release`` after it."""
     width = state.width
     fruit = -1 if state.fruit is None else state.fruit[1] * width + state.fruit[0]
-    heading = int(state.direction)
+    heading = view.heading
     options = []
     for action in RelativeAction:
         d = (heading + action - 1) % 4
-        cell = board.target(d)
-        if cell < 0 or cell == fruit:
+        cell = int(view.nbr[view.head, d])
+        if cell < 0 or view.release[cell] > 1 or cell == fruit:
             continue
         after = GameState(
             width,
@@ -333,15 +347,17 @@ def waits(state: GameState, rules: Rules = TRAINING_RULES) -> list[Wait]:
         )
         if rules.timed_out(after):
             continue
-        undo = board.move(d, cell)
-        options.append(Wait(action, after, board.has_survival_certificate()))
-        board.unmove(cell, undo)
+        moved = view.moved(cell)
+        options.append((Wait(action, after, bool(fast.certificate(moved, view.nbr, cell, d))), moved))
     return options
 
 
 def certified(plan: Plan) -> bool:
     """Whether the plan's afterstate fills the board or has a survival certificate."""
-    return plan.after.won or Board(plan.after).has_survival_certificate()
+    if plan.after.won:
+        return True
+    view = _View(plan.after)
+    return bool(fast.certificate(view.release, view.nbr, view.head, view.heading))
 
 
 def _comfortable(state: GameState, rules: Rules, plans: Sequence[Plan]) -> bool:
@@ -354,31 +370,37 @@ def _comfortable(state: GameState, rules: Rules, plans: Sequence[Plan]) -> bool:
 # --------------------------------------------------------------- choice
 def _values(states: Sequence[GameState], prediction: Prediction | None, offset: int) -> tuple[list, list]:
     """Win values and expected moves (in moves) of ``states``, read from ``prediction`` from row
-    ``offset`` on, skipping filled boards (exact wins, no moves left)."""
+    ``offset`` on, skipping filled boards (exact wins, no moves left). The moves count to the end of the
+    game, or to the network's horizon (:attr:`~snake_agent.search.Prediction.horizon`)."""
     wins, moves = [], []
     row = offset
+    horizon = 0 if prediction is None else prediction.horizon
     for state in states:
         if state.won:
             wins.append(1.0)
             moves.append(0.0)
             continue
+        free = state.free_cells
         wins.append(min(max(float(prediction.win[row]), 0.0), 1.0))
-        units = min(max(float(prediction.moves[row]), 0.0), moves_ceiling(state.num_cells, state.free_cells))
-        moves.append(units * moves_scale(state.free_cells))
+        units = min(max(float(prediction.moves[row]), 0.0), horizon_ceiling(state.num_cells, free, horizon))
+        moves.append(units * horizon_scale(free, horizon))
         row += 1
     return wins, moves
 
 
-def trust(free: int, config: PlanConfig = EVALUATION) -> float:
+def trust(free: int, config: PlanConfig = EVALUATION, horizon: int = 0) -> float:
     """The weight of the network's moves values in a comparison of options, with ``free`` cells free.
 
-    The moves head's errors grow with :func:`~snake_agent.encoding.moves_scale` (about a hundredth of
-    it: ``snake_agent/README.md``, M1), while two plans' futures differ by tens of moves. Shrinking the
-    head's differences by the share of their spread that such differences explain keeps its noise from
-    choosing between plans early on a large board (39,700 moves to go on 20x20, a weight of 0.0006),
-    and leaves its judgement nearly whole late in the game (15 cells free, a weight of 0.997).
+    The moves head's errors grow with its unit, :func:`~snake_agent.encoding.moves_scale` (about a
+    hundredth of it: ``snake_agent/README.md``, M1), while two plans' futures differ by tens of moves.
+    Shrinking the head's differences by the share of their spread that such differences explain keeps its
+    noise from choosing between plans early on a large board (39,700 moves to go on 20x20, a weight of
+    0.0006), and leaves its judgement nearly whole late in the game (15 cells free, a weight of 0.997).
+    A head that looks ``horizon`` fruits ahead has the smaller unit of
+    :func:`~snake_agent.encoding.horizon_scale`, and more weight (with 8 fruits on 20x20: 0.33 at the
+    start, 0.62 at half the board).
     """
-    return 1.0 / (1.0 + (moves_scale(free) / config.moves_trust) ** 2)
+    return 1.0 / (1.0 + (horizon_scale(free, horizon) / config.moves_trust) ** 2)
 
 
 def next_trip(state: GameState) -> float:
@@ -386,13 +408,15 @@ def next_trip(state: GameState) -> float:
     visible fruit, or for an afterstate the mean over the free cells where the next fruit may appear. A
     cell the body walls in counts from when the body beside it moves away
     (:func:`~snake_agent.survival.opening_times`)."""
-    times = opening_times(Board(state))
-    width = state.width
-    if state.fruit is not None:
-        return float(times[state.fruit[1] * width + state.fruit[0]])
-    occupied = set(state.snake)
-    free = [times[y * width + x] for y in range(state.height) for x in range(width) if (x, y) not in occupied]
-    return float(sum(free)) / len(free) if free else 0.0
+    view = _View(state)
+    fruit = -1 if state.fruit is None else state.fruit[1] * state.width + state.fruit[0]
+    return _trip(view.release, view.nbr, view.head, view.heading, fruit)
+
+
+def _trip(release: np.ndarray, nbr: np.ndarray, head: int, heading: int, fruit: int = -1) -> float:
+    """:func:`next_trip` from the kernels' arrays: to ``fruit``, or with none to the mean free cell."""
+    times = fast.opening(release, nbr, head, heading)
+    return float(times[fruit]) if fruit >= 0 else float(fast.free_mean(times, release))
 
 
 def _fastest(wins: np.ndarray, moves: np.ndarray, config: PlanConfig, rng: random.Random | None) -> int:
@@ -453,20 +477,21 @@ def seeks_certificate(state: GameState, config: PlanConfig = EVALUATION) -> bool
     )
 
 
-def _plans(state: GameState, paths: Sequence[Sequence[int]], rules: Rules) -> list[Plan]:
+def _plans(state: GameState, view: _View, paths: Sequence[Sequence[int]], rules: Rules) -> list[Plan]:
     """``paths`` as plans, one per afterstate, without those the fruit timeout cuts short."""
     budget = rules.moves_left(state)
-    plans: dict[tuple, Plan] = {}
+    plans: dict[bytes, Plan] = {}
     for path in paths:
         if budget is None or len(path) <= budget:
-            after = afterstate(state, path)
-            plans.setdefault(after.snake, Plan(tuple(path), after))
+            key = view.key(np.asarray(path, dtype=np.int64))
+            if key not in plans:
+                plans[key] = Plan(tuple(path), afterstate(state, path))
     return list(plans.values())
 
 
-def _certain(state: GameState, plans: Sequence[Plan]) -> Decision:
+def _certain(view: _View, plans: Sequence[Plan]) -> Decision:
     """The fastest of ``plans``, whose afterstates are certified: the fewest moves with the next trip."""
-    totals = [p.moves + (0.0 if p.after.won else next_trip(p.after)) for p in plans]
+    totals = [p.moves + (0.0 if p.after.won else view.trip(p.cells)) for p in plans]
     i = min(range(len(plans)), key=totals.__getitem__)
     return Decision(plans[i], None, 1.0, totals[i], len(plans), True)
 
@@ -491,44 +516,61 @@ def decide(
     certificate (:func:`~snake_agent.certify.transition_paths`).
     """
     rng = random.Random(0) if rng is None else rng
+    view = _View(state)
+    nbr = view.nbr
     plans = None
     if seeks_certificate(state, config):
         lay = certify(state)
         if lay is not None:
-            kept = _plans(
-                state,
-                certified_paths(state, lay, rng, config.trees, config.shortcuts, config.shortcut_budget),
-                rules,
-            )
+            paths = certified_paths(state, lay, rng, config.trees, config.shortcuts, config.shortcut_budget)
+            kept = _plans(state, view, paths, rules)
             if kept:
-                return _certain(state, kept)
+                return _certain(view, kept)
         else:
-            exact, partial = transition_paths(state, rng, config.trees, config.paths)
-            exact_plans = _plans(state, exact, rules)
+            exact, partial = transition_paths(
+                state, rng, config.trees, config.paths, config.shortcuts, config.shortcut_budget
+            )
+            exact_plans = _plans(state, view, exact, rules)
             if exact_plans:
-                return _certain(state, exact_plans)
-            plans = [p for p in _plans(state, partial, rules) if certified(p)] or None
+                return _certain(view, exact_plans)
+            plans = _plans(state, view, partial, rules)
+            plans = [p for p in plans if p.after.won or view.certified(p.cells)] or None
     if plans is None:
-        plans = candidates(state, rules, config, rng)
-    holds = waits(state, rules)
+        plans = _candidates(state, view, rules, config, fast.generator(rng.getrandbits(32)))
+    arrays = [view.after(p.cells) for p in plans]  # each afterstate's release, head and heading
+    holds = _waits(state, view, rules)
     if config.guard and _comfortable(state, rules, plans):
-        safe_plans = [p for p in plans if certified(p)]
-        safe_holds = [w for w in holds if w.certified]
-        if safe_plans or safe_holds:
-            plans, holds = safe_plans, safe_holds
+        safe = [
+            p.after.won or fast.certificate(r, nbr, h, d) for p, (r, h, d) in zip(plans, arrays, strict=True)
+        ]
+        safe_holds = [w for w in holds if w[0].certified]
+        if any(safe) or safe_holds:
+            plans = [p for p, ok in zip(plans, safe, strict=True) if ok]
+            arrays = [a for a, ok in zip(arrays, safe, strict=True) if ok]
+            holds = safe_holds
     if not plans and len(holds) <= 1:  # forced, or every move collides or times out
-        return Decision(None, holds[0].action if holds else RelativeAction.STRAIGHT)
+        return Decision(None, holds[0][0].action if holds else RelativeAction.STRAIGHT)
     afters = [p.after for p in plans]
     queries = [Query(a, rules, afterstate=True) for a in afters if not a.won]
-    queries += [Query(w.state, rules) for w in holds]
+    queries += [Query(w.state, rules) for w, _ in holds]
     prediction = (yield queries) if queries else None
     plan_wins, after_moves = _values(afters, prediction, 0)
     plan_moves = [p.moves + m for p, m in zip(plans, after_moves, strict=True)]
-    wait_wins, state_moves = _values([w.state for w in holds], prediction, len(queries) - len(holds))
+    wait_wins, state_moves = _values([w.state for w, _ in holds], prediction, len(queries) - len(holds))
     wait_moves = [1.0 + m for m in state_moves]
-    weight = trust(state.free_cells, config)
-    plan_near = [0.0 if a.won or not config.next_trip else next_trip(a) for a in afters]
-    wait_near = [next_trip(w.state) if config.next_trip else 0.0 for w in holds]
+    weight = trust(state.free_cells, config, 0 if prediction is None else prediction.horizon)
+    width = state.width
+    fruit = state.fruit[1] * width + state.fruit[0]
+    plan_near = [
+        0.0 if a.won or not config.next_trip else _trip(r, nbr, h, d)
+        for a, (r, h, d) in zip(afters, arrays, strict=True)
+    ]
+    wait_near = [
+        _trip(moved, nbr, w.state.head[1] * width + w.state.head[0], int(w.state.direction), fruit)
+        if config.next_trip
+        else 0.0
+        for w, moved in holds
+    ]
     is_plan, i = choose(
         plan_wins,
         [p.moves + n + weight * (m - n) for p, n, m in zip(plans, plan_near, after_moves, strict=True)],
@@ -540,7 +582,7 @@ def decide(
     options = len(plans) + len(holds)
     if is_plan:
         return Decision(plans[i], None, plan_wins[i], plan_moves[i], options)
-    return Decision(None, holds[i].action, wait_wins[i], wait_moves[i], options)
+    return Decision(None, holds[i][0].action, wait_wins[i], wait_moves[i], options)
 
 
 def run_decision(
@@ -564,18 +606,20 @@ class Planner:
     """Follows a decision's plan move by move: the moves left, and the next move as a relative action."""
 
     def __init__(self) -> None:
-        self.cells: list[int] = []
+        self.cells: Sequence[int] = ()
+        self.next = 0
 
     def follow(self, plan: Plan) -> None:
-        self.cells = list(plan.cells)
+        self.cells, self.next = plan.cells, 0
 
     def next_action(self, state: GameState) -> RelativeAction | None:
         """The plan's next move from ``state``, or None if there is no plan left."""
-        if not self.cells:
+        if self.next >= len(self.cells):
             return None
         width = state.width
         head = state.head[1] * width + state.head[0]
-        cell = self.cells.pop(0)
+        cell = self.cells[self.next]
+        self.next += 1
         return to_relative(state.direction, Direction(_direction(width, head, cell)))
 
 
@@ -607,31 +651,81 @@ class PlanAgent:
 
 
 # ------------------------------------------------------------- self-play
-class _Game:
-    """One self-play game of the plan agent: the live game, the pending decision and the record."""
+class _Reservoir:
+    """A uniform sample of a stream: at most ``capacity`` of its items (all of them if it is None)."""
 
-    def __init__(self, start: Start, rules: Rules, config: PlanConfig, rng: random.Random) -> None:
+    def __init__(self, capacity: int | None, rng: random.Random) -> None:
+        self.capacity, self.rng = capacity, rng
+        self.items: list = []
+        self.seen = 0
+
+    def offer(self, item):
+        """Add ``item`` to the sample; returns the item left out to make room (``item`` itself or the one
+        it replaces), or None."""
+        self.seen += 1
+        if self.capacity is None or len(self.items) < self.capacity:
+            self.items.append(item)
+            return None
+        if not self.capacity:
+            return item
+        j = self.rng.randrange(self.seen)
+        if j >= self.capacity:
+            return item
+        left, self.items[j] = self.items[j], item
+        return left
+
+
+class _Game:
+    """One self-play game of the plan agent: the live game, the pending decision and the record.
+
+    A long game keeps a uniform sample of its states: ``samples`` of all its states for mid-game starts,
+    and with ``cap`` at most that many decision states and afterstates as examples (all if 0); the others
+    keep their targets' bookkeeping only."""
+
+    def __init__(
+        self,
+        start: Start,
+        rules: Rules,
+        config: PlanConfig,
+        rng: random.Random,
+        sampler: random.Random | None = None,
+        samples: int = 0,
+        cap: int = 0,
+    ) -> None:
         self.start, self.rules, self.config, self.rng = start, rules, config, rng
         self.game = start.game()
         self.start_length = self.game.length
         self.planner = Planner()
         self.deciding: Generator[list[Query], Prediction, Decision] | None = None
         self.prediction: Prediction | None = None
-        self.decided: list[tuple[int, GameState, float]] = []
-        """Decisions that compared options: the move they were made before, the state and the chosen
-        option's win value."""
+        self.decided: list[list] = []
+        """Decisions that compared options: the move they were made before, the state (None if it is not
+        sampled) and the chosen option's win value."""
         self.eats: list[int] = []
         """Moves (from the agent's first) that ate a fruit without filling the board."""
-        self.afters: list[GameState] = []
+        self.afters: list[GameState | None] = []
+        """The afterstates of those fruits (None if not sampled, or certified)."""
         self.after_moves: list[float] = []
         """The moves value (in moves) the network gave each afterstate when its plan was chosen."""
         self.after_certain: list[bool] = []
         """Whether each afterstate was certified by a Hamiltonian cycle (:attr:`Decision.certain`)."""
         self.moves = 0
         self.leaves = 0
-        self.states: list[GameState] = []
+        sampler = random.Random(0) if sampler is None else sampler
+        self.samples = _Reservoir(samples, sampler)
+        self.kept = _Reservoir(cap or None, sampler)
         self.outcome: Outcome | None = None
         self.pending: Decision | None = None
+
+    def _keep(self, kind: str, index: int) -> None:
+        """Offer an example to the sample; forget the state of the one left out."""
+        left = self.kept.offer((kind, index))
+        if left is not None:
+            kind, index = left
+            if kind == "decided":
+                self.decided[index][1] = None
+            else:
+                self.afters[index] = None
 
     def advance(self) -> list[Query] | None:
         """Play until a decision needs the network (its queries are returned) or the game ends (None)."""
@@ -652,7 +746,8 @@ class _Game:
                 self.deciding = None
                 decision: Decision = stop.value
                 if decision.win is not None and not decision.certain:
-                    self.decided.append((self.moves, state, decision.win))
+                    self.decided.append([self.moves, state, decision.win])
+                    self._keep("decided", len(self.decided) - 1)
                 if decision.plan is None:
                     self._play(state, decision.wait)
                     continue
@@ -661,29 +756,33 @@ class _Game:
         return None
 
     def _play(self, state: GameState, action: RelativeAction) -> None:
-        self.states.append(state)
-        step = self.game.step_relative(action)
+        self.samples.offer(state)
+        game = self.game
+        step = game.step_relative(action)
         self.moves += 1
         if step.ate_fruit and not step.won:
-            after = dataclasses.replace(self.game.state(), fruit=None)
+            after = dataclasses.replace(game.state(), fruit=None)
             self.eats.append(self.moves - 1)
-            self.afters.append(after)
             decision = self.pending
             known = (
                 decision is not None and decision.plan.after.snake == after.snake and decision.win is not None
             )
+            certain = known and decision.certain
+            self.afters.append(None if certain else after)
             self.after_moves.append(decision.moves - decision.plan.moves if known else 0.0)
-            self.after_certain.append(known and decision.certain)
+            self.after_certain.append(certain)
+            if not certain:
+                self._keep("afters", len(self.afters) - 1)
             self.pending = None
-        if self.game.won:
+        limit = self.rules.limit(game.width * game.height, game.length)
+        if game.won:
             self.outcome = Outcome.WON
-        elif self.game.done:
+        elif game.done:
             self.outcome = Outcome.LOST
-        elif self.rules.timed_out(self.game.state()):
+        elif limit is not None and game.steps_since_fruit >= limit:
             self.outcome = Outcome.TIMED_OUT
 
-    def summary(self, samples: int, rng: np.random.Generator) -> GameSummary:
-        chosen = rng.choice(len(self.states), size=min(samples, len(self.states)), replace=False)
+    def summary(self) -> GameSummary:
         return GameSummary(
             self.start.kind,
             self.start.seed,
@@ -696,11 +795,11 @@ class _Game:
             0,
             (self.game.width, self.game.height),
             self.leaves,
-            tuple(self.states[i] for i in sorted(chosen)),
+            tuple(sorted(self.samples.items, key=lambda state: state.steps)),
         )
 
     def examples(
-        self, beta: float, moves_lambda: float, size: int, cycle: bool, arrival: bool
+        self, beta: float, moves_lambda: float, size: int, cycle: bool, arrival: bool, horizon: int = 0
     ) -> list[tuple]:
         """The game's decision states and afterstates as example rows (see
         :func:`snake_agent.selfplay._to_examples`).
@@ -711,19 +810,30 @@ class _Game:
         (:func:`~snake_agent.selfplay.moves_returns`) with the network's values of the afterstates.
         Certified decisions and afterstates (:attr:`Decision.certain`) are no examples, since the agent
         never asks the network about them; the moves the game played from such an afterstate stand for
-        its value in the returns of the ones before."""
+        its value in the returns of the ones before. States left out of the sample give no examples.
+
+        With a ``horizon``, the moves targets are the moves the game took to eat that many more fruits
+        (:func:`horizon_returns`), in units of :func:`~snake_agent.encoding.horizon_scale`, wherever the
+        game got that far or filled the board, lost games included."""
         won = self.outcome is Outcome.WON
         z = float(won)
-        moves = [0.0] * self.moves
-        afters = [0.0] * len(self.afters)
-        if won:
-            values = [
-                self.moves - 1 - eat if certain else value
-                for eat, value, certain in zip(self.eats, self.after_moves, self.after_certain, strict=True)
-            ]
-            moves, afters = moves_returns(self.moves, self.eats, values, moves_lambda)
+        if horizon:
+            moves, afters = horizon_returns(self.moves, self.eats, won, horizon)
+        else:
+            moves = [0.0 if won else None] * self.moves
+            afters = [0.0 if won else None] * len(self.afters)
+            if won:
+                values = [
+                    self.moves - 1 - eat if certain else value
+                    for eat, value, certain in zip(
+                        self.eats, self.after_moves, self.after_certain, strict=True
+                    )
+                ]
+                moves, afters = moves_returns(self.moves, self.eats, values, moves_lambda)
         rows = []
         for t, state, win in self.decided:
+            if state is None:
+                continue
             rows.append(
                 (
                     encode(state, self.rules, size, cycle=cycle, arrival=arrival),
@@ -732,15 +842,15 @@ class _Game:
                     np.zeros(3),
                     False,
                     (1.0 - beta) * z + beta * win,
-                    moves[t] / moves_scale(state.free_cells) if won else 0.0,
-                    won,
+                    0.0 if moves[t] is None else moves[t] / horizon_scale(state.free_cells, horizon),
+                    moves[t] is not None,
                     Label.BLEND,
                     state.free_cells,
                 )
             )
         following = {t: win for t, _, win in self.decided}
         for k, after in enumerate(self.afters):
-            if self.after_certain[k]:
+            if after is None:
                 continue
             win = following.get(self.eats[k] + 1)
             rows.append(
@@ -751,13 +861,38 @@ class _Game:
                     np.zeros(3),
                     False,
                     z if win is None else (1.0 - beta) * z + beta * win,
-                    afters[k] / moves_scale(after.free_cells) if won else 0.0,
-                    won,
+                    0.0 if afters[k] is None else afters[k] / horizon_scale(after.free_cells, horizon),
+                    afters[k] is not None,
                     Label.AFTERSTATE,
                     after.free_cells,
                 )
             )
         return rows
+
+
+def horizon_returns(
+    total: int, eats: Sequence[int], won: bool, horizon: int
+) -> tuple[list[float | None], list[float | None]]:
+    """The moves a game of ``total`` moves took to eat ``horizon`` more fruits, ``(from each move, from each
+    fruit's afterstate)``, or until the board was full; None where it ended first without filling it.
+
+    ``eats`` are the moves that ate a fruit without filling the board. From the state before move ``t``
+    the count runs to the move that ate the ``horizon``-th fruit after it, that move included; from the
+    afterstate of the ``i``-th fruit, to the move that ate the ``(i + horizon)``-th.
+    """
+    ends = list(eats) + ([total - 1] if won else [])
+    from_moves: list[float | None] = []
+    before = 0  # fruits eaten before move t
+    for t in range(total):
+        while before < len(eats) and eats[before] < t:
+            before += 1
+        k = before + horizon - 1
+        from_moves.append(float(ends[k] - t + 1) if k < len(ends) else float(total - t) if won else None)
+    from_afters: list[float | None] = []
+    for i, eat in enumerate(eats):
+        k = i + horizon
+        from_afters.append(float(ends[k] - eat) if k < len(ends) else float(total - 1 - eat) if won else None)
+    return from_moves, from_afters
 
 
 def play(
@@ -773,22 +908,30 @@ def play(
     samples: int = 0,
     cycle: bool = False,
     arrival: bool = False,
+    max_examples: int = 0,
+    horizon: int = 0,
 ) -> tuple[list[GameSummary], Examples | None]:
     """Play a game of the plan agent from each start, all at once, and return their summaries and examples.
 
     Each round, every game plays until its next decision, and the options of all their decisions are
     evaluated in one batch. ``seed`` drives the agents' random choices, never the fruits. The examples are
-    the states where the games decided and the afterstates they reached (:meth:`_Game.examples`), encoded
-    on a canvas of side ``size`` with or without the canonical cycle's inputs and the arrival planes
-    (``cycle``, ``arrival``, as the network expects). Each summary keeps ``samples`` of its game's states
-    for mid-game starts.
+    the states where the games decided and the afterstates they reached (:meth:`_Game.examples`), at most
+    ``max_examples`` per game (a uniform sample; 0: all), encoded on a canvas of side ``size`` with or
+    without the canonical cycle's inputs and the arrival planes (``cycle``, ``arrival``, as the network
+    expects), their moves targets over ``horizon`` fruits if the network looks that far
+    (:meth:`_Game.examples`). Each summary keeps a uniform sample of ``samples`` of its game's states for
+    mid-game starts.
     """
     if not rules.fruit_timeout:
         raise ValueError("self-play needs the fruit timeout, which turns loops into losses")
     if not starts:
         raise ValueError("no starts")
     rng = np.random.default_rng(seed)
-    games = [_Game(s, rules, config, random.Random(int(rng.integers(1 << 62)))) for s in starts]
+    agents = [random.Random(int(rng.integers(1 << 62))) for _ in starts]
+    games = [
+        _Game(s, rules, config, agent, random.Random(int(rng.integers(1 << 62))), samples, max_examples)
+        for s, agent in zip(starts, agents, strict=True)
+    ]
     waiting = games
     while waiting:
         asking, queries, counts = [], [], []
@@ -806,6 +949,6 @@ def play(
                 offset += count
         waiting = asking
     size = size or max(max(s.state.width, s.state.height) for s in starts)
-    rows = [row for game in games for row in game.examples(beta, moves_lambda, size, cycle, arrival)]
-    summaries = [game.summary(samples, rng) for game in games]
+    rows = [row for game in games for row in game.examples(beta, moves_lambda, size, cycle, arrival, horizon)]
+    summaries = [game.summary() for game in games]
     return summaries, _to_examples(rows) if rows else None

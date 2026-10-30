@@ -40,10 +40,11 @@ import numpy as np
 
 from snake_game import Direction, GameState, RelativeAction
 
+from . import fast
 from .contract import Rules
 from .cycles import CycleEnvelope
 from .exact import standard_starts
-from .survival import Board, MoveClass, arrival_times, classify_moves, neighbour_table
+from .survival import MoveClass, neighbour_table
 
 PLANES = (
     "valid",
@@ -93,6 +94,8 @@ GLOBALS = (
 )
 ACTION_FEATURES = ("fatal", "won", "certified", "lost", "unknown", "eats", "envelope", "jump")
 MOVE_CLASSES = (MoveClass.FATAL, MoveClass.WON, MoveClass.CERTIFIED, MoveClass.LOST, MoveClass.UNKNOWN)
+_KERNEL_CLASSES = (MoveClass.FATAL, MoveClass.WON, MoveClass.CERTIFIED, MoveClass.UNKNOWN)
+"""The move classes by the codes of :func:`~snake_agent.fast.move_classes`."""
 SATURATION = 16
 """Cell counts saturate here in the ``release_cells`` and ``wall_*`` planes."""
 _P = {name: i for i, name in enumerate(PLANES)}
@@ -110,6 +113,23 @@ def moves_scale(free: int) -> float:
     appears in a hole behind the tail: see :func:`moves_ceiling`.
     """
     return free * (free + 3) / 4
+
+
+def horizon_scale(free: int, horizon: int = 0) -> float:
+    """The moves head's unit when it predicts the moves until ``horizon`` more fruits are eaten (0: until
+    the board is full): the plain cycle's expected moves for those ``k = min(horizon, F)`` fruits,
+    ``k(2F - k + 3) / 4``, which is :func:`moves_scale` when ``k = F``."""
+    k = free if horizon <= 0 else min(horizon, free)
+    return k * (2 * free - k + 3) / 4
+
+
+def horizon_ceiling(cells: int, free: int, horizon: int = 0) -> float:
+    """The most moves the next ``k = min(horizon, F)`` fruits can take under the fruit timeout, each within
+    ``N + L`` moves, in units of :func:`horizon_scale` (:func:`moves_ceiling` for the whole game)."""
+    if free <= 0:
+        return 0.0
+    k = free if horizon <= 0 else min(horizon, free)
+    return (k * (2 * cells - free) + k * (k - 1) / 2) / horizon_scale(free, horizon)
 
 
 def moves_ceiling(cells: int, free: int) -> float:
@@ -218,7 +238,7 @@ def encode(
     if size < max(width, height):
         raise ValueError(f"a {width}x{height} board does not fit a {size}x{size} canvas")
     length = state.length
-    flat = np.array([y * width + x for x, y in state.snake], dtype=np.int64)
+    flat = fast.flat(state)
     head, tail = int(flat[0]), int(flat[-1])
     fruit = -1 if afterstate or state.fruit is None else state.fruit[1] * width + state.fruit[0]
 
@@ -233,52 +253,30 @@ def encode(
     planes[_P["release"], flat] = release / cells
     planes[_P["release_cells"], flat] = np.minimum(release, SATURATION) / SATURATION
 
-    # Free cells reachable from the head, their distance, and the slack of the body cells around them
-    # (a breadth-first search over plain lists: indexing NumPy arrays one cell at a time is slow).
-    board = Board(state)
-    neighbours = board.neighbours
-    release_of = [0] * cells  # nonzero exactly on the body
-    for k, cell in enumerate(flat.tolist()):
-        release_of[cell] = length - k
-    unseen = -(1 << 30)
-    distance, slack = [-1] * cells, [unseen] * cells
-    distance[head] = 0
-    frontier, step = [head], 1
-    reverse = (int(state.direction) + 2) % 4
-    while frontier:
-        layer = []
-        for cell in frontier:
-            for direction, nxt in enumerate(neighbours[cell]):
-                if nxt < 0 or (cell == head and direction == reverse):
-                    continue
-                if release_of[nxt]:
-                    if step - release_of[nxt] > slack[nxt]:
-                        slack[nxt] = step - release_of[nxt]
-                elif distance[nxt] < 0:
-                    distance[nxt] = step
-                    layer.append(nxt)
-        frontier = layer
-        step += 1
-    occupied = np.zeros(cells, dtype=bool)
-    occupied[flat] = True
+    # Free cells reachable from the head, their distance, and the slack of the body cells around them.
+    neighbours = fast.grid(width, height)
+    heading = int(state.direction)
+    release_of = fast.release_of(flat, cells)
+    distance_, slack_ = fast.reach(release_of, neighbours, head, heading)
+    occupied = release_of > 0
     if arrival:
-        times = np.array(arrival_times(board))
+        times = fast.arrival(release_of, neighbours, head, heading, -1)
         reached = times > 0
         planes[_P["arrival"]] = np.where(reached, times, 0) / cells
         planes[_P["arrival_cells"]] = np.where(reached, np.minimum(times, SATURATION), 0) / SATURATION
         planes[_P["unreached"]] = ~reached & ~occupied
-    distance_ = np.array(distance)
     reach = (distance_ > 0) & ~occupied
     planes[_P["reach"]] = reach
     planes[_P["distance"]] = np.where(reach, distance_, 0) / cells
-    slack_ = np.array(slack)
-    edge = slack_ > unseen
+    edge = slack_ > fast.UNSEEN
     planes[_P["slack"]] = np.where(edge, np.clip(slack_ / cells, -1.0, 1.0), 0.0)
 
-    k = int(state.direction)  # quarter turns that bring the heading up
+    k = heading  # quarter turns that bring the heading up
     toward = np.full(cells, -1, dtype=np.int64)
-    if length > 1:
-        toward[flat[1:]] = [int(d) for d in state.segment_directions[1:]]
+    if length > 1:  # each segment's direction to the one in front of it
+        dx = flat[:-1] % width - flat[1:] % width
+        dy = flat[:-1] // width - flat[1:] // width
+        toward[flat[1:]] = np.where(dy == -1, 0, np.where(dx == 1, 1, np.where(dy == 1, 2, 3)))
     for d in range(4):  # absolute direction d points (d - k) % 4 in the head's frame
         planes[_P["toward_up"] + (d - k) % 4] = toward == d
 
@@ -312,18 +310,19 @@ def encode(
     globals_[budget : budget + 3] = rules.budget_features(state)
     globals_[_G["afterstate"]] = float(afterstate)
     globals_[_G["in_cycle_order"]] = float(in_order)
-    globals_[_G["certified"]] = float(board.has_survival_certificate())
+    globals_[_G["certified"]] = float(fast.certificate(release_of, neighbours, head, heading))
 
     actions = np.zeros((3, len(ACTION_FEATURES)), dtype=np.float32)
     if not afterstate:
         if classes is None:
-            classes = classify_moves(state)
-        heading = state.direction
+            codes = fast.move_classes(release_of, neighbours, head, heading, fruit, length)
+            classes = tuple(_KERNEL_CLASSES[code] for code in codes)
+        direction = state.direction
         for a in RelativeAction:
             actions[a, MOVE_CLASSES.index(classes[a])] = 1.0
-            target = neighbours[head][heading.turn(a)]
+            target = neighbours[head, direction.turn(a)]
             actions[a, _A["eats"]] = float(target >= 0 and target == fruit)
-            jump = jumps.get(heading.turn(a))
+            jump = jumps.get(direction.turn(a))
             if jump is not None:
                 actions[a, _A["envelope"]] = 1.0
                 actions[a, _A["jump"]] = jump / cells

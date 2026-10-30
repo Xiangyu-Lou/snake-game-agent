@@ -21,6 +21,11 @@ faster: it plays free while the snake is short, then finishes on a
 Hamiltonian-cycle certificate that it rebuilds at every fruit. On the test
 seeds of 20×20 it wins 298 of 299 games in 11,047 moves on average, 46% fewer
 than M3's agent ([below](#free-play-and-a-certified-finish-the-plan-agent)).
+Then the plan agent gets a **Transformer**, plays **100×100**, and plays free
+until 40% of the board is filled instead of 30%: its searches are compiled, and
+the Transformer, trained on boards up to 20×20, clears 100×100 in 45% of the
+shortcut cycle's moves; on the test seeds of 20×20 it wins all 299 games in
+10,978 moves ([below](#a-transformer-100100-and-a-later-switch)).
 
 M0's gate is met: the tests pass, and the harness reproduces the reference
 numbers of the [Architecture B probe](../analysis/architecture_b_probe.py):
@@ -37,6 +42,7 @@ analytic network cost model ([below](#reproducing-the-probe)).
 - [Habits: faster than the shortcut cycle on 10×10](#habits-faster-than-the-shortcut-cycle-on-1010)
 - [M3: 20×20](#m3-2020)
 - [Free play and a certified finish: the plan agent](#free-play-and-a-certified-finish-the-plan-agent)
+- [A Transformer, 100×100 and a later switch](#a-transformer-100100-and-a-later-switch)
 - [Reproducing the probe](#reproducing-the-probe)
 - [Package layout](#package-layout)
 
@@ -1192,7 +1198,8 @@ leaves:
 - **The guard.** Exact code decides survival where it can (review §2.3): while
   the fruit timeout leaves room to wait, only the options that keep a survival
   certificate are compared, if any does.
-- **The certified finish** (`PlanConfig.certify`, 0.3). From 30% of the board
+- **The certified finish** (`PlanConfig.certify`, 0.3 here; 0.4 since
+  [the later switch](#where-to-switch)). From 30% of the board
   filled the agent heads for a certified body, then keeps one to the end,
   taking at each fruit the fastest path that keeps it; the network is not asked
   then ([below](#the-certified-finish)). With `--certify none` the agent plays
@@ -1481,6 +1488,298 @@ python -m snake_agent assess runs/plans-20/model-030.pt --agents plans --board 2
     --sources 100 --workers 20 --certify none                                         # pure free play
 ```
 
+## A Transformer, 100×100 and a later switch
+
+After the plan agent the owner set three targets: a Transformer network, the
+100×100 board, and free play over more of the game, switching to the
+cycle-based finish later.
+
+**Status:**
+
+- **The Transformer** (`NetworkConfig(kind="transformer")`) learns from random
+  weights by the plan agent's self-play in under an hour and plays level with
+  the CNN: on 20×20 the networks are within 100 moves of each other wherever
+  the switch pays, from 30% to 50% ([below](#where-to-switch)).
+- **100×100 works.** The searches are compiled
+  ([below](#compiled-kernels)), and the Transformer, trained on boards up to
+  20×20 only, wins every validation game of 100×100 in 5.6 to 5.7 million
+  moves, 45% of the shortcut cycle's 12.5 million ([below](#100100)).
+  The plan agent's CNN, trained in pure free play, loses every game there; a
+  CNN trained as the Transformer was wins every game too, and within the noise
+  of 8 games as fast (1.8% slower): the training carries a network to
+  100×100, not its architecture.
+- **Free play runs to 40%** of the board instead of 30% (`PlanConfig.certify`,
+  now 0.4): 211 to 252 moves fewer on 20×20, a tie on 100×100.
+  Beyond 40% free play costs more per fruit than the certified finish, with
+  every network. Searching the transition's paths and a moves head that looks
+  8 fruits ahead make a later switch safe (all 100 games won at 60%), not
+  faster.
+- **Test seeds**, the Transformer with the 8-fruit horizon switching at 40%: on
+  20×20 all 299 T1 games won in 10,978.4 moves on average, 9,904.0 fewer than
+  the shortcut cycle on the same games (the plan agent's CNN switching at 30%:
+  298 won in 11,046.7), and the T2 gate passed (327 of 327, 113 of 113, 34 of
+  38); on 100×100 all 8 test games won in 5,693,532.6 moves, 6,847,106 fewer
+  than the shortcut cycle (±128,281, 95%), 45.4% of its moves.
+
+
+### Compiled kernels
+
+On 100×100 the plan agent's Python loops took a quarter to half a second per
+decision: the searches for when the head can reach each cell, the survival
+certificates, the encoder's planes, and the 64 spanning trees of the
+certificate. A game has 10,000 decisions. [`fast.py`](fast.py) holds the same
+searches over flat NumPy arrays (the body as cells, each cell's `release`, the
+neighbour table), compiled by Numba, an optional dependency
+(`pip install -e ".[fast]"`, part of the `dev` and `train` extras). Without
+Numba they run as plain Python, the same code giving the same results, only
+slower. The deterministic kernels give exactly what the Python functions they
+replace give (the tests compare them on thousands of states, and the encodings
+are bit-identical on 39,064 cases); the ones that draw random tie-breaks use a
+small xorshift generator, so their choices differ from the old code's but not
+their kind.
+
+| 100×100 | Python | Kernels |
+| --- | ---: | ---: |
+| A free-play decision at the start, with the encodings of its 23 options | 460 ms | 18 ms |
+| A free-play decision at 50% fill, without the encodings | 356 ms | 21 ms |
+| A certified decision at 50% fill | 198 ms | 66 ms |
+| Encoding one state (5% to 50% fill) | 4.8 to 6.5 ms | 0.27 to 0.57 ms |
+| Encoding one state of 20×20 | 0.20 to 0.28 ms | 0.05 to 0.06 ms |
+
+The encoder's speed-up also serves the M-series search agents. On 20×20, 100
+games of the plan agent now take 30 to 60 seconds on 8 of the server's workers.
+
+### The Transformer
+
+`NetworkConfig(kind="transformer")` ([`network.py`](network.py),
+`SnakeTransformer`) keeps two of the CNN's residual blocks at the cells, then
+cuts the board into 2×2 tokens, the blocks of the certificate, and runs 6
+attention layers of width 128 with 4 heads, so that a bottleneck at the far
+side of the board is one layer away. Positions enter attention as rotations of
+the queries and keys by the tokens' two coordinates (two-dimensional rotary
+embeddings): they depend only on the offsets between tokens, so the same
+weights run on any board, and a board gives the same outputs on its own canvas
+and padded into a larger one. The summary reads the head's token and the mean
+and maximum over the board's tokens; the heads are the CNN's. 1.52 M
+parameters. On the GPU it runs in bfloat16.
+
+On the RTX 4090, per position, in batches as a decision evaluates them:
+
+| | Parameters | 20×20 (batch 256) | 100×100 (batch 64) |
+| --- | ---: | ---: | ---: |
+| CNN (6 blocks of 64 channels, float32) | 0.60 M | 0.015 ms | 0.63 ms |
+| Transformer, 2×2 tokens (bfloat16) | 1.52 M | 0.025 ms | 0.69 ms |
+| Transformer, 4×4 tokens | 1.61 M | 0.025 ms | 0.29 ms |
+| Transformer, 2×2 tokens, width 192, 8 layers | 3.93 M | 0.030 ms | 1.19 ms |
+
+The 2×2 tokens cost about what the CNN costs on 100×100 (2,500 tokens, all
+attending to each other); 4×4 tokens halve that but merge 16 cells per token.
+
+### Training the Transformer
+
+From random weights, by the plan agent's own self-play (track T3), in two
+stages like the CNN's ([above](#the-current-network)), with the same settings
+otherwise (exploration 0.1, 400 Adam steps of 512 examples per generation,
+learning rate 10⁻³ after two generations of warm-up):
+
+| Stage | Starts from | Boards (games per generation) | Generations | Self-play |
+| --- | --- | --- | ---: | --- |
+| A | random weights | 10×10 (128), 8×8 (64), 6×6 (64) | 40 | pure free play |
+| B | A's last | 20×20 (32), 14×14 (16), 10×10 (32) | 30 | the certified finish from 50% fill |
+
+Stage A's assessments (100 games of 10×10 in pure free play) won 58, 97, 100
+and 96 games at generations 10 to 40; the last in 1,328.4 moves, where the
+CNN's pure free play takes 1,438.6. Stage B's (100 games of 20×20, the
+certified finish from 50%) won 100, 99 and 100 games in 11,370.7, 11,364.5 and
+11,371.2 moves: it reached its level within ten generations. In all: 12,593 games, 18.6
+million moves and 1.8 million examples in 52 minutes of the server (16
+workers), most of it the network's updates (stage A 24 minutes, stage B 29).
+
+### Where to switch
+
+The agent heads for the certified finish once a share of the board is filled
+(`--certify`). Both networks on the same 100 validation games of 20×20, with
+the transition's searched paths ([below](#the-transition-search)):
+
+| Switch at | CNN won | CNN moves | Transformer won | Transformer moves |
+| --- | ---: | ---: | ---: | ---: |
+| 30% (the plan agent's setting) | 100 | 11,115.3 | 100 | 11,101.7 |
+| **40%** | 100 | **10,863.1** | 100 | **10,890.5** |
+| 50% | 100 | 11,401.9 | 99 | 11,307.0 |
+| 60% | 97 | 14,842.7 | 92 | 12,644.7 |
+
+The best switch is 40% for both: 252 and 211 moves fewer than at 30% (the
+earlier study of 10 games had put 30% ahead, within its noise). Later than that, free play
+costs more per fruit than the certified finish, by band of fill:
+
+| Fill | 30–40% | 40–50% | 50–60% |
+| --- | ---: | ---: | ---: |
+| Free play (CNN; the Transformer is within 0.5) | 37.4 | 50.0 | 63.5 |
+| The certified finish, switching at 30% | 45.6 | 43.7 | 40.2 |
+
+The two networks play free at the same pace because the decision rule sets it:
+among the plans the win head rates safe enough, the agent takes the fewest
+moves, its own and the exact next trip, and the moves head counts only near the
+end of the game (`trust`: 0.005 with 240 cells free on 20×20). Free play leaves
+walls and holes, which make later trips longer; the network sees them, but its
+moves values are not trusted where they would matter. Trusting them more
+(`--moves-trust`, switching at 60%) helps late in the game and hurts early:
+
+| Switch at 60% | Won | Moves | Moves per fruit at 0–10%, 70–80%, 90–100% |
+| --- | ---: | ---: | --- |
+| `moves_trust` 1,000 | 97 | 14,842.7 | 14.0, 45.2, 28.5 |
+| 3,000 | 98 | 13,369.7 | 14.0, 37.0, 15.8 |
+| 10,000 | 100 | 13,592.3 | 14.5, 32.7, 12.9 |
+
+### The transition search
+
+From a free-play body the transition looked for paths among walks around 64
+random spanning trees that hold the body's recent run of the layout's moves,
+and among shortest paths by the layout's moves; on a long body most of them run
+into the older part of the body or break the run's gates, and the agent then
+falls back to free plans. The certified shortcut search
+([above](#the-certified-finish)) now also runs in the transition, keeping only
+the gates of the recent run and without its pruning by regions (the older part
+of the body still divides the free cells): it finds the shortest paths by the
+layout's moves that lengthen the run, or that certify the whole body. Switching
+at 60% on 20×20 (20 games, the CNN), it won 20 games in 15,140.9 moves, where
+the transition without it won 19 in 16,943.1; at 30% and 40% (40 games each)
+the two are within 25 moves, since short bodies finish the transition anyway.
+
+### A moves head that looks a few fruits ahead
+
+The moves head predicts the moves until the board is full, in units of
+`moves_scale` of the free cells, and its errors grow with that unit: on 20×20
+with 240 cells free it is 14,580 moves, so the agent rightly gives it a weight of
+0.005. Two plans differ in what they leave behind, walls and holes that lengthen
+the next few trips, by tens of moves. A head that predicts those few trips can
+be trusted where the whole game's cannot. With `NetworkConfig.horizon = K`
+(`--horizon`) the moves head of the plan agent's network predicts the moves to
+eat the next `K` fruits (or to fill the board, if it is closer), in units of
+`encoding.horizon_scale`, the plain cycle's moves for those fruits; its targets
+are the moves the game took (`plans.horizon_returns`), from lost games too as
+far as they got, and `trust` uses the smaller unit (with 8 fruits on 20×20, a
+weight of 0.33 at the start and 0.62 with half the board free).
+
+The Transformer of stage B, trained 20 more generations with an 8-fruit horizon
+and the certified finish from 60% fill (`runs/t-h8`), on the same 100 games:
+
+| Switch at | Won | Moves | Moves per fruit at 40–50%, 50–60% |
+| --- | ---: | ---: | --- |
+| 40% | 100 | 10,856.7 | 46.6 (certified), 39.0 |
+| 50% | 100 | 11,351.2 | 49.5, 48.0 (certified) |
+| 60% | 100 | 12,411.2 | 49.5, 60.2 |
+
+It makes a late switch safe, 100 games won at 60% where the other networks lose
+3 and 8, and a little faster (12,411 moves against 12,645 and 14,843), but free
+play's pace at 40% to 60% fill barely moves (49.5 and 60.2 moves per fruit,
+against 50.0 and 63.5): the head does not tell the plans apart by what they
+leave behind, at least not after 20 generations. The certified finish stays
+cheaper from 40% on.
+
+### Making 100×100 fit
+
+A 100×100 game takes about 5.7 million moves and 10,000 decisions. Besides the
+kernels:
+
+- **Bounded memory in self-play.** A game kept every state it passed, for
+  mid-game starts, and every decision state and afterstate, for examples: on
+  100×100 that is hundreds of gigabytes of body tuples. It now keeps a uniform
+  sample (reservoir sampling) of `samples` states and, with `max_examples`, of
+  its examples; the targets' bookkeeping stays complete.
+- **A canvas per board.** Examples were encoded on the canvas of the largest
+  board of the mixture, so a 10×10 example in a mixture with 100×100 took 100
+  times its size. The plan agent's examples now keep their own board's canvas,
+  in a replay per canvas side (`train.Replays`, capped with `--replay-cells`),
+  and each minibatch comes from one side. The search agents keep their single
+  canvas, so their runs are unchanged.
+- **Evaluation by board.** `NetworkEvaluator` evaluates each board size on its
+  own canvas, at most `max_cells` cells of canvas per batch (256 positions of
+  20×20, 10 of 100×100): six 100×100 workers with batches of 256 had taken 17 GB
+  of the GPU.
+
+### 100×100
+
+The shortcut cycle needs 12.5 million moves on 100×100. The Transformers have
+never seen a board larger than 20×20; on the first 8 validation games, with
+the difference from the shortcut cycle on the same games (95% interval):
+
+| 100×100 | Won | Mean moves | Against the shortcut cycle |
+| --- | ---: | ---: | --- |
+| Transformer (stage B), switch at 30% | 8 of 8 | 5,618,526.5 | −6,898,270 (±107,930), 44.9% of its moves |
+| Transformer (stage B), switch at 40% | 8 of 8 | 5,641,974.9 | −6,874,821 (±104,730), 45.1% |
+| Transformer with the 8-fruit horizon, switch at 40% | 8 of 8 | 5,693,918.6 | −6,822,878 (±57,498), 45.5% |
+| The plan agent's CNN, switch at 30% | 0 of 12 | | 10 timed out, 2 lost, all at 27.5% to 28% fill |
+| A CNN trained as the Transformer of stage B, switch at 40% | 8 of 8 | 5,746,177.6 | −6,770,619 (±103,963), 45.9% |
+| Shortcut cycle | 8 of 8 | 12,516,796.3 | |
+
+The switch at 30% or 40% makes no difference here. The plan agent's CNN does
+not carry over to 100×100: in every game it waits more and more (3% to 6% of its
+moves), its win values rating the waiting moves safer than eating, until the
+fruit timeout ends the game near 28% fill. The Transformers wait for 0.3% of
+their moves. The CNN was trained in pure free play, the Transformers with the
+certified finish in their self-play. A CNN trained with stage B's settings
+from the plan agent's CNN (`runs/c-20`; 100 of 100 games of 20×20 won at 40%,
+10,895.4 moves) wins all 8 too, waiting for 0.4% of its moves: the training
+with the certified finish carried the networks to 100×100, not the attention.
+On these games the Transformer of stage B is 104,203 moves faster than that CNN
+(1.8%, ±155,288: within the noise of 8 games), and the one with the horizon
+52,259 (±104,250).
+
+By band of fill, in moves per fruit:
+
+| Fill | 0–10% | 10–20% | 20–30% | 30–40% | 40–50% | 50–60% | 60–70% | 70–80% | 80–90% | 90–100% |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Transformer, switch at 40% | 192.1 | 451.4 | 666.5 | 949.8 | 917.7 | 801.1 | 658.8 | 526.1 | 347.5 | 131.5 |
+
+Free play costs 192 moves per fruit in the first band, three times the mean
+distance between two cells of the board (67), and 950 by 30–40%. A 100×100
+board is long in snake: at 10% fill the body is already ten board widths long,
+as long as at 50% on 20×20, and free play by short paths lays it across the
+board in walls that later trips must go round. The certified finish costs about
+a sixth of the free cells per fruit (918 at 40–50%), so here too free play
+stops paying at about 40%. The transition completes within a percent of fill
+after the switch in every game. A game takes about 30 minutes of one core of
+the server and 10,000 decisions: 50 to 220 ms each in free play (the network's
+batches share the GPU with seven other games) and 80 to 100 ms certified, most
+of it the shortcut search.
+
+On the first 8 test games, the Transformer with the 8-fruit horizon switching
+at 40% won all 8 in 5,693,532.6 moves on average (5,512,041 to 5,794,212), the
+shortcut cycle 12,540,638.1 on the same games: 6,847,106 fewer (±128,281), 45.4%
+of its moves.
+
+In the certified finish (measured in a game whose free play used a stand-in
+network; the certified finish asks the network nothing) the shortest path by
+the layout's moves averages 102 moves per fruit at 30–36% fill, but the
+certified path the agent takes averages 865: a direct path would cut the free cells in two, which a certified
+body cannot leave behind, so the certified path sweeps one side first. The
+shortcut search finds a certified path below the greedy walk for 24% of the
+fruits (83 moves on average when it does); 100 times its step budget finds no
+more.
+
+```bash
+pip install -e ".[train]"                                         # PyTorch and Numba
+python -m snake_agent train --agent plans --network transformer --blocks 2 --width 128 --layers 6 \
+    --heads 4 --patch 2 --board 10x10:128 --board 8x8:64 --board 6x6:64 --free-share 0 \
+    --midgame-share 0.3 --recovery-share 0.1 --midgame-samples 4 --steps 400 --replay 400000 \
+    --warmup 2 --generations 40 --certify none --workers 16 --out runs/t-small --device cuda    # stage A
+python -m snake_agent train --agent plans --network transformer --blocks 2 --width 128 --layers 6 \
+    --heads 4 --patch 2 --init runs/t-small/model-040.pt --board 20x20:32 --board 14x14:16 \
+    --board 10x10:32 --free-share 0 --midgame-share 0.4 --recovery-share 0.05 --midgame-samples 6 \
+    --sweeps 0.05,0.25,1 --steps 400 --replay 500000 --generations 30 --certify 0.5 --workers 16 \
+    --out runs/t-20 --device cuda                                                               # stage B
+python -m snake_agent train --agent plans --network transformer --blocks 2 --width 128 --layers 6 \
+    --heads 4 --patch 2 --horizon 8 --init runs/t-20/model-030.pt --board 20x20:32 --board 14x14:16 \
+    --board 10x10:32 --free-share 0 --midgame-share 0.4 --recovery-share 0.05 --midgame-samples 6 \
+    --sweeps 0.05,0.25,1 --steps 400 --replay 500000 --generations 20 --certify 0.6 --workers 12 \
+    --out runs/t-h8 --device cuda                                                       # the 8-fruit horizon
+python -m snake_agent assess runs/t-h8/model-020.pt --agents plans --board 20x20 --games 100 \
+    --sources 100 --workers 8                                      # free T1 and T2, the switch at 40%
+python -m snake_agent assess runs/t-h8/model-020.pt --agents plans --board 100x100 --games 8 \
+    --sources 0 --workers 8               # free T1 on 100x100 (about 30 minutes a game), no T2 starts
+```
+
 ## Reproducing the probe
 
 `python -m snake_agent reproduce` (about 20 seconds) replays the probe's
@@ -1521,11 +1820,12 @@ survivable.
 | [`reproduce.py`](reproduce.py) | the probe's reference numbers |
 | [`encoding.py`](encoding.py) | M1: the network inputs, `mirror`, `moves_scale`, `canonical_envelope`; free play: inputs without the cycle, arrival planes |
 | [`search.py`](search.py) | M1: Gumbel root search, `SearchAgent`, `PolicyAgent`, `policy_move`; M2: the relative unit; M3: the win unit and adaptive budgets |
-| [`network.py`](network.py) | M1: `SnakeNet`, `NetworkEvaluator` (M3: bounded batches, `release`), checkpoints; free play: `NetworkConfig.cycle`, `arrival`, `widen` (PyTorch) |
+| [`network.py`](network.py) | M1: `SnakeNet`, `NetworkEvaluator` (M3: bounded batches, `release`; later: one board size at a time, `max_cells`), checkpoints; free play: `NetworkConfig.cycle`, `arrival`, `widen`; the Transformer: `SnakeTransformer`, `NetworkConfig.kind`, `build` (PyTorch) |
 | [`selfplay.py`](selfplay.py) | M1 to M3: batched self-play, the kinds of start, training examples, playout caps |
-| [`train.py`](train.py) | M1 to M3: the training loop over board mixtures, worker balancing; `distill`, `improve_habits`; free play: `TrainConfig.agent` (PyTorch) |
+| [`train.py`](train.py) | M1 to M3: the training loop over board mixtures, worker balancing; `distill`, `improve_habits`; free play: `TrainConfig.agent`, `Replays` (a canvas per board) (PyTorch) |
 | [`assess.py`](assess.py) | M1 and M2: batched assessment against the gates, the shortcut cycle on the same seeds; free play: `assess_free` (PyTorch) |
 | [`habits.py`](habits.py) | `Habit`, `HabitEvaluator`, paired windows (`compare`), `improve`, distillation examples |
-| [`plans.py`](plans.py) | Free play: the plan agent's `candidates`, `waits`, `choose`, `decide`, `PlanAgent`, self-play (`play`); the certified finish (`PlanConfig.certify`, `seeks_certificate`) |
-| [`certify.py`](certify.py) | The plan agent's certified finish: Hamiltonian cycles around spanning trees of 2×2 blocks (`layout`, `spanning`, `walk`), the exact check (`certify`, `certified`), certified paths and shortcuts (`certified_paths`, `shortcuts`, `greedy_walk`), the transition (`transition_paths`) |
+| [`plans.py`](plans.py) | Free play: the plan agent's `candidates`, `waits`, `choose`, `decide`, `PlanAgent`, self-play (`play`, sampled with `max_examples`); the certified finish (`PlanConfig.certify`, `seeks_certificate`) |
+| [`certify.py`](certify.py) | The plan agent's certified finish: Hamiltonian cycles around spanning trees of 2×2 blocks (`layout`, `spanning`, `walk`), the exact check (`certify`, `certified`), certified paths and shortcuts (`certified_paths`, `shortcuts`, `greedy_walk`), the transition (`transition_paths`, with the searched paths that keep the run's gates); the layout's arrays for the kernels (`tables`) |
+| [`fast.py`](fast.py) | Compiled kernels (Numba, optional): the searches over cells (`arrival`, `opening`, `certificate`, `reach`, `move_classes`), the plans' paths (`shortest_paths`, `extend`, afterstates), and the certificate's (`requirements`, `spanning`, `best_tree`, `greedy_walk`, `shortcuts`, `field_arrival`) |
 | [`__main__.py`](__main__.py) | `python -m snake_agent evaluate | solve | reproduce | train | assess | habits` |

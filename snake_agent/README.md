@@ -1521,6 +1521,17 @@ cycle-based finish later.
   38); on 100×100 all 8 test games won in 5,693,532.6 moves, 6,847,106 fewer
   than the shortcut cycle (±128,281, 95%), 45.4% of its moves.
 
+<p align="center"><a href="docs/transformer-100x100.mp4"><img src="docs/transformer-100x100.png" alt="The Transformer plan agent on 100×100 at 55% full, in its certified finish" width="420"></a></p>
+
+**Demo.** [The video](docs/transformer-100x100.mp4) (116 seconds, one frame
+every three fruits) shows the Transformer with the 8-fruit horizon, switching
+at 40%, on the first validation game of 100×100: won in 5,779,772 moves. It was
+played on an Apple GPU, whose float32 values differ in their last bits from the
+server's bfloat16, so the game differs from the assessment's game of the same
+seed (5,760,073 moves). The caption names the phase: free play, which lays the
+body down in compact sweeps joined by straight runs; the transition from 40%
+fill; and the certified finish from 40.8% (move 2,390,758) on. In the still, at
+55% full, the body lies along the walk around a spanning tree of 2×2 blocks.
 
 ### Compiled kernels
 

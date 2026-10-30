@@ -25,7 +25,12 @@ Then the plan agent gets a **Transformer**, plays **100×100**, and plays free
 until 40% of the board is filled instead of 30%: its searches are compiled, and
 the Transformer, trained on boards up to 20×20, clears 100×100 in 45% of the
 shortcut cycle's moves; on the test seeds of 20×20 it wins all 299 games in
-10,978 moves ([below](#a-transformer-100100-and-a-later-switch)).
+10,978 moves ([below](#a-transformer-100100-and-a-later-switch)). It can now
+play **free to 80%** of the board: the transition waits for its certificate,
+free play leaves fewer holes, and the Transformer is retrained for late free
+play. Free play to 80% wins nearly every game but costs more moves than the
+switch at 40%: 40% more on 20×20 and 53% more on 100×100, still 30% fewer
+than the shortcut cycle ([below](#free-play-to-80)).
 
 M0's gate is met: the tests pass, and the harness reproduces the reference
 numbers of the [Architecture B probe](../analysis/architecture_b_probe.py):
@@ -43,6 +48,7 @@ analytic network cost model ([below](#reproducing-the-probe)).
 - [M3: 20×20](#m3-2020)
 - [Free play and a certified finish: the plan agent](#free-play-and-a-certified-finish-the-plan-agent)
 - [A Transformer, 100×100 and a later switch](#a-transformer-100100-and-a-later-switch)
+- [Free play to 80%](#free-play-to-80)
 - [Reproducing the probe](#reproducing-the-probe)
 - [Package layout](#package-layout)
 
@@ -1791,6 +1797,281 @@ python -m snake_agent assess runs/t-h8/model-020.pt --agents plans --board 100x1
     --sources 0 --workers 8               # free T1 on 100x100 (about 30 minutes a game), no T2 starts
 ```
 
+## Free play to 80%
+
+The owner's next target: play free until at least 80% of the board is filled,
+on 100×100, with the Transformer, and only then finish on the certificate.
+
+**Status:**
+
+- **Free play runs to 80%.** From a dense free-play body the old transition
+  rarely completed: switching at 80%, 4 of 100 games of 20×20 were won. The
+  transition now waits for its certificate along a searched path of the
+  cycles' moves ([below](#the-transitions-waiting-path)), and wins 96 of 100
+  games of 20×20, all 12 of 50×50 and all 8 of 100×100.
+- **Faster late free play.** Free play gets paths beside the body and into
+  gaps, and a cost for holes that stay closed
+  ([below](#free-play-that-leaves-fewer-holes)); the Transformer, retrained
+  switching at 80% ([below](#retraining-for-late-free-play)), plays late free
+  play faster. Together they save 12% of the moves on 20×20 and 7% on 50×50.
+  The waiting path and the options are now the defaults; the switch stays at
+  40%, and `--certify 0.8` plays free to 80%.
+- **The cost.** Beyond 50% fill free play still costs more per fruit than the
+  certified finish, two to three times as much from 60% to 80%. Free play to
+  80% takes 40% more moves than switching at 40% on 20×20 (to 50%: 1.5% more;
+  to 70%: 19%), 48% more on 50×50 and 53% more on 100×100, where it uses 70%
+  of the shortcut cycle's moves (switching at 40%: 45%).
+- **Test seeds**, 100×100: all 8 games won in 8,672,857.1 moves on average,
+  2,979,325 more than switching at 40% on the same games (52.3%) and 3,867,781
+  fewer than the shortcut cycle (69.2% of its moves).
+
+### What stopped free play at 80%
+
+Switching at 80% (`--certify 0.8`) with the Transformer of the 8-fruit
+horizon (`runs/t-h8`) failed in two ways, shown here on 100 validation games of
+20×20:
+
+- **The transition did not complete.** 4 of 100 games were won. From a
+  free-play body at 80% fill, a path to the fruit that lengthens the
+  certifiable run rarely exists (in one traced game, at 27 of 1,479 decisions),
+  and each free plan or waiting move in between starts the run again. All 96
+  lost games died without ever certifying the body, 93 of them at 93% to 100%
+  fill.
+- **Late free play is slow.** From 50% fill on, free play costs one and a
+  half to three and a half times as many moves per fruit as the certified
+  finish ([below](#retraining-for-late-free-play)), and the boards show why:
+  the body walls off large free regions behind segments of middle age. In one
+  game at 70% fill more than half of the free cells lay behind such walls,
+  opening after 120 to 150 moves, and 28% of the last 40 fruits took more than
+  100 moves to reach.
+
+### The transition's waiting path
+
+The transition may now wait for its certificate instead of eating
+(`PlanConfig.stall`, `--stall`). A search (`certify.stall`, the kernel
+`fast.stall_run`) looks for a path of the layout's moves from the head, through
+free cells and body cells vacated in time and never onto the fruit, whose own
+gates and those of the body's certifiable run some spanning tree can hold,
+`L - run` moves long, `run` being the length of that run. Without eating, such
+a path replaces the rest of the body, which is then certified. The search is
+depth first and tries first the move with more moves after it; a depth-first
+search backtracks only from the dead ends below its first choices, so the
+agent runs 32 searches of 10,000 steps that break their ties at random and
+keeps the longest path (`stall_tries`, `stall_budget`). When it finds a full
+path and the fruit timeout leaves more than a board's worth of moves after it,
+the agent follows it without eating, a certain decision like those of the
+certified finish, with no network call; the fruit is then among the free cells
+ahead on the walk. Otherwise, if no path to the fruit lengthens the run, it
+follows the longest of the first half, quarter, eighth and so on of the longest
+path found after which the snake keeps a survival certificate, and searches
+again; and the waiting moves that the transition compares with its paths to
+the fruit are only those that lengthen the run.
+
+On 20×20 one search takes about a millisecond, and from 80% it finds a full
+path at the first decision of most games: 307 moves in the traced game, whose
+old transition never completed. On 50×50 at 80% fill, where a full path needs
+about 2,000 moves, one search of 50,000 steps found 158 to 947 and a hundred
+times the steps no more, while 32 or 64 restarted searches found up to 1,301.
+The searches decide the run's gates once for all their restarts, and a gate
+kept out now asks whether its two blocks still reach each other, a search that
+stops when it gets there, instead of whether all the blocks stay connected: the
+same answers (the blocks were connected before), and 32 restarted searches on
+that board take 0.018 seconds instead of 0.133. The certified finish's
+shortcuts use the same gate checks.
+
+| Switch at 80%, 20×20, 100 games | Won | Mean moves of the games won | Body certified from |
+| --- | ---: | ---: | ---: |
+| The old transition | 4 | 20,152.8 | |
+| Waiting moves that lengthen the run, one at a time | 43 | 19,802.2 | |
+| The waiting path | 94 | 17,217.6 (17,014.8–17,420.4) | 80.8% |
+
+Switching at 40% it changes nothing: 10,990.6 moves against 10,965.3, all 100
+games won, the body certified at 40.1% fill instead of 40.7%. Following part of
+a path needs the survival certificate at its end: a version that followed half
+of the longest path whatever its length walked the head into corners, and won
+41 of 100 games switching at 80%.
+
+### Free play that leaves fewer holes
+
+Three options change free play itself:
+
+- **Holes that stay closed** (`persistence`). The next trip counts each free
+  cell's opening time once, but a hole beside young segments stays closed for
+  many fruits. The option adds to the next trip the waits of the fruits after
+  it: for each free cell, `sum over j >= 1 of (o - j u)` while positive, `o`
+  the cell's opening time and `u` the typical next trip (the median over the
+  plans), averaged over the free cells and weighted by `persistence`
+  (`fast.persistence`).
+- **Paths beside the body** (`hugs`). The shortest path with the most sides of
+  its cells blocked by the body or the board's edge while the head is there, a
+  dynamic program over the shortest paths (`fast.hugging_path`).
+- **Gaps** (`gaps`). Shortest paths lengthened into the strips one cell wide
+  beside them: a step `u -> v` becomes `u -> u' -> v' -> v` when the cells
+  beyond `u'` and `v'` are blocked, so that the strip between the path and the
+  obstacle does not stay as a hole (`fast.fill_gaps`).
+
+Switching at 80% with the waiting path, the same network, 100 games of 20×20
+(measured with the first version of the waiting path, one search of 50,000
+steps; with the final version no options win 94 games in 17,217.6 moves and the
+three together 99 in 16,218.3):
+
+| Options | Won | Mean moves of the games won |
+| --- | ---: | ---: |
+| None | 95 | 17,339.7 |
+| `persistence` 1 | 97 | 17,256.7 |
+| `persistence` 3 | 96 | 16,973.6 |
+| `persistence` 10 | 98 | 17,479.5 |
+| `hugs` 2, `persistence` 3 | 98 | 16,672.1 |
+| `gaps` 4 | 96 | 16,890.9 |
+| `gaps` 16 | 97 | 16,562.6 |
+| **`gaps` 16, `hugs` 2, `persistence` 3** | 97 | **16,318.2** (16,082.4–16,554.0) |
+| The same with tolerance 0.05 | 95 | 15,967.3 |
+
+Each option alone saves 2% to 5%, and together 6%. They lay the body down more
+tidily, which shows most in the shortest path to each fruit (28.6 moves at
+40–50% fill, against 37.1 without them), but the plans that keep it tidy are
+longer, so the moves per fruit fall less (45.1 against 50.8). Switching at 40%
+they save 1.6% (10,789.3 moves). Two things were tried and dropped: playing the
+next four fruits after each of the four fastest plans, on the same fruits for
+each, to choose among them (16,507.9 moves, against 16,318.2 without), and the
+network's moves values, which change nothing here: ignoring them (`moves_trust`
+1) gives 17,241.4 moves against 17,339.7. Free play's pace comes from the exact
+lengths of the plans and of the next trip, not from the moves head.
+
+### Retraining for late free play
+
+The network had been trained switching at 60%. At 70–80% fill in free play it
+rated the best plans near 0.5, as the old transition would have lost those
+games, while with the waiting path nearly all of them are won. Retrained by
+the plan agent's self-play switching at 80%, with the waiting path and the
+options (`runs/t-f80b`: 20 generations from `runs/t-h8/model-020.pt`, on
+20×20 and 14×14), it plays late free play much faster. Switching at 80%, 100
+games of 20×20, moves per fruit by band of fill:
+
+| Fill | 40–50% | 50–60% | 60–70% | 70–80% | Won | Mean moves of the games won |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Free play, the old network, no options | 49.7 | 61.1 | 79.3 | 101.0 | 94 | 17,217.6 |
+| Free play, the old network, the options | 45.2 | 56.1 | 72.9 | 96.9 | 99 | 16,218.3 |
+| Free play, the retrained network, no options | 51.0 | 60.8 | 70.6 | 81.7 | 98 | 16,290.6 |
+| **Free play, the retrained network, the options** | 46.4 | 55.5 | 65.5 | 78.5 | 96 | **15,210.0** (15,025.0–15,395.0) |
+| The certified finish (switching at 40%, the same network) | 47.7 | 40.6 | 35.2 | 28.3 | 100 | 10,871.9 |
+
+Retraining saves 5% to 6%, and the options 7% more: 12% in all. With the
+retrained network the hole cost and the win head's filter no longer matter.
+With the first version of the waiting path, where the settings of the table
+play 15,174.4 moves, it plays 15,213.9 without `persistence` and 15,117.2 with a
+tolerance of 1, every plan acceptable whatever its win value. The sweeping
+plans still matter: without them it plays 16,418.6. The extra length of its
+plans comes from the guard and the next trip: at 70–80% fill its plans are 75.8
+moves long where the shortest path is 50.6.
+
+The first attempt also trained on 10×10, and lost more and more 10×10 games in
+self-play (26 of 30 won, then 16 of 17, then 7 of 17, five of them by the fruit
+timeout): switching at 80% leaves 20 free cells on 10×10, the losses taught the
+win head to wait, and waiting lost more games. The run used for the results
+dropped 10×10. Twenty more generations (`runs/t-f80c`) did not help (99 of 100
+games of 20×20 won in 15,359.4 moves, against 98 in 15,040.8, in the training
+runs' own assessments).
+
+### Where to switch, again
+
+With the retrained network and the options, 100 games of 20×20:
+
+| Switch at | 40% | 50% | 60% | 70% | 80% | 90% |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Won | 100 | 100 | 100 | 100 | 96 | 47 |
+| Mean moves of the games won | 10,871.9 | 11,033.2 | 11,625.5 | 12,968.8 | 15,210.0 | 20,097.0 |
+| Against the switch at 40% | | +1.5% | +6.9% | +19.3% | +39.9% | +84.9% |
+
+Free play now runs to 50% at almost no cost, and to 70% for a fifth more moves;
+the band from 70% to 80% costs as much again, since free play there takes 79
+moves per fruit where the certified finish takes 28. From 90% the transition
+fails half the time: all 53 lost games died without a certified body.
+
+The assessment of the plan agent (`assess --agents plans --certify 0.8`, the
+other settings now the defaults) on the 100 T1 games of 20×20 and the T2 starts
+of 100 source games, validation seeds:
+
+| 20×20, switch at 80% | Won | Mean moves of the games won (95% interval) | Against the shortcut cycle, same games | T2 won by band | T2 gate |
+| --- | ---: | ---: | ---: | --- | --- |
+| The retrained network | 99 | 15,425.4 (15,219.0–15,631.8) | −5,460.9 (−5,714.6 to −5,207.1) | 61 of 62, 16 of 16, 6 of 6 | passed |
+| The old network (`runs/t-h8/model-020.pt`) switching at 40%, the same seeds | 100 | 10,882.4 (10,764.9–10,999.9) | −9,983.9 | 62, 16, 5 | passed |
+
+### 50×50
+
+Between 20×20 and 100×100, on the first 12 validation games:
+
+| 50×50, 12 games | Won | Mean moves (95% interval) | Against the switch at 40%, same network | Against the shortcut cycle |
+| --- | ---: | ---: | ---: | ---: |
+| Switch at 40%, the old network | 12 | 376,985.7 (370,921.5–383,049.9) | | 48.0% |
+| Switch at 40%, the retrained network, the options | 12 | 375,950.0 (369,486.6–382,413.4) | | 47.9% |
+| Switch at 80%, the old network, the waiting path only | 12 | 596,371.8 | +58.2% | 76.0% |
+| Switch at 80%, the old network, the options | 12 | 573,285.7 | +52.1% | 73.0% |
+| **Switch at 80%, the retrained network, the options** | 12 | **557,094.4** (545,677.0–568,511.8) | **+48.2%** | **71.0%** |
+| The shortcut cycle | 12 | 785,062.3 | | |
+
+The rows of the old network switching at 80% used the first version of the
+waiting path. Retraining helps less here than on 20×20 (3% against 6%). By
+band of fill, the retrained network's free play costs 296, 356, 419 and 463
+moves per fruit from 40% to 80%, where its certified finish costs 257 (with the
+transition), 228, 189 and 154: two to three times as much late in free play,
+as on 20×20.
+
+### 100×100
+
+The retrained network with the options, switching at 80%, on the first 8
+validation games, against the Transformer with the 8-fruit horizon switching at
+40% ([above](#100100)) and the shortcut cycle on the same games:
+
+| 100×100, 8 validation games | Won | Mean moves | Against the switch at 40%, same games (95% interval) | Against the shortcut cycle, same games |
+| --- | ---: | ---: | ---: | ---: |
+| **Free play to 80%** | 8 | **8,735,547.0** (8,508,992 to 8,985,263) | **+3,041,628** (±196,013), +53.4% | −3,781,249 (±218,206), 69.8% of its moves |
+| Switch at 40%, the old network | 8 | 5,693,918.6 | | −6,822,878 (±57,498), 45.5% |
+| Shortcut cycle | 8 | 12,516,796.3 | | |
+
+Every body was certified at 80.0% to 80.2% fill. By band of fill, in moves per
+fruit:
+
+| Fill | 0–10% | 10–20% | 20–30% | 30–40% | 40–50% | 50–60% | 60–70% | 70–80% | 80–90% | 90–100% |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Free play to 80% | 193.9 | 455.4 | 653.2 | 926.0 | 1,184.6 | 1,422.9 | 1,623.4 | 1,784.1 | 358.6 | 134.0 |
+| Switch at 40% | 209.5 | 479.4 | 666.3 | 974.3 | 883.3 | 792.5 | 676.5 | 539.1 | 346.1 | 127.5 |
+
+Below 40% the retrained network with the options plays free 2% to 7% faster
+than the old network. From 40% to 80% free play costs 1.3, 1.8, 2.4 and 3.3
+times as many moves per fruit as the certified finish: 3.1 million moves more
+over those four bands, of which the faster early free play wins back 0.1
+million. The transition costs little: the band from 80% to 90%, which holds
+it, takes 12,500 moves more than in the games that switched at 40%.
+
+A game took 1.6 to 2.1 hours of one core of the server, with 16 games sharing
+its 15 cores and the GPU, four to six minutes of it from 80% to the end. Late
+in free play a decision takes 30 to 50 ms, but a fruit costs 1,200 to 1,800
+moves, and for 2% to 3% of its moves the agent waits, one decision per move.
+
+On the first 8 test games, run once with the same settings, every game was
+won and every body certified at 80.0% to 80.2% fill:
+
+| 100×100, 8 test games | Won | Mean moves | Against the switch at 40%, same games (95% interval) | Against the shortcut cycle, same games |
+| --- | ---: | ---: | ---: | ---: |
+| **Free play to 80%** | 8 | **8,672,857.1** (8,424,163 to 8,780,944) | **+2,979,325** (±115,666), +52.3% | −3,867,781 (±144,138), 69.2% of its moves |
+| Switch at 40%, the old network | 8 | 5,693,532.6 | | −6,847,106 (±128,281), 45.4% |
+| Shortcut cycle | 8 | 12,540,638.1 | | |
+
+```bash
+python -m snake_agent train --agent plans --network transformer --blocks 2 --width 128 --layers 6 \
+    --heads 4 --patch 2 --horizon 8 --init runs/t-h8/model-020.pt --board 20x20:40 --board 14x14:16 \
+    --free-share 0 --midgame-share 0.4 --recovery-share 0.05 --midgame-samples 6 --sweeps 0.05,0.25,1 \
+    --steps 400 --replay 500000 --generations 20 --certify 0.8 --workers 10 --out runs/t-f80b \
+    --device cuda                    # retraining for free play to 80% (the waiting path and options are defaults)
+python -m snake_agent assess runs/t-f80b/model-020.pt --agents plans --board 20x20 --games 100 \
+    --sources 100 --certify 0.8 --workers 4                           # free T1 and T2 with free play to 80%
+python -m snake_agent assess runs/t-f80b/model-020.pt --agents plans --board 100x100 --games 8 \
+    --sources 0 --certify 0.8 --workers 8                     # 100x100, free play to 80% (about 2 hours a game)
+python -m snake_agent assess runs/t-h8/model-020.pt --agents plans --board 20x20 --games 100 \
+    --sources 100 --hugs 0 --gaps 0 --persistence 0 --no-stall     # the agent before these options, at 40%
+```
+
 ## Reproducing the probe
 
 `python -m snake_agent reproduce` (about 20 seconds) replays the probe's
@@ -1836,7 +2117,7 @@ survivable.
 | [`train.py`](train.py) | M1 to M3: the training loop over board mixtures, worker balancing; `distill`, `improve_habits`; free play: `TrainConfig.agent`, `Replays` (a canvas per board) (PyTorch) |
 | [`assess.py`](assess.py) | M1 and M2: batched assessment against the gates, the shortcut cycle on the same seeds; free play: `assess_free` (PyTorch) |
 | [`habits.py`](habits.py) | `Habit`, `HabitEvaluator`, paired windows (`compare`), `improve`, distillation examples |
-| [`plans.py`](plans.py) | Free play: the plan agent's `candidates`, `waits`, `choose`, `decide`, `PlanAgent`, self-play (`play`, sampled with `max_examples`); the certified finish (`PlanConfig.certify`, `seeks_certificate`) |
-| [`certify.py`](certify.py) | The plan agent's certified finish: Hamiltonian cycles around spanning trees of 2×2 blocks (`layout`, `spanning`, `walk`), the exact check (`certify`, `certified`), certified paths and shortcuts (`certified_paths`, `shortcuts`, `greedy_walk`), the transition (`transition_paths`, with the searched paths that keep the run's gates); the layout's arrays for the kernels (`tables`) |
-| [`fast.py`](fast.py) | Compiled kernels (Numba, optional): the searches over cells (`arrival`, `opening`, `certificate`, `reach`, `move_classes`), the plans' paths (`shortest_paths`, `extend`, afterstates), and the certificate's (`requirements`, `spanning`, `best_tree`, `greedy_walk`, `shortcuts`, `field_arrival`) |
+| [`plans.py`](plans.py) | Free play: the plan agent's `candidates`, `waits`, `choose`, `decide`, `PlanAgent`, self-play (`play`, sampled with `max_examples`); the certified finish (`PlanConfig.certify`, `seeks_certificate`); free play to 80%: paths beside the body and into gaps, the cost of holes that stay closed, the transition's waiting path (`PlanConfig.hugs`, `gaps`, `persistence`, `stall`; `waited`, `Plan.eats`) |
+| [`certify.py`](certify.py) | The plan agent's certified finish: Hamiltonian cycles around spanning trees of 2×2 blocks (`layout`, `spanning`, `walk`), the exact check (`certify`, `certified`), certified paths and shortcuts (`certified_paths`, `shortcuts`, `greedy_walk`), the transition (`transition_paths`, with the searched paths that keep the run's gates; `recent_run`, `extends`, and the waiting path `stall`); the layout's arrays for the kernels (`tables`) |
+| [`fast.py`](fast.py) | Compiled kernels (Numba, optional): the searches over cells (`arrival`, `opening`, `certificate`, `reach`, `move_classes`), the plans' paths (`shortest_paths`, `hugging_path`, `extend`, `fill_gaps`, afterstates, `persistence`), and the certificate's (`requirements`, `spanning`, `best_tree`, `greedy_walk`, `shortcuts`, `field_arrival`, `stall_run`) |
 | [`__main__.py`](__main__.py) | `python -m snake_agent evaluate | solve | reproduce | train | assess | habits` |

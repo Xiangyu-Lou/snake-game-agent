@@ -26,6 +26,12 @@ from fruit to fruit: a path to the fruit is as safe as the walk when its
 afterstate is certified too, and :func:`shortcuts` searches such paths,
 shortest first.
 
+A body laid down by free play is certified only up to a run of its most recent
+moves (:func:`recent_run`). The transition lengthens that run by paths to the
+fruit (:func:`transition_paths`), or, from a dense board, waits for the
+certificate (:func:`stall`): a path of the layout's moves that replaces the rest
+of the body without eating, through cells as they are vacated.
+
 The searches run in the compiled kernels of :mod:`snake_agent.fast`, over the
 layout's tables (:func:`tables`); the functions here take and return plain
 lists.
@@ -494,6 +500,61 @@ def certified_paths(
     return paths + [found[i, : lengths[i]].tolist() for i in range(n)]
 
 
+def recent_run(state: GameState) -> tuple[Layout, int]:
+    """The layout whose moves the body's most recent moves followed, and how many cells at the head end of
+    the body they hold without two of them disagreeing about a gate (the longer run of the two
+    orientations); the board's sides must be even."""
+    body = fast.flat(state)
+    runs = []
+    for orientation in (0, 1):
+        t = tables(layout(state.width, state.height, orientation))
+        runs.append(int(fast.consistent(t.gate, t.cross, t.side, body, len(t.ends))))
+    return layout(state.width, state.height, int(runs[1] > runs[0])), max(runs)
+
+
+def extends(lay: Layout, run: int, state: GameState) -> bool:
+    """Whether the body of ``state`` holds a longer run of ``lay``'s moves than ``run`` and some spanning
+    tree holds that run."""
+    t = tables(lay)
+    body = fast.flat(state)
+    longer = int(fast.consistent(t.gate, t.cross, t.side, body, len(t.ends)))
+    return longer > run and bool(fast.certified(t.gate, t.cross, t.side, t.ends, t.blocks, body[:longer]))
+
+
+def stall(
+    state: GameState, rng: random.Random, budget: int = 20_000, tries: int = 1
+) -> tuple[list[int], int]:
+    """A way to finish the transition without eating: ``(path, goal)``, the longest path found of the
+    layout's moves from the head that lengthens the body's certifiable run (:func:`recent_run`), through
+    free cells and body cells vacated in time and never onto the fruit, and the ``goal`` of moves after
+    which such a path has replaced the rest of the body, certifying it.
+
+    Each of ``tries`` searches (:func:`~snake_agent.fast.stall_run`, at most ``budget`` steps) breaks its
+    ties at random: a depth-first search backtracks only from the dead ends below its first choices, so
+    searches that start differently find longer paths than one search with all the steps."""
+    lay, run = recent_run(state)
+    t = tables(lay)
+    width = state.width
+    goal = state.length - run
+    path = fast.stall_run(
+        t.gate,
+        t.cross,
+        t.side,
+        t.ends,
+        t.bnbr,
+        t.bedge,
+        t.blocks,
+        fast.flat(state),
+        run,
+        state.fruit[1] * width + state.fruit[0] if state.fruit is not None else -1,
+        goal,
+        budget,
+        tries,
+        _generator(rng),
+    )
+    return path.tolist(), goal
+
+
 def transition_paths(
     state: GameState,
     rng: random.Random,
@@ -515,13 +576,9 @@ def transition_paths(
     if state.width % 2 or state.height % 2:
         return [], []
     body = fast.flat(state)
-    runs = []  # the run of recent moves that each orientation's gates can hold
-    for orientation in (0, 1):
-        t = tables(layout(state.width, state.height, orientation))
-        runs.append(int(fast.consistent(t.gate, t.cross, t.side, body, len(t.ends))))
-    lay = layout(state.width, state.height, int(runs[1] > runs[0]))
+    lay, run = recent_run(state)  # the run of recent moves that the layout's gates can hold
     t = tables(lay)
-    _, need = fast.requirements(t.gate, t.cross, t.side, body[: max(runs)], len(lay.ends))
+    _, need = fast.requirements(t.gate, t.cross, t.side, body[:run], len(lay.ends))
     width = state.width
     fruit = state.fruit[1] * width + state.fruit[0]
     head = int(body[0])
@@ -553,7 +610,7 @@ def transition_paths(
                 2 * int(arrival[fruit]) + 2,
                 searched,
                 budget,
-                max(runs),
+                run,
                 True,
                 generator,
             )

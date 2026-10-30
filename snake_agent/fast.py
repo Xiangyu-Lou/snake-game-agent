@@ -202,6 +202,22 @@ def free_mean(times, release):
 
 
 @kernel
+def persistence(times, release, unit):
+    """The mean over the free cells of the waits that the fruits after the next would spend on them, if
+    the fruits came every ``unit`` moves and each cell opened at ``times``: ``sum over j >= 1 of
+    (times - j * unit)`` while positive, the wait of a fruit that appears there ``j`` fruits later."""
+    total, count = 0.0, 0
+    for c in range(times.shape[0]):
+        if release[c] == 0:
+            count += 1
+            x = float(times[c])
+            if x > unit:
+                j = np.ceil(x / unit) - 1.0
+                total += j * x - unit * j * (j + 1.0) / 2.0
+    return total / count if count else 0.0
+
+
+@kernel
 def certificate(release, nbr, head, heading):
     """:meth:`~snake_agent.survival.Board.has_survival_certificate`: whether a shortest path through free
     cells brings the head next to a segment that has moved away by the time it arrives."""
@@ -374,6 +390,57 @@ def shortest_paths(arrival, nbr, goal, count, state):
 
 
 @kernel
+def hugging_path(arrival, release, nbr, goal, state):
+    """A shortest path from the head to ``goal`` by ``arrival`` that runs beside the body and the board's
+    edge as much as it can: the most sides of its cells blocked while the head is there (by the board's
+    edge, or by a body cell not yet vacated), ties broken at random."""
+    cells = arrival.shape[0]
+    n = arrival[goal]
+    order = np.argsort(arrival)
+    best = np.full(cells, -1, np.int64)
+    for i in range(cells):
+        cell = order[i]
+        t = arrival[cell]
+        if t < 0:
+            continue
+        if t > n:
+            break
+        if t == 0:
+            best[cell] = 0
+            continue
+        top = -1
+        for d in range(4):
+            c = nbr[cell, d]
+            if c >= 0 and arrival[c] == t - 1 and best[c] > top:
+                top = best[c]
+        if top < 0:
+            continue
+        contact = 0
+        for d in range(4):
+            c = nbr[cell, d]
+            if c < 0 or release[c] > t:
+                contact += 1
+        best[cell] = top + contact
+    path = np.empty(n, np.int64)
+    options = np.empty(4, np.int64)
+    cell = goal
+    path[n - 1] = goal
+    for i in range(n - 2, -1, -1):
+        t = arrival[cell] - 1
+        top, m = -1, 0
+        for d in range(4):
+            c = nbr[cell, d]
+            if c >= 0 and arrival[c] == t and best[c] >= top:
+                if best[c] > top:
+                    top, m = best[c], 0
+                options[m] = c
+                m += 1
+        cell = options[0] if m == 1 else options[below(state, m)]
+        path[i] = cell
+    return path
+
+
+@kernel
 def extend(path, release, nbr, width, head, heading, fruit, extra, state):
     """:func:`~snake_agent.plans.extend`: ``path`` lengthened by up to ``extra`` cells of detours through
     free cells, two at a time: a step ``u -> v`` becomes ``u -> u' -> v' -> v``."""
@@ -412,6 +479,59 @@ def extend(path, release, nbr, width, head, heading, fruit, extra, state):
                     and release[a] == 0
                     and release[b] == 0
                 ):
+                    following[u] = a
+                    following[a] = b
+                    following[b] = v
+                    on[a] = True
+                    on[b] = True
+                    added += 2
+                    changed = True
+                    break
+            u = following[u]
+    out = np.empty(path.shape[0] + added, np.int64)
+    u, i = head, 0
+    while following[u] >= 0:
+        u = following[u]
+        out[i] = u
+        i += 1
+    return out
+
+
+@kernel
+def fill_gaps(path, release, nbr, width, head, heading, fruit, state):
+    """``path`` with detours into the gaps beside it: a step ``u -> v`` becomes ``u -> u' -> v' -> v`` when
+    ``u'`` and ``v'`` are free cells beside the step whose own next cells on that side are blocked (the
+    board's edge, the body or the path), the free cells of a strip one cell wide between the path and an
+    obstacle, which would otherwise be left as a hole."""
+    cells = release.shape[0]
+    following = np.full(cells, -1, np.int64)
+    on = np.zeros(cells, np.bool_)
+    on[head] = True
+    previous = head
+    for c in path:
+        following[previous] = c
+        previous = c
+        on[c] = True
+    reverse = (heading + 2) % 4
+    added, changed = 0, True
+    while changed:
+        changed = False
+        u = head
+        while following[u] >= 0:
+            v = following[u]
+            d = direction(width, u, v)
+            first, second = (d + 1) % 4, (d + 3) % 4
+            if _next(state) & 1:
+                first, second = second, first
+            for k in range(2):
+                side = first if k == 0 else second
+                if u == head and side == reverse:
+                    continue
+                a, b = nbr[u, side], nbr[v, side]
+                if a < 0 or b < 0 or on[a] or on[b] or a == fruit or b == fruit or release[a] or release[b]:
+                    continue
+                aa, bb = nbr[a, side], nbr[b, side]
+                if (aa < 0 or on[aa] or release[aa] > 0) and (bb < 0 or on[bb] or release[bb] > 0):
                     following[u] = a
                     following[a] = b
                     following[b] = v
@@ -785,23 +905,28 @@ def _find(parent, a):
 
 
 @kernel
-def _connected(bnbr, bedge, outside, blocks, seen, queue):
-    """Whether the blocks stay connected over the edges no decision keeps out."""
-    seen[:] = False
-    seen[0] = True
-    queue[0] = 0
-    size, reached = 1, 1
-    while size:
-        size -= 1
-        a = queue[size]
+def _reaches(bnbr, bedge, outside, a, b, seen, queue):
+    """Whether block ``b`` can be reached from block ``a`` over the edges no decision keeps out: a search
+    from ``a`` that stops at ``b``, leaving ``seen`` all False as it found it."""
+    seen[a] = True
+    queue[0] = a
+    head_, tail_ = 0, 1
+    found = False
+    while head_ < tail_ and not found:
+        x = queue[head_]
+        head_ += 1
         for k in range(4):
-            b, e = bnbr[a, k], bedge[a, k]
-            if b >= 0 and not seen[b] and not outside[e]:
-                seen[b] = True
-                reached += 1
-                queue[size] = b
-                size += 1
-    return reached == blocks
+            y, f = bnbr[x, k], bedge[x, k]
+            if y >= 0 and not seen[y] and not outside[f]:
+                if y == b:
+                    found = True
+                    break
+                seen[y] = True
+                queue[tail_] = y
+                tail_ += 1
+    for i in range(tail_):
+        seen[queue[i]] = False
+    return found
 
 
 @kernel
@@ -826,10 +951,12 @@ def _decide(e, want, inside, outside, parent, size, ends, bnbr, bedge, blocks, s
     if inside[e]:
         return False, -1
     outside[e] += 1
+    # The blocks were connected over the edges not kept out, so they stay connected without this one
+    # exactly when its two blocks still reach each other.
     if (
         outside[e] == 1
         and _find(parent, ends[e, 0]) != _find(parent, ends[e, 1])
-        and not _connected(bnbr, bedge, outside, blocks, seen, queue)
+        and not _reaches(bnbr, bedge, outside, ends[e, 0], ends[e, 1], seen, queue)
     ):
         outside[e] -= 1
         return False, -1
@@ -846,6 +973,136 @@ def _undo(e, want, root, inside, outside, parent, size):
             size[b] -= size[root]
     else:
         outside[e] -= 1
+
+
+@kernel
+def stall_run(gate, cross, side, ends, bnbr, bedge, blocks, body, run, fruit, goal, budget, tries, state):
+    """The longest path found, up to ``goal`` moves, of the layout's moves from the head through free cells
+    and body cells vacated in time, never onto the fruit, whose own gates and those of the body's first
+    ``run`` cells some spanning tree can hold. ``tries`` depth-first searches of at most ``budget`` steps
+    each, trying first the move with more moves after it and breaking ties at random, start from the gates
+    of the run, decided once. Without eating, ``length - run`` such moves replace the rest of the body,
+    which is then certified."""
+    cells = gate.shape[0]
+    edges = ends.shape[0]
+    length = body.shape[0]
+    release = np.zeros(cells, np.int64)
+    for k in range(length):
+        release[body[k]] = length - k
+    kept_inside = np.zeros(edges, np.int64)
+    kept_outside = np.zeros(edges, np.int64)
+    kept_parent = np.arange(blocks)
+    kept_size = np.ones(blocks, np.int64)
+    seen = np.zeros(blocks, np.bool_)
+    block_queue = np.empty(blocks, np.int64)
+    for k in range(1, min(run, length)):
+        cell = body[k]
+        e = gate[cell]
+        if e >= 0:
+            ok, _ = _decide(
+                e,
+                body[k - 1] == cross[cell],
+                kept_inside,
+                kept_outside,
+                kept_parent,
+                kept_size,
+                ends,
+                bnbr,
+                bedge,
+                blocks,
+                seen,
+                block_queue,
+            )
+            if not ok:
+                return np.empty(0, np.int64)
+    goal = min(goal, cells)
+    on = np.zeros(cells, np.bool_)
+    path = np.empty(goal + 1, np.int64)
+    best = np.empty(goal + 1, np.int64)
+    found = 0
+    frame_cell = np.empty(goal + 1, np.int64)
+    options = np.empty((goal + 1, 2), np.int64)
+    wants = np.empty((goal + 1, 2), np.bool_)
+    choices = np.zeros(goal + 1, np.int64)
+    current = np.zeros(goal + 1, np.int64)
+    frame_e = np.empty(goal + 1, np.int64)
+    frame_want = np.empty(goal + 1, np.bool_)
+    frame_root = np.empty(goal + 1, np.int64)
+    keys = np.empty(2)
+    for _ in range(max(tries, 1)):
+        inside, outside = kept_inside.copy(), kept_outside.copy()
+        parent, size = kept_parent.copy(), kept_size.copy()
+        on[:] = False
+        on[body[0]] = True
+        steps, depth = 0, 0
+        frame_cell[0] = body[0]
+        expand = True
+        while depth >= 0:
+            if expand:  # the options from the frame's cell, after ``depth`` moves
+                expand = False
+                if depth > found:
+                    found = depth
+                    best[:depth] = path[:depth]
+                if depth >= goal:
+                    break
+                cell, t = frame_cell[depth], depth
+                n = 0
+                for k in range(2):
+                    nxt = cross[cell] if k == 0 else side[cell]
+                    if nxt < 0 or on[nxt] or nxt == fruit or release[nxt] > t + 1:
+                        continue
+                    onward = 0
+                    for j in range(2):
+                        after = cross[nxt] if j == 0 else side[nxt]
+                        if after >= 0 and not on[after] and after != fruit and release[after] <= t + 2:
+                            onward += 1
+                    options[depth, n] = nxt
+                    wants[depth, n] = k == 0
+                    keys[n] = -onward + uniform(state)
+                    n += 1
+                if n == 2 and keys[1] < keys[0]:
+                    options[depth, 0], options[depth, 1] = options[depth, 1], options[depth, 0]
+                    wants[depth, 0], wants[depth, 1] = wants[depth, 1], wants[depth, 0]
+                choices[depth] = n
+                current[depth] = 0
+            if current[depth] >= choices[depth] or steps >= budget:
+                depth -= 1  # back to the frame before: undo the move it was exploring
+                if depth >= 0:
+                    on[options[depth, current[depth]]] = False
+                    if frame_e[depth] >= 0:
+                        _undo(
+                            frame_e[depth],
+                            frame_want[depth],
+                            frame_root[depth],
+                            inside,
+                            outside,
+                            parent,
+                            size,
+                        )
+                    current[depth] += 1
+                continue
+            cell = frame_cell[depth]
+            nxt = options[depth, current[depth]]
+            want = wants[depth, current[depth]]
+            steps += 1
+            e = gate[cell]
+            root = -1
+            if e >= 0:
+                ok, root = _decide(
+                    e, want, inside, outside, parent, size, ends, bnbr, bedge, blocks, seen, block_queue
+                )
+                if not ok:
+                    current[depth] += 1
+                    continue
+            frame_e[depth], frame_want[depth], frame_root[depth] = e, want, root
+            path[depth] = nxt
+            on[nxt] = True
+            depth += 1
+            frame_cell[depth] = nxt
+            expand = True
+        if found >= goal:
+            break
+    return best[:found].copy()
 
 
 @kernel

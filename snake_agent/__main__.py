@@ -174,14 +174,20 @@ def plan_config(args: argparse.Namespace, explore: float = 0.0):
 
     return PlanConfig(
         paths=args.paths,
+        hugs=args.hugs,
+        gaps=args.gaps,
         waits=args.waits,
         sweeps=args.sweeps,
         tolerance=args.tolerance,
         moves_trust=args.moves_trust,
         explore=explore,
+        persistence=args.persistence,
         certify=args.certify,
         trees=args.trees,
         shortcut_budget=args.shortcut_budget,
+        stall=args.stall,
+        stall_budget=args.stall_budget,
+        stall_tries=args.stall_tries,
     )
 
 
@@ -580,6 +586,18 @@ def build_parser() -> argparse.ArgumentParser:
 def _plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--paths", type=int, default=16, help="plans: shortest paths drawn per decision")
     parser.add_argument(
+        "--hugs",
+        type=int,
+        default=2,
+        help="plans: shortest paths beside the body and the edge per decision (default: 2)",
+    )
+    parser.add_argument(
+        "--gaps",
+        type=int,
+        default=16,
+        help="plans: shortest paths lengthened into the gaps beside them (default: 16)",
+    )
+    parser.add_argument(
         "--waits",
         type=waits,
         default=(2, 4, 8, 16, 32),
@@ -605,6 +623,12 @@ def _plan_arguments(parser: argparse.ArgumentParser) -> None:
         help="plans: moves scale up to which the moves head's differences are trusted (default: 1000)",
     )
     parser.add_argument(
+        "--persistence",
+        type=float,
+        default=3.0,
+        help="plans: weight of the waits that later fruits would spend on cells left closed (default: 3)",
+    )
+    parser.add_argument(
         "--certify",
         type=certify_share,
         default=0.4,
@@ -619,6 +643,24 @@ def _plan_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=20_000,
         help="plans: steps of search for certified shortcuts per decision (default: 20000)",
+    )
+    parser.add_argument(
+        "--stall",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="plans: in the transition, wait along the layout's moves until the body is certified (default)",
+    )
+    parser.add_argument(
+        "--stall-budget",
+        type=int,
+        default=10_000,
+        help="plans: steps of each search for the transition's waiting path (default: 10000)",
+    )
+    parser.add_argument(
+        "--stall-tries",
+        type=int,
+        default=32,
+        help="plans: searches for the transition's waiting path per decision (default: 32)",
     )
 
 

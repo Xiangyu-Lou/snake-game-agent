@@ -49,14 +49,15 @@ def follow(state, cells):
 
 
 @pytest.mark.parametrize("side", [6, 8])
-def test_every_plan_is_safe_eats_at_its_end_and_reaches_its_afterstate(side):
+@pytest.mark.parametrize("config", [PlanConfig(paths=6), PlanConfig(paths=6, hugs=2, gaps=6)])
+def test_every_plan_is_safe_eats_at_its_end_and_reaches_its_afterstate(side, config):
     rng = random.Random(side)
     checked = looped = 0
     for seed in range(4):
         game = SnakeGame(GameConfig(side, side), seed=seed)
         while not game.done and not TRAINING_RULES.timed_out(game.state()):
             state = game.state()
-            plans = candidates(state, TRAINING_RULES, PlanConfig(paths=6), rng)
+            plans = candidates(state, TRAINING_RULES, config, rng)
             assert len({p.after.snake for p in plans}) == len(plans)  # one plan per afterstate
             for plan in plans:
                 results, after = follow(state, plan.cells)
@@ -158,11 +159,17 @@ def hashed(queries):
     return Prediction(logits, win, moves)
 
 
-def test_batched_games_play_as_the_plan_agent_does_one_at_a_time():
+@pytest.mark.parametrize(
+    "config",
+    [
+        PlanConfig(paths=4, tolerance=0.05),
+        PlanConfig(paths=4, tolerance=0.05, hugs=2, gaps=4, persistence=3.0, certify=0.5, stall=True),
+    ],
+)
+def test_batched_games_play_as_the_plan_agent_does_one_at_a_time(config):
     pytest.importorskip("torch")  # the lockstep driver lives in assess, which imports PyTorch
     from snake_agent.assess import _Lockstep, _runs, play_lockstep
 
-    config = PlanConfig(paths=4, tolerance=0.05)
     expected = [
         run_game(SnakeGame(GameConfig(6, 6), seed=s), PlanAgent(hashed, TRAINING_RULES, config, i), seed=s)
         for i, s in enumerate(range(3))

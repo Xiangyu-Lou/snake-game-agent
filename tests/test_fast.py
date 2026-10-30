@@ -126,3 +126,73 @@ def test_shortest_paths_and_extensions_are_safe():
             assert len(longer) - len(path) in range(0, 13, 2) and set(path) <= set(longer.tolist())
             checked += 1
     assert checked > 50
+
+
+def test_persistence_counts_the_waits_of_the_fruits_after_the_next():
+    times = np.array([0, 3, 10, 25, 7, 40], dtype=np.int64)
+    release = np.array([5, 0, 0, 0, 0, 2], dtype=np.int64)  # cells 1 to 4 are free
+    for unit in (1.0, 4.0, 5.0, 30.0):
+        waits = [sum(max(0.0, t - j * unit) for j in range(1, 100)) for t in (3, 10, 25, 7)]
+        assert fast.persistence(times, release, unit) == pytest.approx(np.mean(waits))
+    assert fast.persistence(times, np.ones(6, dtype=np.int64), 4.0) == 0.0  # no free cell
+
+
+def test_a_hugging_path_is_a_safe_shortest_path_beside_the_most_blocked_sides():
+    def blocked(path, release, nbr):
+        return sum(
+            sum(1 for d in range(4) if nbr[c, d] < 0 or release[nbr[c, d]] > t)
+            for t, c in enumerate(path.tolist(), 1)
+        )
+
+    rng = random.Random(2)
+    checked = 0
+    for state in wandering_states(9, 3, 200, rng):
+        if state.done or state.fruit is None:
+            continue
+        body = fast.flat(state)
+        release = fast.release_of(body, state.num_cells)
+        nbr = fast.grid(state.width, state.height)
+        head, heading = int(body[0]), int(state.direction)
+        fruit = state.fruit[1] * state.width + state.fruit[0]
+        arrival = fast.arrival(release, nbr, head, heading, -1)
+        if arrival[fruit] <= 0:
+            continue
+        hug = fast.hugging_path(arrival, release, nbr, fruit, fast.generator(checked))
+        assert len(hug) == arrival[fruit] and hug[-1] == fruit
+        game = SnakeGame.from_state(state, seed=0)
+        for cell in hug:
+            x, y = game.head
+            assert not game.step(Direction(fast.direction(state.width, y * state.width + x, int(cell)))).lost
+        assert game.length == state.length + 1
+        others = fast.shortest_paths(arrival, nbr, fruit, 8, fast.generator(checked + 1))
+        assert all(blocked(hug, release, nbr) >= blocked(path, release, nbr) for path in others)
+        checked += 1
+    assert checked > 50
+
+
+def test_filling_the_gaps_keeps_a_path_safe_and_takes_only_strips_one_cell_wide():
+    rng = random.Random(3)
+    filled = 0
+    for state in wandering_states(10, 4, 250, rng):
+        if state.done or state.fruit is None:
+            continue
+        body = fast.flat(state)
+        release = fast.release_of(body, state.num_cells)
+        nbr = fast.grid(state.width, state.height)
+        head, heading = int(body[0]), int(state.direction)
+        fruit = state.fruit[1] * state.width + state.fruit[0]
+        arrival = fast.arrival(release, nbr, head, heading, -1)
+        if arrival[fruit] <= 0:
+            continue
+        path = fast.shortest_paths(arrival, nbr, fruit, 1, fast.generator(filled))[0]
+        longer = fast.fill_gaps(path, release, nbr, state.width, head, heading, fruit, fast.generator(filled))
+        assert (len(longer) - len(path)) % 2 == 0 and set(path.tolist()) <= set(longer.tolist())
+        added = set(longer.tolist()) - set(path.tolist())
+        assert all(release[c] == 0 and c != fruit for c in added)
+        game = SnakeGame.from_state(state, seed=0)
+        for cell in longer:
+            x, y = game.head
+            assert not game.step(Direction(fast.direction(state.width, y * state.width + x, int(cell)))).lost
+        assert game.length == state.length + 1
+        filled += len(added) > 0
+    assert filled > 20

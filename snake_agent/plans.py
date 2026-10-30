@@ -9,11 +9,14 @@ at another grain:
 
 * **Plans.** When a fruit appears, the agent lists paths to it
   (:func:`candidates`): shortest paths with their ties broken at random,
-  sweeping paths (shortest paths lengthened through the free cells beside them,
-  which lay the body down compactly), and paths that first follow the survival
-  certificate's loop for a few moves (a way to wait for the body to clear).
-  Paths go through free cells and through body cells already vacated when the
-  head arrives, so every plan is safe move by move, and its length is exact.
+  shortest paths that run beside the body and the board's edge
+  (``config.hugs``), shortest paths lengthened into the strips one cell wide
+  beside them (``config.gaps``), sweeping paths (shortest paths lengthened
+  through the free cells beside them, which lay the body down compactly), and
+  paths that first follow the survival certificate's loop for a few moves (a
+  way to wait for the body to clear). Paths go through free cells and through
+  body cells already vacated when the head arrives, so every plan is safe move
+  by move, and its length is exact.
 * **Afterstates.** A plan ends by eating the fruit, at its *afterstate*: the
   longer body, before the next fruit appears. Nothing random happens on the
   way, so a plan's whole future is the afterstate's, and the network values
@@ -27,8 +30,10 @@ at another grain:
   than ``tolerance``: among the plans whose risk (one minus the win value) is
   within the tolerance of the least risky plan's, the agent takes the fewest
   moves in all: the plan's own, the trip to the next fruit as far as it is
-  known exactly (:func:`next_trip`), and the rest of the afterstate's value,
-  weighted by how far the network's precision can be trusted (:func:`trust`).
+  known exactly (:func:`next_trip`), the waits that the fruits after it would
+  spend on cells the afterstate leaves closed (``config.persistence``), and the
+  rest of the afterstate's value, weighted by how far the network's precision
+  can be trusted (:func:`trust`).
   The tolerance is the price of speed: for this agent the owner accepts a
   slightly lower clear rate for far fewer moves (``snake_agent/README.md``, free
   play). It also keeps the noise of the win head from deciding between equally
@@ -46,7 +51,9 @@ at another grain:
   (:mod:`snake_agent.certify`), and then keeps such a body to the end. It
   follows no fixed cycle: at each fruit it takes the fastest path whose
   afterstate some such cycle holds, so the win stays certain and the network is
-  not asked.
+  not asked. From a dense free-play body, the transition can wait for the
+  certificate (``config.stall``): it follows a path of the cycles' moves that
+  replaces the rest of the body without eating, found by a search.
 
 The network does not see the canonical cycle's input planes
 (:attr:`~snake_agent.network.NetworkConfig.cycle`), and no move is restricted to
@@ -71,7 +78,7 @@ import numpy as np
 from snake_game import Direction, GameState, RelativeAction, Status
 
 from . import fast
-from .certify import certified_paths, certify, transition_paths
+from .certify import certified_paths, certify, extends, recent_run, stall, transition_paths
 from .contract import TRAINING_RULES, Outcome, Rules, to_relative
 from .encoding import encode, horizon_ceiling, horizon_scale
 from .search import Evaluator, Prediction, Query
@@ -85,6 +92,12 @@ class PlanConfig:
 
     paths: int = 16
     """Shortest paths drawn at random per decision (fewer if the fruit has fewer)."""
+    hugs: int = 2
+    """Shortest paths that run beside the body and the board's edge as much as they can
+    (:func:`~snake_agent.fast.hugging_path`), per decision."""
+    gaps: int = 16
+    """Shortest paths lengthened into the strips one cell wide beside them
+    (:func:`~snake_agent.fast.fill_gaps`), per decision."""
     waits: tuple[int, ...] = (2, 4, 8, 16, 32)
     """Moves along the certificate's loop before a shortest path, for the waiting plans."""
     sweeps: tuple[float, ...] = (0.25, 1.0)
@@ -101,6 +114,10 @@ class PlanConfig:
     """Self-play: the chance of playing a random acceptable plan instead of the fastest."""
     next_trip: bool = True
     """Count the trip to the next fruit exactly (:func:`next_trip`), whatever the trust in the network."""
+    persistence: float = 3.0
+    """The weight of the waits that the fruits after the next would spend on cells the afterstate leaves
+    closed (:func:`~snake_agent.fast.persistence`), counted with the next trip: a hole beside young
+    segments stays closed for many fruits, and the next trip counts it once."""
     guard: bool = True
     """Only plans whose afterstate has a survival certificate are compared, if there are any; if there
     are none, the agent waits along the certificate's loop while the fruit timeout leaves room, and plans
@@ -110,13 +127,26 @@ class PlanConfig:
     Hamiltonian-cycle certificate (:mod:`snake_agent.certify`): it heads for a body that the walk around a
     spanning tree of 2x2 blocks holds in order, then keeps such a body to the end, taking the fastest
     path to each fruit that keeps it. None plays free to the end. 0.4 is fastest on 20x20 and ties with
-    0.3 on 100x100 (``snake_agent/README.md``, where to switch); the plan agent first used 0.3."""
+    0.3 on 100x100 (``snake_agent/README.md``, where to switch); the plan agent first used 0.3. Free
+    play to 0.8, the owner's later target, needs the transition's waiting path (``stall``) and costs
+    about 40% more moves on 20x20 (``snake_agent/README.md``, free play to 80%)."""
     trees: int = 64
     """Random spanning trees tried per decision once the certificate is sought."""
     shortcuts: int = 8
     """Certified shortcuts kept per decision (:func:`~snake_agent.certify.shortcuts`)."""
     shortcut_budget: int = 20_000
     """Steps of search for the certified shortcuts per decision."""
+    stall: bool = True
+    """In the transition, wait for the body to be certified when the fruit timeout leaves more than a
+    board's worth of moves: follow a path of the layout's moves that replaces the rest of the body without
+    eating, if the search finds one (:func:`~snake_agent.certify.stall`); otherwise, when no path to the
+    fruit lengthens the certifiable run and keeps a survival certificate, wait with a move that lengthens it
+    and keeps one (the first move of the longest such path found, if it is one of them)."""
+    stall_budget: int = 10_000
+    """Steps of each search for the transition's waiting path."""
+    stall_tries: int = 32
+    """Searches for the transition's waiting path per decision, each breaking its ties at random; the
+    longest path found is kept (:func:`~snake_agent.certify.stall`)."""
 
 
 SELF_PLAY = PlanConfig(explore=0.1)
@@ -224,16 +254,39 @@ def afterstate(state: GameState, path: Sequence[int]) -> GameState:
     )
 
 
+def waited(state: GameState, path: Sequence[int]) -> GameState:
+    """The state after entering the cells of ``path`` (flat) without eating: the fruit stays in place."""
+    width = state.width
+    d = len(path)
+    entered = tuple((c % width, c // width) for c in reversed(path))
+    body = entered[: state.length] if d >= state.length else entered + state.snake[: state.length - d]
+    before = path[-2] if d > 1 else state.head[1] * width + state.head[0]
+    return GameState(
+        width,
+        state.height,
+        body,
+        Direction(_direction(width, before, path[-1])),
+        state.fruit,
+        state.score,
+        state.steps + d,
+        state.steps_since_fruit + d,
+    )
+
+
 @dataclass(frozen=True)
 class Plan:
-    """A path to the fruit and where it leads."""
+    """A path to the fruit and where it leads (or, for the transition, a path that waits)."""
 
     cells: tuple[int, ...]
-    """Flat cells entered, in order; the last holds the fruit."""
+    """Flat cells entered, in order; the last holds the fruit, unless the plan does not eat."""
     after: GameState
-    """The afterstate: the board after eating, before the next fruit appears."""
+    """The afterstate: the board after eating, before the next fruit appears (or after the moves, the fruit
+    still in place, for a plan that does not eat)."""
     wait: int = 0
     """Moves along the certificate's loop before the shortest path."""
+    eats: bool = True
+    """False for a path that only waits: the transition's way to certify the body without eating
+    (:func:`~snake_agent.certify.stall`)."""
 
     @property
     def moves(self) -> int:
@@ -280,6 +333,10 @@ def _candidates(
         shortest = fast.shortest_paths(arrival, nbr, fruit, config.paths, generator)
         for path in shortest:
             add(path, 0)
+        for _ in range(config.hugs):
+            add(fast.hugging_path(arrival, release, nbr, fruit, generator), 0)
+        for path in shortest[: config.gaps]:
+            add(fast.fill_gaps(path, release, nbr, width, head, view.heading, fruit, generator), 0)
         free = state.free_cells
         for k, share in enumerate(config.sweeps):
             extra = int(share * free)
@@ -489,6 +546,22 @@ def _plans(state: GameState, view: _View, paths: Sequence[Sequence[int]], rules:
     return list(plans.values())
 
 
+def _certified_prefix(view: _View, path: Sequence[int], most: int) -> list[int]:
+    """The longest of the first half, quarter, eighth... of ``path`` (a waiting path, which eats nothing),
+    at most ``most`` moves, after which the snake has a survival certificate; empty if none has."""
+    cells = np.asarray(path, dtype=np.int64)
+    n = min(len(cells) // 2, most)
+    while n > 1:
+        moved = fast.moved_release(view.release, cells[:n], view.length)
+        before = int(cells[n - 2])
+        if fast.certificate(
+            moved, view.nbr, int(cells[n - 1]), _direction(view.width, before, int(cells[n - 1]))
+        ):
+            return cells[:n].tolist()
+        n //= 2
+    return []
+
+
 def _certain(view: _View, plans: Sequence[Plan]) -> Decision:
     """The fastest of ``plans``, whose afterstates are certified: the fewest moves with the next trip."""
     totals = [p.moves + (0.0 if p.after.won else view.trip(p.cells)) for p in plans]
@@ -513,12 +586,14 @@ def decide(
     fastest certified path is played, with no evaluation (:func:`~snake_agent.certify.certified_paths`).
     Before that, a path whose afterstate is certified is played if there is one; otherwise the paths that
     lengthen the body's certifiable run replace the free plans, if any of them keeps a survival
-    certificate (:func:`~snake_agent.certify.transition_paths`).
+    certificate (:func:`~snake_agent.certify.transition_paths`). With ``config.stall``, a path that
+    certifies the body without eating comes next (:func:`~snake_agent.certify.stall`), and the waiting moves
+    compared with the paths are those that lengthen the run.
     """
     rng = random.Random(0) if rng is None else rng
     view = _View(state)
     nbr = view.nbr
-    plans = None
+    plans = holds = None
     if seeks_certificate(state, config):
         lay = certify(state)
         if lay is not None:
@@ -534,11 +609,54 @@ def decide(
             if exact_plans:
                 return _certain(view, exact_plans)
             plans = _plans(state, view, partial, rules)
-            plans = [p for p in plans if p.after.won or view.certified(p.cells)] or None
+            plans = [p for p in plans if p.after.won or view.certified(p.cells)]
+            if config.stall:  # the waiting moves that lengthen the run too, and no others
+                left = rules.moves_left(state)
+                holds = []
+                if left is None or left > state.num_cells:
+                    path, goal = stall(state, rng, config.stall_budget, config.stall_tries)
+                    if path and len(path) == goal and (left is None or left - goal > state.free_cells):
+                        # a way to certify the body without eating: the fruit is then within the free cells
+                        return Decision(
+                            Plan(tuple(path), waited(state, path), eats=False),
+                            None,
+                            1.0,
+                            float(goal),
+                            1,
+                            True,
+                        )
+                    walk = _certified_prefix(
+                        view, path, len(path) // 2 if left is None else left - state.num_cells
+                    )
+                    if not plans and len(walk) > 1:
+                        # the start of the longest waiting path found, which the rest continues
+                        return Decision(
+                            Plan(tuple(walk), waited(state, walk), eats=False),
+                            None,
+                            None,
+                            float(len(walk)),
+                            1,
+                        )
+                    lay, run = recent_run(state)
+                    holds = [
+                        w
+                        for w in _waits(state, view, rules)
+                        if w[0].certified and extends(lay, run, w[0].state)
+                    ]
+                    width = state.width
+                    ahead = [
+                        w for w in holds if path and w[0].state.head == (path[0] % width, path[0] // width)
+                    ]
+                    holds = ahead or holds  # the first move of the longest stall found, if it is among them
+                if not plans and not holds:
+                    holds = None
+            if holds is None:  # no way to lengthen the run: free plans
+                plans = plans or None
     if plans is None:
         plans = _candidates(state, view, rules, config, fast.generator(rng.getrandbits(32)))
     arrays = [view.after(p.cells) for p in plans]  # each afterstate's release, head and heading
-    holds = _waits(state, view, rules)
+    if holds is None:
+        holds = _waits(state, view, rules)
     if config.guard and _comfortable(state, rules, plans):
         safe = [
             p.after.won or fast.certificate(r, nbr, h, d) for p, (r, h, d) in zip(plans, arrays, strict=True)
@@ -561,16 +679,36 @@ def decide(
     weight = trust(state.free_cells, config, 0 if prediction is None else prediction.horizon)
     width = state.width
     fruit = state.fruit[1] * width + state.fruit[0]
-    plan_near = [
-        0.0 if a.won or not config.next_trip else _trip(r, nbr, h, d)
+    plan_times = [  # when the head could first enter each cell, after each plan
+        None if a.won or not config.next_trip else fast.opening(r, nbr, h, d)
         for a, (r, h, d) in zip(afters, arrays, strict=True)
     ]
-    wait_near = [
-        _trip(moved, nbr, w.state.head[1] * width + w.state.head[0], int(w.state.direction), fruit)
+    wait_times = [
+        fast.opening(moved, nbr, w.state.head[1] * width + w.state.head[0], int(w.state.direction))
         if config.next_trip
-        else 0.0
+        else None
         for w, moved in holds
     ]
+    plan_near = [
+        0.0 if t is None else float(fast.free_mean(t, r))
+        for t, (r, _, _) in zip(plan_times, arrays, strict=True)
+    ]
+    wait_near = [0.0 if t is None else float(t[fruit]) for t in wait_times]
+    if config.persistence and config.next_trip:
+        # the fruits after the next come about every ``unit`` moves: the typical next trip
+        trips = [n for n, t in zip(plan_near, plan_times, strict=True) if t is not None]
+        trips = trips or [
+            float(fast.free_mean(t, moved)) for t, (_, moved) in zip(wait_times, holds, strict=True)
+        ]
+        unit = max(1.0, float(np.median(trips))) if trips else 1.0
+        plan_near = [
+            n if t is None else n + config.persistence * fast.persistence(t, r, unit)
+            for n, t, (r, _, _) in zip(plan_near, plan_times, arrays, strict=True)
+        ]
+        wait_near = [
+            n + config.persistence * fast.persistence(t, moved, unit)
+            for n, t, (_, moved) in zip(wait_near, wait_times, holds, strict=True)
+        ]
     is_plan, i = choose(
         plan_wins,
         [p.moves + n + weight * (m - n) for p, n, m in zip(plans, plan_near, after_moves, strict=True)],

@@ -9,23 +9,28 @@ from snake_agent.certify import (
     certified,
     certified_paths,
     certify,
+    extends,
     field_arrival,
     flat_body,
     follow,
     greedy_walk,
     layout,
     prefix,
+    recent_run,
     requirements,
     shortcuts,
     spanning,
+    stall,
     successor,
     timely,
     transition_paths,
 )
 from snake_agent.contract import TRAINING_RULES, play_move
-from snake_agent.plans import PlanAgent, PlanConfig, _direction, decide
+from snake_agent.plans import PlanAgent, PlanConfig, _direction, _View, _waits, decide, run_decision
 from snake_agent.search import Prediction
+from snake_agent.survival import Board
 from snake_game import Direction, GameConfig, GameState, SnakeGame
+from snake_game.policies import GreedyPolicy
 
 
 def steps(game, cells):
@@ -193,6 +198,111 @@ def test_a_transition_lengthens_the_certifiable_run_or_certifies():
                 break
             game.step(rng.choice(moves))
     assert exact > 0 and partial > 0
+
+
+def free_play_states(side, games, longest, rng):
+    """States of games that mostly chase the fruit and sometimes turn at random, without colliding."""
+    for seed in range(games):
+        game = SnakeGame(GameConfig(side, side), seed=seed)
+        greedy = GreedyPolicy()
+        while not game.done and game.length < longest:
+            state = game.state()
+            yield state
+            safe = game.safe_directions()
+            if not safe:
+                break
+            move = greedy(state)
+            game.step(move if move in safe and rng.random() < 0.7 else rng.choice(safe))
+
+
+def test_the_recent_run_is_the_longer_certifiable_prefix_and_lengthens():
+    rng = random.Random(4)
+    grew = 0
+    for state in free_play_states(8, 4, 30, rng):
+        lay, run = recent_run(state)
+        body = flat_body(state)
+        assert 1 <= run <= prefix(lay, body) and requirements(lay, body[:run]) is not None
+        other = layout(8, 8, 1 - lay.orientation)
+        assert requirements(other, body[: run + 1]) is None or run == len(body)
+        for wait in waits_of(state):
+            if extends(lay, run, wait.state):
+                after = flat_body(wait.state)
+                assert prefix(lay, after) > run and certified(lay, after[: run + 1])
+                grew += 1
+    assert grew > 50
+
+
+def waits_of(state):
+    return [wait for wait, _ in _waits(state, _View(state), TRAINING_RULES)]
+
+
+def test_a_stalling_transition_waits_only_with_moves_that_lengthen_the_run():
+    rng = random.Random(5)
+    config = PlanConfig(certify=0.0, stall=True, paths=4, trees=8, shortcut_budget=2000)
+    stalled = 0
+    for state in free_play_states(8, 30, 40, rng):
+        if state.fruit is None or certify(state) is not None:
+            continue
+        if TRAINING_RULES.moves_left(state) <= state.num_cells:  # too close to the fruit timeout to wait
+            continue
+        lay, run = recent_run(state)
+        longer = [w for w in waits_of(state) if w.certified and extends(lay, run, w.state)]
+        decision = run_decision(constant, state, TRAINING_RULES, config, random.Random(0))
+        if decision.plan is None and longer:
+            assert decision.wait in [w.action for w in longer]
+            stalled += 1
+    assert stalled > 10
+
+
+def test_a_waiting_path_certifies_the_body_without_eating():
+    rng = random.Random(6)
+    config = PlanConfig(certify=0.0, stall=True, paths=4, trees=8, shortcut_budget=2000)
+    played = 0
+    for state in free_play_states(8, 12, 40, rng):
+        if state.fruit is None or certify(state) is not None:
+            continue
+        path, goal = stall(state, random.Random(0))
+        lay, run = recent_run(state)
+        assert goal == state.length - run and len(path) <= goal
+        if len(path) < goal or TRAINING_RULES.moves_left(state) - goal <= state.free_cells:
+            continue
+        decision = run_decision(constant, state, TRAINING_RULES, config, random.Random(0))
+        if decision.plan is None or decision.plan.eats:
+            continue  # a path to the fruit that certified the body came first
+        assert decision.certain and decision.win == 1.0
+        game = SnakeGame.from_state(state, seed=0)
+        results = steps(game, decision.plan.cells)
+        assert not any(r.lost or r.ate_fruit for r in results)
+        assert game.state() == decision.plan.after
+        assert certify(game.state()) is not None
+        played += 1
+    assert played > 10
+
+
+def test_part_of_a_waiting_path_lengthens_the_run_and_keeps_a_survival_certificate():
+    rng = random.Random(7)
+    config = PlanConfig(
+        certify=0.0, stall=True, paths=4, trees=8, shortcut_budget=2000, stall_budget=60, stall_tries=1
+    )
+    walked = 0
+    for state in free_play_states(10, 30, 70, rng):
+        if state.fruit is None or certify(state) is not None:
+            continue
+        decision = run_decision(constant, state, TRAINING_RULES, config, random.Random(0))
+        if decision.plan is None or decision.plan.eats or decision.certain:
+            continue
+        lay, run = recent_run(state)
+        cells = decision.plan.cells
+        game = SnakeGame.from_state(state, seed=0)
+        results = steps(game, cells)
+        assert not any(r.lost or r.ate_fruit for r in results)
+        after = game.state()
+        assert after == decision.plan.after and decision.win is None
+        assert recent_run(after) == (lay, run + len(cells))
+        assert TRAINING_RULES.moves_left(after) >= state.num_cells
+        assert Board(after).has_survival_certificate()  # the snake is not walked into a dead end
+        walked += 1
+    assert walked > 5
 
 
 def constant(queries):

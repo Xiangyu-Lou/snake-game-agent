@@ -351,7 +351,7 @@ class NetworkEvaluator:
                 with torch.autocast("cuda", torch.bfloat16, enabled=self.half):
                     logits, win, moves = self.model(*tensors(stack(encoded), self.device))
                 for k, value in enumerate((logits, torch.sigmoid(win), moves)):
-                    outputs[k][chunk] = value.double().cpu().numpy()
+                    outputs[k][chunk] = value.cpu().double().numpy()  # float64 on the CPU: MPS has none
         return Prediction(*outputs, horizon=config.horizon)
 
     def release(self) -> None:

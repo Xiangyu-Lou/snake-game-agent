@@ -89,7 +89,7 @@ Results are judged against exact or reproduced numbers, so keep these consistent
 - **`analysis/`.**
   - Documents there are written in English.
   - A pull request for analysis work contains only `analysis/`. Changes to code or other files need a separate, explicit request.
-- **Model files.** `*.pt`, `*.pth`, `*.ckpt`, `*.safetensors`, `*.onnx`, `*.h5`, `*.keras`, `*.zip` and `*.npz` are stored with Git LFS (`.gitattributes`). Run `git lfs install` before committing such files.
+- **Model files and videos.** `*.pt`, `*.pth`, `*.ckpt`, `*.safetensors`, `*.onnx`, `*.h5`, `*.keras`, `*.zip`, `*.npz` and `*.mp4` are stored with Git LFS (`.gitattributes`): the repository keeps only a pointer to each. Run `git lfs install` before committing such files.
 - **PyTorch.** The network's stack (review §4), an optional dependency: `pip install -e ".[train]"`. Only `network.py`, `train.py` and `assess.py` import it.
 - **Numba.** Compiles the kernels of `fast.py`, an optional dependency (`pip install -e ".[fast]"`, also in `dev` and `train`). Without it the kernels run as plain Python, the same code and results, only slower. Kernels take flat NumPy arrays, never Python lists, and draw random numbers from their own generator (`fast.generator`), so compiled and plain runs agree.
 - **Training runs.** `train` writes logs and checkpoints to `runs/`, which git ignores. Commit a checkpoint only on request (Git LFS). With many self-play workers on one GPU, start NVIDIA MPS first (`nvidia-cuda-mps-control -d`), or their small batches take turns on the GPU.
